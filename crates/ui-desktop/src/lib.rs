@@ -9,6 +9,7 @@
 //! Each OS implements [`DesktopHost`]; everything above it is shared here.
 
 #[cfg(target_os = "linux")] mod linux;
+#[cfg(target_os = "macos")] mod macos;
 #[cfg(windows)] mod webview;
 #[cfg(windows)] mod windows;
 
@@ -23,6 +24,16 @@ use std::{
 };
 
 #[cfg(target_os = "linux")] use linux::Host as Os;
+#[cfg(target_os = "macos")] use macos::Host as Os;
+#[cfg(target_os = "macos")]
+pub use macos::{
+   PanelAction,
+   PanelButton,
+   PanelSection,
+   close_panel,
+   redraw_windows,
+   show_panel,
+};
 #[cfg(windows)] use windows::Host as Os;
 
 /// Self-contained HTML/JS/CSS companion dashboard for Desktop settings,
@@ -48,7 +59,7 @@ pub struct TrayConfig {
 /// What the tray menu offers, the same on every OS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
-   not(any(windows, target_os = "linux")),
+   not(any(windows, target_os = "linux", target_os = "macos")),
    allow(dead_code, reason = "no tray backend on this target")
 )]
 enum TrayAction {
@@ -63,7 +74,7 @@ enum TrayAction {
 impl TrayAction {
    /// The menu in order, `None` for a separator.
    #[cfg_attr(
-      not(any(target_os = "linux", test)),
+      not(any(target_os = "linux", target_os = "macos", test)),
       expect(
          dead_code,
          reason = "the Windows menu has its own labels with hotkey hints"
@@ -81,7 +92,7 @@ impl TrayAction {
    ];
 
    #[cfg_attr(
-      not(any(target_os = "linux", test)),
+      not(any(target_os = "linux", target_os = "macos", test)),
       expect(
          dead_code,
          reason = "the Windows menu has its own labels with hotkey hints"
@@ -99,7 +110,7 @@ impl TrayAction {
    }
 
    #[cfg_attr(
-      not(any(windows, target_os = "linux")),
+      not(any(windows, target_os = "linux", target_os = "macos")),
       allow(dead_code, reason = "no tray backend on this target")
    )]
    fn run(self) {
@@ -163,10 +174,10 @@ trait DesktopHost {
    fn start_tray() {}
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 struct Os;
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl DesktopHost for Os {}
 
 static CONFIG: OnceLock<TrayConfig> = OnceLock::new();

@@ -718,13 +718,130 @@ unsafe extern "C" fn modal_button_callback(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// macOS draws pages and dialogs as `AppKit` windows
+/// ([`phoenix_ui_desktop::show_panel`]), since Discord's GPUI modal has no
+/// arm64 locators.
+#[cfg(target_os = "macos")]
+mod panel {
+   use std::sync::Arc;
+
+   use phoenix_ui_desktop::{
+      PanelButton,
+      PanelSection,
+      close_panel,
+      show_panel,
+   };
+
+   use super::{
+      Choice,
+      ChoiceOption,
+      ModalSection,
+      PageModalSpec,
+   };
+
+   fn section(section: ModalSection) -> PanelSection {
+      match section {
+         ModalSection::Buttons { title, buttons } => {
+            PanelSection::Buttons {
+               title,
+               buttons: buttons
+                  .into_iter()
+                  .map(|button| {
+                     PanelButton {
+                        label:    button.label,
+                        danger:   button.danger,
+                        on_press: button.on_press,
+                     }
+                  })
+                  .collect(),
+            }
+         },
+         ModalSection::Text { title, text } => PanelSection::Text { title, text },
+         ModalSection::Code {
+            title,
+            text,
+            monospace,
+            ..
+         } => {
+            PanelSection::Code {
+               title,
+               text,
+               monospace,
+            }
+         },
+      }
+   }
+
+   pub fn open(spec: PageModalSpec, on_close: Option<phoenix_ui_desktop::PanelAction>) -> u64 {
+      show_panel(
+         spec.title,
+         spec.sections.into_iter().map(section).collect(),
+         on_close,
+      )
+   }
+
+   /// A dialog whose buttons answer `choice` with their index and close it;
+   /// closing it any other way answers -1.
+   pub fn open_choice(
+      title: String,
+      body: Option<ModalSection>,
+      options: Vec<ChoiceOption>,
+      choice: &Arc<Choice>,
+   ) {
+      let id = Arc::new(std::sync::OnceLock::<u64>::new());
+      let mut sections: Vec<PanelSection> = body.into_iter().map(section).collect();
+      if !options.is_empty() {
+         let buttons = options
+            .into_iter()
+            .enumerate()
+            .map(|(index, option)| {
+               let (choice, id) = (Arc::clone(choice), Arc::clone(&id));
+               PanelButton {
+                  label:    option.label,
+                  danger:   option.danger,
+                  on_press: Arc::new(move || {
+                     choice.pick(i32::try_from(index).unwrap_or(-1));
+                     if let Some(&id) = id.get() {
+                        close_panel(id);
+                     }
+                  }),
+               }
+            })
+            .collect();
+         sections.push(PanelSection::Buttons {
+            title: None,
+            buttons,
+         });
+      }
+      let dismissed = Arc::clone(choice);
+      let _ = id.set(show_panel(
+         title,
+         sections,
+         Some(Arc::new(move || dismissed.pick(-1))),
+      ));
+   }
+}
+
 /// Opens a native GPUI modal for `phoenix.ui.openPage` and triggers a GPUI
 /// redraw immediately.
 pub fn open_page(spec: PageModalSpec) -> u64 {
+   if cfg!(target_os = "macos") {
+      return open_panel(spec);
+   }
    resolve_pending_choice();
    let id = NEXT_PAGE_ID.fetch_add(1, Ordering::Relaxed);
    set_active(Some(ActiveModal::Page { id, spec }));
    id
+}
+
+#[cfg(target_os = "macos")]
+fn open_panel(spec: PageModalSpec) -> u64 {
+   panel::open(spec, None)
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn open_panel(_spec: PageModalSpec) -> u64 {
+   0
 }
 
 /// Replaces the active modal. `MODAL_OPEN` changes under the same lock, so a
@@ -747,6 +864,11 @@ pub fn open_choice(
    options: Vec<ChoiceOption>,
 ) -> Arc<Choice> {
    let choice = Arc::new(Choice::new());
+   #[cfg(target_os = "macos")]
+   if cfg!(target_os = "macos") {
+      panel::open_choice(title, body, options, &choice);
+      return choice;
+   }
    if ORIG_OVERLAY_RENDER.get().is_none() {
       choice.pick(-1);
       return choice;
@@ -830,6 +952,8 @@ fn resolve_pending_choice() {
 
 /// Closes an open page modal if its id still matches `id`.
 pub fn close_page(id: u64) {
+   #[cfg(target_os = "macos")]
+   phoenix_ui_desktop::close_panel(id);
    let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
    if matches!(&*guard, Some(ActiveModal::Page { id: cur, .. }) if *cur == id) {
       *guard = None;
@@ -1154,8 +1278,9 @@ unsafe fn set_field_text(app: *mut c_void, entity: &RawEntity, text: &str) {
       text_len: text.len(),
       tf:       ptr::from_ref(tf),
    };
-   // SAFETY: `update_entity_dyn` leases `FieldState`, calls `set_value_trampoline`
-   // synchronously on this stack frame, ends the lease, and flushes effects.
+   // SAFETY: `update_entity_dyn` leases `FieldState`, calls
+   // `set_value_trampoline` synchronously on this stack frame, ends the lease,
+   // and flushes effects.
    unsafe {
       (tf.update_entity_dyn)(
          app,
@@ -1708,8 +1833,9 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                if let Some(init) = &ed.pending_init {
                   unsafe { set_field_text(app, &ent, init) };
                }
-               // SAFETY: constructs hosted `TextArea` from `&Entity<FieldState>`
-               // in a buffer that fits it and converts to `AnyElement`.
+               // SAFETY: constructs hosted `TextArea` from
+               // `&Entity<FieldState>` in a buffer that fits it and converts to
+               // `AnyElement`.
                let mut ta_any = unsafe {
                   let mut ta = RawTextArea::zeroed();
                   (tf.text_area_new)(&raw mut ta, &raw const ent);
@@ -1782,23 +1908,19 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
             gpui::style_div(b, |s| s.length(s.at.size[0], W_FULL));
             if let Some(tf) = FIELD_SYM.get()
                && let Some(ent) = unsafe {
-                  ensure_field_entity(
-                     app,
-                     window,
-                     false,
-                     match &inst.setting {
-                        None => "https://example.com/plugin.js",
-                        Some(field) if field.kind == FieldKind::Secret => "Leave empty to clear",
-                        Some(_) => "",
-                     },
-                  )
+                  ensure_field_entity(app, window, false, match &inst.setting {
+                     None => "https://example.com/plugin.js",
+                     Some(field) if field.kind == FieldKind::Secret => "Leave empty to clear",
+                     Some(_) => "",
+                  })
                }
             {
                if let Some(init) = &inst.pending_init {
                   unsafe { set_field_text(app, &ent, init) };
                }
-               // SAFETY: constructs hosted `TextInput` from `&Entity<FieldState>`
-               // in a buffer that fits it and converts to `AnyElement`.
+               // SAFETY: constructs hosted `TextInput` from
+               // `&Entity<FieldState>` in a buffer that fits it and converts to
+               // `AnyElement`.
                let mut ti_any = unsafe {
                   let mut ti = RawTextInput::zeroed();
                   (tf.text_input_new)(&raw mut ti, &raw const ent);

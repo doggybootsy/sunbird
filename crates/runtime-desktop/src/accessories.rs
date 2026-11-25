@@ -233,6 +233,12 @@ pub fn install(image: &Image<'static>) {
       return;
    }
 
+   if !crate::X86_CODE {
+      #[cfg(target_os = "macos")]
+      arm64::install(image);
+      return;
+   }
+
    let (render_row, offset) = match desktop::message_row(image) {
       Ok(row) => (row.func, row.msg_id_offset),
       Err(err) => {
@@ -288,7 +294,8 @@ fn install_body_tint(image: &Image<'static>, render_row: usize) {
 
    let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).row;
    // SAFETY: runs from `prepare` before Discord threads execute;
-   // `build_body_detour` matches `build_message_body`'s verified 6-argument ABI.
+   // `build_body_detour` matches `build_message_body`'s verified 6-argument
+   // ABI.
    let trampoline = match unsafe {
       image.hook_entry(
          body_fn,
@@ -390,12 +397,18 @@ unsafe extern "C" fn render_row_detour(
    // SAFETY: `row` is Discord's live `&MessageRow` and `offset` was decoded
    // from its `message-content-{id}` formatting read.
    let message_id = unsafe { row.cast::<u8>().add(offset).cast::<u64>().read_unaligned() };
-   if message_id == 0 {
-      return out;
-   }
+   decorate(sret, message_id);
+   out
+}
 
+/// Wraps the row `sret` rendered for `message_id` with the accessories
+/// plugins returned for it.
+fn decorate(sret: *mut RawAnyElement, message_id: u64) {
+   if message_id == 0 {
+      return;
+   }
    let Some(items) = lookup_cached(message_id) else {
-      return out;
+      return;
    };
 
    let mut lines = Vec::new();
@@ -409,13 +422,12 @@ unsafe extern "C" fn render_row_detour(
       }
    }
    if lines.is_empty() && tint.is_none() {
-      return out;
+      return;
    }
 
    let _ = std::panic::catch_unwind(|| {
       gpui::wrap_with_accessories(sret, &lines, tint);
    });
-   out
 }
 
 // ---------------------------------------------------------------------------
@@ -504,5 +516,133 @@ mod tests {
       assert_eq!(argb_to_rgba(0x8058_65F2), 0x5865_F280);
       assert_eq!(argb_to_rgba(0x00F2_3F43), 0xF23F_43FF);
       assert_eq!(argb_to_rgba(0), 0);
+   }
+}
+
+/// `MessageRow::render` on macOS, arm64 ([`phoenix_sigs::macos::message_row`]).
+///
+/// It takes `x0` the row, `x1`..`x7`, `d0` and one stack word, and returns
+/// the 0x20-byte `AnyElement` through `x8`, which a Rust `extern "C"` function
+/// returning [`RawAnyElement`] does too, so the detour is native. Extra stack
+/// words are read from the caller's frame and passed back unchanged.
+#[cfg(target_os = "macos")]
+mod arm64 {
+   use std::sync::{
+      OnceLock,
+      atomic::Ordering,
+   };
+
+   use phoenix_hook::image::Image;
+
+   use super::{
+      ACTIVE_COUNT,
+      RawAnyElement,
+      decorate,
+   };
+
+   type RenderFn = unsafe extern "C" fn(
+      row: *const u8,
+      a1: usize,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+      a6: usize,
+      a7: usize,
+      f0: f64,
+      f1: f64,
+      f2: f64,
+      f3: f64,
+      s0: usize,
+      s1: usize,
+      s2: usize,
+      s3: usize,
+   ) -> RawAnyElement;
+
+   static ORIG: OnceLock<RenderFn> = OnceLock::new();
+   static ROW: OnceLock<phoenix_sigs::macos::MessageRow> = OnceLock::new();
+
+   pub fn install(image: &Image<'static>) {
+      let row = match phoenix_sigs::macos::message_row(image) {
+         Ok(row) => row,
+         Err(err) => {
+            log::warn!("desktop accessories: {err}, skipping");
+            return;
+         },
+      };
+      let pro = phoenix_sigs::desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
+      // SAFETY: runs from `prepare` before Discord's threads; `detour` has the
+      // render's arm64 signature.
+      let trampoline = match unsafe {
+         image.hook_entry(row.func, pro.pattern, pro.len, detour as *const () as usize)
+      } {
+         Ok(trampoline) => trampoline,
+         Err(err) => {
+            log::warn!("desktop accessories: MessageRow hook failed: {err}");
+            return;
+         },
+      };
+      // SAFETY: the trampoline runs the render's displaced instructions, so it
+      // has the render's signature.
+      let _ = ORIG.set(unsafe { std::mem::transmute::<usize, RenderFn>(trampoline) });
+      let _ = ROW.set(row);
+      log::info!("desktop accessories: hooked MessageRow render {row:x?}");
+   }
+
+   /// The message id the row renders: `row.rc -> Rc<Message> -> id`.
+   ///
+   /// # Safety
+   ///
+   /// `row` is the live row the render was called with.
+   unsafe fn message_id(row: *const u8) -> u64 {
+      let Some(at) = ROW.get() else {
+         return 0;
+      };
+      // SAFETY: the render loads the `Rc` from `row + rc` and hands
+      // `rc + value` to the helper that formats `id`.
+      unsafe {
+         let rc = row.add(at.rc).cast::<*const u8>().read_unaligned();
+         if rc.is_null() {
+            return 0;
+         }
+         rc.add(at.value + at.message_id)
+            .cast::<u64>()
+            .read_unaligned()
+      }
+   }
+
+   unsafe extern "C" fn detour(
+      row: *const u8,
+      a1: usize,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+      a6: usize,
+      a7: usize,
+      f0: f64,
+      f1: f64,
+      f2: f64,
+      f3: f64,
+      s0: usize,
+      s1: usize,
+      s2: usize,
+      s3: usize,
+   ) -> RawAnyElement {
+      let orig = *ORIG.get().expect("the detour only runs once ORIG is set");
+      // SAFETY: forwards every register and the stack words to the render.
+      let mut out = unsafe {
+         orig(
+            row, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3, s0, s1, s2, s3,
+         )
+      };
+      if ACTIVE_COUNT.load(Ordering::Relaxed) > 0 && !row.is_null() {
+         // SAFETY: `row` is the render's live row.
+         let id = unsafe { message_id(row) };
+         if (1 << 32..1 << 63).contains(&id) {
+            decorate(&raw mut out, id);
+         }
+      }
+      out
    }
 }

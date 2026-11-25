@@ -52,9 +52,9 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `crates/runtime-mobile/src/host.rs` | Phoenix's host call, event and field numbers, read at startup from the name table in the installed APK's dex, or the host's Swift name table on iOS. `host::send` and `host::ask` call host modules. |
 | `crates/runtime-mobile/src/picker.rs` | File picker, toasts, clipboard and links through Phoenix's host modules. |
 | `crates/runtime-mobile/src/install.rs`, `loader.rs` | The APK self-update, and Android's installer opened on it through Discord's `FileProvider`. |
-| `crates/runtime-desktop` | phoenix on Desktop Phoenix (`Discord.exe`): the access gate, the HTTP transport hooks, the Sunbird pages in User Settings, message accessories and the tray. |
+| `crates/runtime-desktop` | phoenix on Desktop Phoenix (`Discord.exe`, Linux `discord-phoenix`, macOS `Discord`): the access gate, the HTTP transport hooks, the Sunbird pages in User Settings, message accessories and the tray. `os.rs` holds what differs per OS. On macOS, which is arm64, the access gate, `phoenix.discord`, plugins, gateway hooks, fetch, storage, the debug shell and the tray run; everything else is x86-located and off (see Host facts). |
 | `crates/ui-mobile` | Typed codec for mobile (Android/iOS) Phoenix UI-op batches. `src/props.in` is Phoenix's prop table, `templates.json` holds captured layouts, `motion.rs` drives native springs, `mirror.rs` keeps a live copy of the view tree that host tests can drive. |
-| `crates/ui-desktop` | Desktop UI host primitives (clipboard, URLs, notifications, GPUI surface hooks). |
+| `crates/ui-desktop` | Desktop UI host primitives (clipboard, URLs, notifications, the tray, GPUI surface hooks), one file per OS. |
 | `crates/wire` | Tagged values and bridge frames (`HostCall`, `DispatchEvent`). |
 | `crates/hook` | Image scanner, `swap_words`, ShadowHook through `sunhook-sys` on Android ARM. |
 | `crates/sigs`, `crates/sigscan` | The gateway registry walk and handler ABI, and every other locator the runtime patches from (`desktop.rs`, `mobile.rs`). `sigscan` dumps a library's registry, runs `check` (every locator for that platform, exit 1 on a miss) and looks up strings, references and disassembly in `Discord.exe`. |
@@ -66,6 +66,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `web/` | What CI deploys to assets.sunbird.tools, with a `site.tar.gz` of it that sunbird-tools/site builds from: patcher wasm, loader libraries, plugin bundles, `version.json`. Builds before 76bc0d7 fetch the last three from sunbird.tools, so the site keeps serving them at the same paths. |
 | `frida/` | Optional Frida gadget bootstrap, for debugging on x86. |
 | `scripts/*.nu` | `phoenix.nu` builds, patches and installs on a phone. `site.nu` builds the site's native libs and wasm. |
+| `scripts/sunbird-{linux,macos}.sh` | The Desktop installers the site serves. Each makes a launcher that fetches the loader before every start and leaves Discord's own files untouched. |
 | `scripts/dev.ps1` | The Windows dev loop, described below. |
 
 ## Building
@@ -89,6 +90,10 @@ Read this file before changing code. Every fact here cost someone hours to learn
     then `cargo build --release -p patcher`.
 - iOS. `.github/workflows/ios.yml` builds `libphoenix.dylib` for `aarch64-apple-ios` on macOS,
   since the SDK ships only with Xcode.
+- macOS. `cargo build --release -p phoenix-loader` builds `target/release/libphoenix.dylib` for
+  Desktop Phoenix. Install it with `SUNBIRD_SITE=http://127.0.0.1:<port> sh scripts/sunbird-macos.sh`
+  against a local folder serving `version.json` and `plugins/libphoenix-macos-arm64.dylib`, or start
+  the copy it makes by hand (below). `sigscan` builds natively on Apple silicon.
 - Site. `nu scripts/site.nu web` and `node web/tools/bundle-plugins.ts` (set `ESBUILD`
   if esbuild is not on `PATH`), then `nu scripts/fetch.nu <this checkout>` in sunbird-tools/site.
   CI deploys the same files to assets.sunbird.tools on pushes to `main`, and the site picks them up within 10 minutes.
@@ -215,3 +220,157 @@ byte pattern says nothing about arm32.
   composer.
 - QuickJS has no `URLSearchParams`. Check any other web global before a plugin uses it.
 - Discord payload shapes are documented at https://docs.discord.food/.
+
+### macOS Desktop
+
+- `Discord Phoenix.app` is a thin arm64 Mach-O with the hardened runtime, so dyld ignores
+  `DYLD_INSERT_LIBRARIES`. `sunbird-macos.sh` clones the app (`cp -c`, free on APFS) into
+  `~/Library/Application Support/Sunbird/Sunbird.app`, renames it and gives it Sunbird's icon in its
+  Info.plist (the bundle id stays Discord's), and signs it ad hoc without the runtime or
+  Discord's restricted entitlements. The launcher, `/Applications/Sunbird.app` (or
+  `~/Applications` without admin rights), starts it with
+  `open -a <copy> --env DYLD_INSERT_LIBRARIES=<dylib>`, and rebuilds the copy when Discord's
+  executable changes. A second Discord hands off to a running one, so the launcher first quits
+  any Discord Phoenix or copy process without `libphoenix` mapped (`lsof -p`). `SIGTERM` exits it
+  within about a second.
+- Patching Discord Phoenix in place (Vencord-style: `DYLD_INSERT_LIBRARIES` in Info.plist's
+  `LSEnvironment`, re-signed ad hoc) works, but was rejected for the launcher. Writing into the
+  bundle needs App Management on macOS 13+ with SIP on. dyld refuses to start the app when the
+  inserted library is missing. Discord's updater swaps in a whole new bundle, so the first start
+  after each update runs without Sunbird. A Developer ID wouldn't help either way: Discord's
+  keychain and App Group entitlements are bound to its team id.
+- Phoenix re-execs itself once, under the same pid, with its malloc settings and
+  `DISCORD_DESKTOP_MALLOC_REEXEC=1`, unless they are already set. Launch Services sets them from
+  Info.plist's `LSEnvironment`, so a copy started through `open` never re-execs, while one exec'd
+  from a shell always does. The loader stays idle in an image that has neither, and starts only in
+  the last one, then drops itself from `DYLD_INSERT_LIBRARIES`. With SIP off, dyld kills any arm64e
+  child (`osascript`, `nohup`) that inherits an arm64 library. `sigscan check` reports a build without
+  the marker.
+- Data lives in `~/Library/Application Support/libdiscord` (or `LIBDISCORD_DATA_DIR`), Sunbird's
+  home in its `sunbird/`. Tokens are in the login keychain, not the data directory, so a copy with
+  `LIBDISCORD_DATA_DIR` pointed elsewhere still logs in to the owner's accounts. Keep such runs
+  short and delete the directory after.
+- To test by hand, start the copy's executable directly with `DYLD_INSERT_LIBRARIES` and
+  `LIBDISCORD_DATA_DIR` set, never through `nohup` or another platform binary. Logs go to the unified
+  log: `/usr/bin/log stream --predicate 'eventMessage CONTAINS "phoenix:"'` (zsh's builtin `log`
+  shadows it). The debug shell is on and needs `debug-shell-token` from Sunbird's home.
+- `__TEXT` never takes `PROT_WRITE`. `Image::write_code` copies the page with
+  `vm_protect(VM_PROT_COPY)`, which drops its execute bit until it is restored, so the patcher must
+  not share the page. Verified with SIP off only.
+- arm64 locators live in `crates/sigs/src/macos.rs`, on the decoder in `crates/hook/src/arm64.rs`.
+  `sigscan strings`/`refs` resolve `adrp` pairs on Mach-O, and function bounds come from
+  `LC_FUNCTION_STARTS`. The code is heavily outlined (`bl` to tiny shared stubs), so static
+  reading stalls fast. Attach `lldb -p` to a running copy and break on a view's render function
+  for the backtrace instead. A copy lldb launches runs without ASLR, and keeps running after
+  `--batch` ends.
+- The access gate is the same function as on x86, `access()` returning 1 (blocked) or 2 (no gate),
+  and `access_gate` makes it `mov w0, #2; ret`. Its caller is `ldr x8,[x0,#0x78]; cmp x8,#3; b.ne;
+  ...; bl access; bl stub; cset w0,ne`, with `cmp w0,#2` outlined into the stub. The root view
+  switches on that same state word, and its case 3 holds the gate. Don't patch the account checks
+  after it: both of their paths still draw the gate through a stored hook. Verified live: the gate
+  renderer is never hit, and the signed-in view is.
+- lldb on a live copy: `kill -INT` quits Discord, and `process handle SIGTRAP -p true` kills it on
+  the `global-keys` thread's trap. End a wait with
+  `script ...; threading.Timer(n, process.SendAsyncInterrupt).start()`, then `detach`. A render
+  function only runs on a redraw, so wait on input or count hits over a fixed window.
+- `phoenix.discord` works. `macos::http_transport` finds `send` by its anchor string, and the
+  `SendFuture` vtable by an `adrp` pair in `send`. The host allocator isn't located. `send` is hooked
+  with the arm64 `hook_entry`: it overwrites the first 4 instructions with
+  `ldr x16,#8; br x16; .quad`, relocates them into a `MAP_JIT` trampoline, and refuses
+  literal loads and branches back into those 4 instructions. Outlined prologues
+  (`mov x2,x30; bl stub; mov x30,x2`) relocate fine. A debug shell token is only written by the
+  instance owning port 4242, so test a second instance with a plugin in its own
+  `LIBDISCORD_DATA_DIR`, triggered from `phoenix.discord.onResponse` (no timers, and no session
+  until Discord's first request).
+- Calling convention. x86 passes a large return's slot as the first argument and returns it, arm64
+  passes it in `x8`. gpui.rs and the settings detour are written the x86 way, so on arm64 calls out
+  go through `image::sret_caller` (slot into `x8`, arguments shifted down, slot back in `x0`).
+  Detours are entered through `image::sret_callee`, which does the reverse. Up to seven register
+  arguments; floats are untouched. Rust lays out the structs the same on both.
+- Settings. `macos::settings_label_parts` finds the packed `PhoenixDESKTOP_PHOENIX`, and
+  `settings_visibility` finds every copy of `sub wA,wB,#9; cmp wA,#0xf; b.hi T`
+  where `T` is `cmp wB,#0; cset ne`. That is the out-of-line `is_page_visible` and the copy inlined
+  into the sidebar; the sidebar uses only the inlined one. The runtime lowers each `cmp` to `#0xe`. `settings_section` finds
+  `host::section` (x8 return, x0-x4 args, active page `ldrb [copy of x0, #0x61f]` on this build).
+  `settings::install_arm64` relabels page 24 to Sunbird, unhides it and hooks the section through
+  the thunks. Until the GPUI builders exist it renders Discord's own page 24 and opens the
+  dashboard window once per visit. Verified: the entry shows above Log Out (window screenshot), and 26
+  section renders went through the hook with no crash. Clicking the entry is untested.
+- `Pattern::new` panics without a literal byte, and a panic in the loader's constructor aborts
+  Discord. Pass the x86 frame prologue to the arm64 `hook_entry`, which ignores it.
+- Struct layouts. `macos::debug_offsets` reads a `Debug::fmt` that calls `DebugStruct::field`
+  (`x1`/`w2` name, `x3` = self + offset, `x4` vtable, nested through vtable + 0x18). It follows
+  branches with per-path register state, because fields on different paths move the same base
+  with writeback loads (`ldr w8, [x19, #8]!`); read in a straight line, one path's writeback
+  leaks into the next. `style_offsets` finds every `StyleRefinement` field this way. The size
+  check needs the Div layout, which is still to do.
+- Outlined stubs. A `bl` to a tiny frameless stub ending in `b T` is a call to `T`, with the
+  stub setting arguments from the caller's frame (`add x8, sp, #0x400; b div_new`). A stub
+  ending in `ret` only sets arguments. On this build: `div_new` 0x10803cf20 (x8 out, x0
+  `&Location`), `Switch::new` 0x106859a98 (x8 out, x0/x1 id, w2 checked), `switch_label`
+  0x106e6ec7c and `switch_desc` 0x106eb61b0 (store at +0x98/+0xb0). `Switch` is 0x1d8 bytes
+  (the memcpy size), and `on_change` is generic, monomorphized per closure.
+- Gateway registry. macOS keeps `MESSAGE_UPDATE`, `MESSAGE_DELETE`, reactions, presence, typing
+  and more in a flat table apart from the domain tables. `registry.rs` walks it from
+  `MESSAGE_UPDATE` when the other walks miss that event, which takes macOS from 87 to 175 events.
+  Platforms that already have the event are unchanged. Verified: a hook on `messageDelete`, which
+  is only in that table, fires.
+- Staff. `macos::staff` finds `flag_override` from its readers (`ldr wT,[b,#t]; tbz wT,#0;
+  ldr xV,[b,#t+8]; orr; tbnz #0`), folding in the `add b, s, #0x8, lsl #12` page base. On this
+  build that's `+0x8f30`/`+0x8f38`, with 3 readers agreeing. A `mov` is an `orr` from `xzr`, so
+  require a real second operand. The user tag before it (`+0x8e98`) is compared only against 1 and
+  2; other values, like `u64::MAX`, are valid, so it is no sanity check. Verified: the Staff Only
+  section (Experiments, Build Overrides, Developer Options) shows.
+- Shortcuts. `ui-desktop/src/macos.rs` installs an `NSEvent` local key monitor (a hand-built global
+  block): Control-Shift-U opens settings, Control-Shift-I DevTools. Command-Shift-U is Discord's
+  Upload File, and Discord's own DevTools stay on Command-Option-I. The monitor only sees keys while
+  Discord is focused. When testing with System Events, confirm focus first; a window opened by the
+  previous shortcut takes it.
+- `Image` gained `function_starts`. Every constructor needs it, Windows' included: cross-check
+  with `cargo clippy --target x86_64-pc-windows-gnu -p phoenix-hook -p phoenix-sigs`, which
+  needs no C toolchain.
+- GPUI builders. `macos::gpui` reads the same two call sites as x86 (the Developer Mode row,
+  the `TesterUpdates` button and its `ActionRow`), but by role: in a stub-flattened stream
+  (`sigscan <bin> flat <from> <to>` prints one) it keeps only calls that return through a stack
+  slot (`add x8, sp` since the last call), minus i18n lookups (a 64-bit hash in `x2`). Every
+  builder that returns a value goes through an `sret_caller` thunk in `gpui::arm64_builders`.
+  `macos::gpui_layouts` reads the Div (0x88, children +0x40 from `div_child_div`'s push,
+  `Interactivity` boxed at +8 by `div_new`), the `StyleRefinement` size from
+  `Interactivity::default`'s box, `Switch` (0x248; label +0x98 and description +0xb0 from the
+  setters' `ldrb w8, [x, #off]!; cmp w8, #0xff`; the 0x1d8 copies are its leading field
+  struct) and `Button` (0x328, `on_click` +0x298). Handler setters allocate the `Rc` (`mov w0,
+  #8; mov w1, #size; bl alloc`), store it, then copy out. The Button's variant and size aren't
+  decoded; their offsets are past the scratch buffer, so the runtime skips them.
+  `SharedString::into_any_element` (beside `div_child_div`) checks tags 0xff and 0x19, the
+  same as x86.
+- Accessories. `macos::message_row` is the common caller of the `\x10message-content-`
+  helpers (the code refs point at the length byte). The row holds the message's `Rc` at +0x7c0,
+  the message is at +0x10 in it, and the id at +0x1d8. The render takes `x0` row, `x1`..`x7`,
+  `d0` and one stack word, and returns the 0x20-byte `AnyElement` through `x8`; the detour is
+  native and passes four stack words through. A tint also gets a faint background now, on every
+  platform. The x86 body-text recolor (`message_body`) has no arm64 locator.
+- Plugin pages and dialogs (`openPage`, `choose`, `showSheet`) are `AppKit` windows on macOS
+  (`ui-desktop/src/macos/panel.rs`), routed from `modal::open_page`/`open_choice`/`close_page`: a
+  vertical `NSStackView` of headings, button rows, wrapping labels and `scrollableTextView`s. One
+  target object answers every button by tag and is each window's delegate, so closing a dialog
+  answers -1. Verified: both render and size correctly.
+- Message actions. `macos::message_context_menu` finds the builder by its `MessageContextMenu`
+  string and flattens its stubs (a `bl` to a stub ending `b T` becomes `bl T`). Items are built
+  `i18n -> MenuItem::new::<F> -> with_id -> [with_icon] -> push`; every `MenuItem::new::<F>` ends
+  in `mov x3,x1; mov w1,#0; b core`, and each core runs `props_new` (`add x8,sp,#k; bl`), boxes
+  the closure, copies the props (`add x0,x19,#0x20; add x1,sp; mov w2,#0x1c8; bl memcpy`) and
+  writes `stp rc,vtable,[x19,#0x10]; mov w8,#2; stp x8,xzr,[x19]`. `push` strides by `mov w9,
+  #0x1f8; madd`. The input holds the message id at +0x80 and the channel id at +0x88 (one `ldp`;
+  the channel goes to the permission check). The detour is a native `extern "C"` function (a
+  24-byte return goes through `x8`), and the constructors are called through `sret_caller`.
+  `SharedString` keeps x86's tags (0x18 static). Discord's Rust heap may be its own malloc zone, so
+  our `Rc` handlers are pinned (`gpui::pinned_rc_u64`) and never freed by Discord. The separator
+  tag isn't verified, so arm64 items follow Discord's without one, and there's no `with_color`.
+- Test a second instance with `open -n -a <copy> --env DYLD_INSERT_LIBRARIES=... --env
+  LIBDISCORD_DATA_DIR=...`. Exec'd from a shell it re-execs, and the loader in the last image
+  hooks but `start` never logs and the window shows the access gate; through Launch Services it
+  starts normally. Under lldb, the debugger's `MallocNanoZone=0` makes the first image claim, so
+  the re-exec runs without Sunbird.
+- Still x86-only: badges, message JSON, optimistic delete and the message body recolor. `X86_CODE` in `runtime-desktop` keeps them from
+  running on arm64. Handlers keep the desktop result ABI: 96 bytes, `Ok` is `u64::MAX - 1`,
+  returned through `x8`.

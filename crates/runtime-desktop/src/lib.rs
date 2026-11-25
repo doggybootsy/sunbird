@@ -1,7 +1,11 @@
 //! phoenix on Desktop Phoenix: the access gate, the HTTP transport hooks, the
 //! Sunbird pages in User Settings, message accessories and the tray.
 
-#![cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#![cfg(any(
+   windows,
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "x86_64")
+))]
 
 mod accessories;
 mod badges;
@@ -90,11 +94,17 @@ struct DialogAnswer {
    index: i32,
 }
 
+/// Whether Discord's code is x86-64, which every locator in
+/// `phoenix_sigs::desktop` and `http` decodes. macOS Phoenix is arm64 only, so
+/// there they are never run, an x86 patch can never land in arm64 code, and
+/// what they locate stays off.
+pub(crate) const X86_CODE: bool = cfg!(all(target_arch = "x86_64", not(target_os = "macos")));
+
 /// The target and its swapped gateway registry, once [`prepare`] hooked them.
 static PREPARED: Mutex<Option<(Image<'static>, &'static GatewayRegistry)>> = Mutex::new(None);
 
-/// Hooks Discord from `DllMain` on Windows or the `.init_array` constructor on
-/// Linux, before its own code runs.
+/// Hooks Discord from `DllMain` on Windows or the constructor on Linux and
+/// macOS, before its own code runs.
 ///
 /// Desktop Phoenix settles on the access gate in its first frames and stops
 /// reading the gateway registry and HTTP vtables once started, so hooks swapped
@@ -104,18 +114,29 @@ pub fn prepare() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
    open_access_gate(&image);
-   staff::prepare(&image);
    settings::install(&image);
-   modal::install(&image);
-   accessories::install(&image);
-   context_menu::install(&image);
-   message::install(&image);
-   badges::install(&image);
-   <os::Os as os::DesktopOs>::install(&image);
+   staff::prepare(&image);
+   if X86_CODE {
+      modal::install(&image);
+      accessories::install(&image);
+      context_menu::install(&image);
+      message::install(&image);
+      badges::install(&image);
+      <os::Os as os::DesktopOs>::install(&image);
+   } else {
+      context_menu::install(&image);
+      accessories::install(&image);
+      log::info!(
+         "arm64 Desktop: plugin pages and dialogs are AppKit windows; badges, message JSON and \
+          optimistic delete stay off"
+      );
+   }
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
       discord::install(&image);
-      accessories::install_optimistic_delete(&image);
+      if X86_CODE {
+         accessories::install_optimistic_delete(&image);
+      }
    }
    // The index is tens of MB and nothing reads it after startup.
    phoenix_sigs::desktop::release_call_index();
@@ -157,6 +178,11 @@ fn open_access_gate(image: &Image<'static>) {
    /// `mov al, 2; ret`
    const ALLOWED: [u8; 3] = [0xB0, 0x02, 0xC3];
 
+   if !X86_CODE {
+      open_arm64_access_gate(image);
+      return;
+   }
+
    let access = match phoenix_sigs::desktop::access_gate(image) {
       Ok(access) => access,
       Err(err) => {
@@ -167,6 +193,23 @@ fn open_access_gate(image: &Image<'static>) {
    // SAFETY: Discord's own code, written from `DllMain` or the constructor
    // before it runs.
    match unsafe { image.write_code(access, &ALLOWED) } {
+      Ok(()) => log::info!("access gate: open"),
+      Err(err) => log::error!("access gate: {err}"),
+   }
+}
+
+/// [`open_access_gate`] on arm64: the same function, answering "no gate"
+/// ([`phoenix_sigs::macos::access_gate`]).
+fn open_arm64_access_gate(image: &Image<'static>) {
+   let access = match phoenix_sigs::macos::access_gate(image) {
+      Ok(access) => access,
+      Err(err) => {
+         log::warn!("access gate: {err}, leaving it");
+         return;
+      },
+   };
+   // SAFETY: Discord's own code, written from the constructor before it runs.
+   match unsafe { image.write_code(access, &phoenix_sigs::macos::NO_GATE) } {
       Ok(()) => log::info!("access gate: open"),
       Err(err) => log::error!("access gate: {err}"),
    }
@@ -247,7 +290,11 @@ impl Platform for Desktop {
       });
       phoenix_ui_desktop::notify(
          "Sunbird ready",
-         Some("Open User Settings -> Sunbird, or press Ctrl+Shift+I for DevTools"),
+         Some(if X86_CODE {
+            "Open User Settings -> Sunbird, or press Ctrl+Shift+I for DevTools"
+         } else {
+            "Sunbird's settings are in its menu bar item"
+         }),
       );
       phoenix_runtime::update::check();
    }

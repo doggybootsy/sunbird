@@ -21,9 +21,12 @@ use rquickjs::{
 };
 use serde::Serialize;
 
-use crate::os::{
-   DesktopOs,
-   Os,
+use crate::{
+   X86_CODE,
+   os::{
+      DesktopOs,
+      Os,
+   },
 };
 
 const MAX_LIST: usize = 64;
@@ -109,6 +112,15 @@ impl From<&x86::CodeRef> for Site {
    }
 }
 
+/// Code references from x86-64 decoding, none when Discord's code is arm64,
+/// where decoding it as x86 would only list noise.
+fn x86_refs(refs: impl FnOnce() -> Vec<x86::CodeRef>) -> Vec<Site> {
+   if !X86_CODE {
+      return Vec::new();
+   }
+   refs().iter().take(MAX_LIST).map(Site::from).collect()
+}
+
 /// The console's `phoenix.native`.
 #[expect(clippy::too_many_lines, reason = "one setter per method, each short")]
 pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
@@ -147,11 +159,7 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
             .map(|at| {
                Found {
                   at:    place(at),
-                  loads: x86::literal_loads(image, at)
-                     .iter()
-                     .take(MAX_LIST)
-                     .map(Site::from)
-                     .collect(),
+                  loads: x86_refs(|| x86::literal_loads(image, at)),
                }
             })
             .collect::<Vec<_>>();
@@ -169,11 +177,7 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
          let image = image().ok_or_else(|| Exception::throw_internal(&ctx, "not started"))?;
          let addr = parse(&ctx, &addr)?;
          let refs = Refs {
-            code:     x86::code_refs(image, addr..addr + 1)
-               .iter()
-               .take(MAX_LIST)
-               .map(Site::from)
-               .collect(),
+            code:     x86_refs(|| x86::code_refs(image, addr..addr + 1)),
             pointers: image
                .pointers_to(addr)
                .into_iter()
@@ -201,6 +205,12 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
       Function::new(
          ctx.clone(),
          |ctx: Ctx<'js>, addr: Value<'js>, count: Opt<usize>| {
+            if !X86_CODE {
+               return Err(Exception::throw_internal(
+                  &ctx,
+                  "phoenix.native.dis decodes x86-64, and this Discord is arm64",
+               ));
+            }
             let addr = parse(&ctx, &addr)?;
             let count = count.0.unwrap_or(20).min(500);
             let code = Os::read_memory(addr, count * 16).unwrap_or_default();
@@ -456,7 +466,7 @@ mod observe {
    }
 }
 
-/// `phoenix.native.hook` until `phoenix_hook::x86::observe` saves SysV
+/// `phoenix.native.hook` until `phoenix_hook::x86::observe` saves `SysV`
 /// argument registers.
 #[cfg(not(windows))]
 mod observe {

@@ -10,6 +10,10 @@ const SEED: &str = "MESSAGE_CREATE";
 /// `RESUMED`, etc.) whose slice sits separately from the main registry or
 /// domain table.
 const DOMAIN_SEED: &str = "READY_SUPPLEMENTAL";
+/// An event every client handles. macOS Phoenix keeps it, with others, in a
+/// flat table apart from the domain tables, which is walked only when the
+/// walks above miss it.
+const SPLIT_SEED: &str = "MESSAGE_UPDATE";
 const STRIDE: usize = 3 * size_of::<usize>();
 /// Stride of a `libdiscord` domain reducer descriptor:
 /// `{domain_name_ptr, domain_name_len, domain_id, slice_ptr, slice_len}`.
@@ -67,6 +71,12 @@ impl GatewayRegistry {
          Ok(domain) => merge_entries(&mut entries, domain),
          Err(Error::NotFound { .. }) => {},
          Err(err) => return Err(err),
+      }
+
+      if !entries.iter().any(|entry| entry.name == SPLIT_SEED)
+         && let Ok(split) = walk_flat(image, SPLIT_SEED)
+      {
+         merge_entries(&mut entries, split);
       }
 
       let by_name = entries
@@ -169,8 +179,8 @@ fn entry(image: &Image<'_>, slot: usize) -> Option<GatewayEntry> {
       return None;
    }
    Some(GatewayEntry {
-      name:    String::from_utf8(name.to_vec()).ok()?,
-      slots:   vec![slot],
+      name: String::from_utf8(name.to_vec()).ok()?,
+      slots: vec![slot],
       handler,
    })
 }

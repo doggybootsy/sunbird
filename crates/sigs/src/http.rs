@@ -21,7 +21,7 @@ use crate::Found;
 
 /// Unique error string inside `ReqwestTransport::send` when handed a mobile
 /// host-file body.
-const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
+pub(crate) const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
 
 /// Located vtable slots and host allocator entry points for Desktop Phoenix's
 /// `libdiscord/crates/http` transport.
@@ -67,8 +67,8 @@ impl DesktopHttpTransport {
          return Err("no Transport vtable holds ReqwestTransport::send".to_owned());
       }
 
-      // 3. The `Box::pin` of the async state machine returns `(ptr, poll_vtable)`,
-      //    from `send_fn` itself or a small helper it calls.
+      // 3. The `Box::pin` of the async state machine returns `(ptr,
+      //    poll_vtable)`, from `send_fn` itself or a small helper it calls.
       let (poll_fn, poll_vtable, box_future) = find_poll_vtable(image, send_fn, send_end)?;
       let mut poll_slots = find_vtable_method_slots(image, poll_fn, 0x100..=0x4000);
       let direct_slot = poll_vtable + 24;
@@ -77,8 +77,8 @@ impl DesktopHttpTransport {
       }
 
       // 4. The host's own `__rust_alloc` and `__rust_dealloc`, so response body
-      //    growth stays allocator-compatible. Both hand the same global allocator
-      //    static to its implementation.
+      //    growth stays allocator-compatible. Both hand the same global
+      //    allocator static to its implementation.
       let host_alloc = box_future.and_then(|box_future| find_host_alloc(image, abi, box_future));
       let host_dealloc = find_host_dealloc(image, abi, send_fn, send_end)
          .or_else(|| host_alloc.and_then(|alloc| dealloc_beside(image, abi, alloc)));
@@ -105,7 +105,7 @@ impl DesktopHttpTransport {
 
 /// Finds all `.rdata` vtable method-0 slots (`vtable + 24`) holding `method_fn`
 /// where `[drop_fn, size, align, method_fn]` passes Rust trait vtable checks.
-fn find_vtable_method_slots(
+pub(crate) fn find_vtable_method_slots(
    image: &Image<'_>,
    method_fn: usize,
    size_range: std::ops::RangeInclusive<usize>,

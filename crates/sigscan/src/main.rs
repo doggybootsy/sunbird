@@ -1,4 +1,5 @@
-//! `sigscan <library.so | Discord.exe> [command]`
+//! `sigscan <library.so | Discord.exe | Discord.app/Contents/MacOS/Discord>
+//! [command]`
 //!
 //! Loads an ELF or PE64 binary the way the OS loader maps it and dumps the
 //! gateway registry the runtime would hook. On x86-64 files it also finds
@@ -28,6 +29,7 @@ use misstep::{
    ResultExt,
 };
 use phoenix_hook::{
+   arm64,
    image::Image,
    pattern::Pattern,
    x86,
@@ -70,7 +72,11 @@ fn main() -> misstep::Result<()> {
          .with_context(|| format!("{text} is not a hex address"))?;
       Ok(if value < base { base + value } else { value })
    };
-   let tools = Tools { image, base };
+   let tools = Tools {
+      image,
+      base,
+      arm64: parsed.machine() == Machine::Aarch64,
+   };
    match args.get(1).map(String::as_str) {
       None => dump(image),
       Some("check") => {
@@ -94,9 +100,19 @@ fn main() -> misstep::Result<()> {
          tools.dis(addr(2)?, count);
          Ok(())
       },
+      Some("flat") if tools.arm64 => {
+         let from = addr(2)?;
+         let to = args.get(3).map_or(Ok(from + 0x400), |_| addr(3))?;
+         tools.flat(from, to);
+         Ok(())
+      },
       Some(_) => Err(misstep::Report::msg(USAGE)),
    }
 }
+
+/// A string only the desktop clients carry, which tells macOS Phoenix from
+/// iOS's `PhoenixFatClient`; both are arm64 Mach-O.
+const MACOS_DESKTOP: &[u8] = b"DESKTOP_ACCESS_GATE_TITLE";
 
 /// Runs every locator for `machine` and prints what each found.
 #[expect(clippy::too_many_lines, reason = "one report per locator")]
@@ -326,6 +342,93 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             }),
          );
       },
+      // macOS Phoenix, the desktop client built for arm64.
+      Machine::Aarch64 if macho && !image.find_bytes(MACOS_DESKTOP).is_empty() => {
+         report(
+            "malloc re-exec",
+            image
+               .find_bytes(phoenix_sigs::MACOS_REEXEC.as_bytes())
+               .first()
+               .map(|&found| at(found))
+               .ok_or_else(|| "the loader waits for a re-exec this build never does".to_owned()),
+         );
+         report(
+            "malloc settings",
+            image
+               .find_bytes(phoenix_sigs::MACOS_MALLOC.as_bytes())
+               .first()
+               .map(|&found| at(found))
+               .ok_or_else(|| "the loader can't tell a launch that never re-execs".to_owned()),
+         );
+         report(
+            "http transport",
+            phoenix_sigs::macos::http_transport(image).map(|http| {
+               format!(
+                  "send {} ({} slots), poll {} ({} slots)",
+                  at(http.send_fn),
+                  http.send_slots.len(),
+                  at(http.poll_fn),
+                  http.poll_slots.len()
+               )
+            }),
+         );
+         report(
+            "settings label",
+            phoenix_sigs::macos::settings_label_parts(image)
+               .map(|label| format!("{} (id {})", at(label.name), at(label.id))),
+         );
+         report(
+            "settings visibility",
+            phoenix_sigs::macos::settings_visibility(image)
+               .map(|guards| guards.into_iter().map(at).collect::<Vec<_>>().join(", ")),
+         );
+         report(
+            "settings section",
+            phoenix_sigs::macos::settings_section(image)
+               .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),
+         );
+         // The size comes with the Div layout; until then only the fields
+         // are checked, against the largest a StyleRefinement could be.
+         report(
+            "style offsets",
+            phoenix_sigs::macos::style_offsets(image, 0x400).map(|style| {
+               format!(
+                  "font {:#x}, color {:#x}, background {:#x}, padding {:x?}, gap {:x?}",
+                  style.font_size, style.text_color, style.background, style.padding, style.gap
+               )
+            }),
+         );
+         report(
+            "staff flag",
+            phoenix_sigs::macos::staff(image).map(|field| format!("{field:x?}")),
+         );
+         report(
+            "message context menu",
+            phoenix_sigs::macos::message_context_menu(image).map(|menu| format!("{menu:x?}")),
+         );
+         let gpui = phoenix_sigs::macos::gpui(image);
+         report(
+            "gpui builders",
+            gpui.clone().map(|gpui| format!("{gpui:x?}")),
+         );
+         report(
+            "gpui layouts",
+            gpui
+               .and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, &gpui))
+               .map(|layout| format!("{layout:x?}")),
+         );
+         report(
+            "message row",
+            phoenix_sigs::macos::message_row(image).map(|row| format!("{row:x?}")),
+         );
+         for name in ["media fetch", "message json"] {
+            report(name, Err("no arm64 Desktop locator yet".to_owned()));
+         }
+         report(
+            "access gate",
+            phoenix_sigs::macos::access_gate(image).map(at),
+         );
+      },
       Machine::Aarch64 if macho => {
          report(
             "guest bridge",
@@ -421,9 +524,49 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 struct Tools<'a> {
    image: &'a Image<'a>,
    base:  usize,
+   /// Mach-O files are arm64, everything else sigscan reads as x86-64 here.
+   arm64: bool,
 }
 
 impl Tools<'_> {
+   /// The arm64 function holding `from`, with its outlined stubs inlined,
+   /// from `from` to `to`: calls, immediates and the addresses `adrp`
+   /// pairs load (with the bytes there when they read as text).
+   fn flat(&self, from: usize, to: usize) {
+      use phoenix_hook::arm64::Insn;
+      let Some(func) = self.image.function_containing(from) else {
+         println!("{} is in no function", self.at(from));
+         return;
+      };
+      let mut pages = [None::<usize>; 32];
+      for (pc, insn) in phoenix_sigs::macos::flattened_at(self.image, func) {
+         if let Insn::Adrp { rd, page } = insn {
+            pages[usize::from(rd)] = Some(page);
+         }
+         if !(from..to).contains(&pc) {
+            continue;
+         }
+         let text = match insn {
+            Insn::Bl { target } => format!("call {target:#x}"),
+            Insn::AddImm { rd, rn, imm } => {
+               match pages[usize::from(rn)] {
+                  Some(page) if rn != 31 => {
+                     let addr = page + imm;
+                     let preview = self.image.read(addr, 24).map_or_else(String::new, |bytes| {
+                        String::from_utf8_lossy(bytes).replace(|c: char| c.is_control(), ".")
+                     });
+                     format!("x{rd} = {addr:#x} \"{preview}\"")
+                  },
+                  _ => format!("{insn:x?}"),
+               }
+            },
+            Insn::Adrp { .. } => continue,
+            other => format!("{other:x?}"),
+         };
+         println!("{pc:#x}  {text}");
+      }
+   }
+
    fn at(&self, addr: usize) -> String {
       format!("{addr:#x} (rva {:#x})", addr - self.base)
    }
@@ -432,6 +575,14 @@ impl Tools<'_> {
       let found = self.image.find_bytes(text.as_bytes());
       if found.is_empty() {
          return Err(misstep::Report::msg(format!("{text:?} is not in the file")));
+      }
+      if self.arm64 {
+         for at in found.into_iter().take(16) {
+            println!("{text:?} at {}", self.at(at));
+            // Rust packs string literals together, so a load may start earlier.
+            self.print_arm64_refs(at.saturating_sub(0x40)..at + 1);
+         }
+         return Ok(());
       }
       for at in found.into_iter().take(16) {
          println!("{text:?} at {}", self.at(at));
@@ -464,7 +615,33 @@ impl Tools<'_> {
       Ok(())
    }
 
+   fn print_arm64_refs(&self, targets: std::ops::Range<usize>) {
+      let refs = arm64::code_refs(self.image, targets);
+      if refs.is_empty() {
+         println!("   no code loads it");
+      }
+      for (site, target) in refs.into_iter().take(64) {
+         let function = self
+            .image
+            .function_bounds(site)
+            .map(|(start, _)| format!("   in fn {} +{:#x}", self.at(start), site - start));
+         println!(
+            "   {} -> {}{}",
+            self.at(site),
+            self.at(target),
+            function.unwrap_or_default()
+         );
+      }
+   }
+
    fn refs(&self, target: usize) {
+      if self.arm64 {
+         self.print_arm64_refs(target..target + 1);
+         for pointer in self.image.pointers_to(target).into_iter().take(64) {
+            println!("   pointer at {}", self.at(pointer));
+         }
+         return;
+      }
       let code = x86::code_refs(self.image, target..target + 1);
       let pointers = self.image.pointers_to(target);
       println!(

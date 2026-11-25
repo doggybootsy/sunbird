@@ -77,7 +77,7 @@ impl SharedString {
       }
       // SAFETY: `inner` holds `16 + s.len()` bytes, aligned to 8.
       unsafe {
-         inner.cast::<[usize; 2]>().write([1, 1]);
+         ptr::copy_nonoverlapping([1usize, 1].as_ptr().cast::<u8>(), inner, 16);
          ptr::copy_nonoverlapping(s.as_ptr(), inner.add(16), s.len());
       }
       Self {
@@ -150,6 +150,17 @@ pub struct RcInner {
    strong:    usize,
    weak:      usize,
    action_id: u64,
+}
+
+/// An `Rc<u64>` whose counts never reach zero, so Discord never frees it:
+/// for when Discord's allocator isn't located (macOS, whose Rust heap may be
+/// its own malloc zone). Leaks 24 bytes.
+pub fn pinned_rc_u64(value: u64) -> *mut RcInner {
+   Box::into_raw(Box::new(RcInner {
+      strong:    usize::MAX / 4,
+      weak:      usize::MAX / 4,
+      action_id: value,
+   }))
 }
 
 #[repr(C)]
@@ -519,10 +530,14 @@ pub fn locate(image: &Image<'static>) -> bool {
       return true;
    }
 
-   let found = desktop::gpui(image).and_then(|gpui| {
-      let layout = desktop::gpui_layouts(image, &gpui)?;
-      Ok((gpui, layout))
-   });
+   let found = if crate::X86_CODE {
+      desktop::gpui(image).and_then(|gpui| {
+         let layout = desktop::gpui_layouts(image, &gpui)?;
+         Ok((gpui, layout))
+      })
+   } else {
+      arm64_builders(image)
+   };
    let (
       desktop::Gpui {
          caller_loc,
@@ -585,6 +600,39 @@ pub fn locate(image: &Image<'static>) -> bool {
    );
    log::info!("desktop gpui: {found_layout:x?}");
    true
+}
+
+/// The arm64 builders ([`phoenix_sigs::macos::gpui`]) with every one that
+/// returns through `x8` swapped for an `image::sret_caller` thunk, so they
+/// are called the x86 way, result slot first, like the types here say.
+#[cfg(target_os = "macos")]
+fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), String> {
+   let gpui = phoenix_sigs::macos::gpui(image)?;
+   let layout = phoenix_sigs::macos::gpui_layouts(image, &gpui)?;
+   let thunk = |addr: usize| {
+      phoenix_hook::image::sret_caller(addr).ok_or_else(|| "no memory for a thunk".to_owned())
+   };
+   let thunked = desktop::Gpui {
+      div_new: thunk(gpui.div_new)?,
+      div_flex: thunk(gpui.div_flex)?,
+      div_flex_col: thunk(gpui.div_flex_col)?,
+      div_child_div: thunk(gpui.div_child_div)?,
+      div_child_button: thunk(gpui.div_child_button)?,
+      div_into_any: thunk(gpui.div_into_any)?,
+      str_into_any: gpui.str_into_any.map(thunk).transpose()?,
+      text_block: thunk(gpui.text_block)?,
+      switch_new: thunk(gpui.switch_new)?,
+      switch_into_div: thunk(gpui.switch_into_div)?,
+      button_new: thunk(gpui.button_new)?,
+      action_row: thunk(gpui.action_row)?,
+      ..gpui
+   };
+   Ok((thunked, layout))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm64_builders(_image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), String> {
+   Err("no arm64 builders off macOS".to_owned())
 }
 
 /// `div.f(..)` for a `Div` builder taking and returning it by value.
@@ -1136,6 +1184,9 @@ pub fn wrap_with_accessories(
          s.hsla(s.at.text_color, hsla);
          s.length(s.at.border_widths[3], gpui_px(3.0));
          s.hsla(s.at.border_color, hsla);
+         // A faint wash of the tint behind the whole row.
+         let [h, sat, l, _] = hsla;
+         s.solid_background([h, sat, l, 0.12]);
       });
    }
    if !b.push_any(&mut outer, &mut orig) {
@@ -1484,7 +1535,8 @@ fn render_plugins_tab(
          for setting in &plugin.settings {
             let sid = format!("sunbird-set-{}-{}", plugin.name, setting.key);
             let sdesc = setting.description.as_deref().unwrap_or("");
-            // A text, number or secret setting: its value, and Edit for an input.
+            // A text, number or secret setting: its value, and Edit for an
+            // input.
             let edit_row = |shown: &str, initial: String, kind: FieldKind| {
                let sub = if sdesc.is_empty() {
                   shown.to_owned()
@@ -1601,7 +1653,11 @@ fn render_plugins_tab(
                   );
                },
                Control::Text(val) => {
-                  let shown = if val.is_empty() { "empty" } else { val.as_str() };
+                  let shown = if val.is_empty() {
+                     "empty"
+                  } else {
+                     val.as_str()
+                  };
                   drawer = b.push_div(drawer, edit_row(shown, val.clone(), FieldKind::Text));
                },
                Control::Secret(val) => {

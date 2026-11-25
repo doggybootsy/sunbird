@@ -72,14 +72,16 @@ type WithColorFn = unsafe extern "C" fn(*mut RawMenuItem, *mut RawMenuItem, u8) 
 type VecPushFn = unsafe extern "C" fn(*mut RawMenuVec, *mut RawMenuItem);
 
 struct MenuSymbols {
-   orig_build:        BuildMenuFn,
+   /// x86's [`BuildMenuFn`]; arm64 keeps its own in `arm64::ORIG`.
+   orig_build:        Option<BuildMenuFn>,
    msg_ptr_offset:    usize,
    msg_id_offset:     usize,
    channel_id_offset: usize,
    props_new:         PropsNewFn,
    with_id:           WithIdFn,
    with_icon:         WithIconFn,
-   with_color:        WithColorFn,
+   /// Not located on arm64, where danger items keep the default color.
+   with_color:        Option<WithColorFn>,
    vec_push:          VecPushFn,
    layout:            MenuLayout,
 }
@@ -228,6 +230,11 @@ fn map_icon(icon: Option<&str>) -> Option<u16> {
 
 /// Locates and hooks `MessageContextMenu` from `DllMain`.
 pub fn install(image: &Image<'static>) {
+   if !crate::X86_CODE {
+      #[cfg(target_os = "macos")]
+      arm64::install(image);
+      return;
+   }
    let menu = match desktop::message_context_menu(image) {
       Ok(menu) => menu,
       Err(err) => {
@@ -257,14 +264,14 @@ pub fn install(image: &Image<'static>) {
    // SAFETY: every address was validated by `desktop::message_context_menu`.
    let syms = unsafe {
       MenuSymbols {
-         orig_build:        std::mem::transmute::<usize, BuildMenuFn>(trampoline),
+         orig_build:        Some(std::mem::transmute::<usize, BuildMenuFn>(trampoline)),
          msg_ptr_offset:    menu.msg_ptr_offset,
          msg_id_offset:     menu.msg_id_offset,
          channel_id_offset: menu.channel_id_offset,
          props_new:         std::mem::transmute::<usize, PropsNewFn>(menu.props_new),
          with_id:           std::mem::transmute::<usize, WithIdFn>(menu.with_id),
          with_icon:         std::mem::transmute::<usize, WithIconFn>(menu.with_icon),
-         with_color:        std::mem::transmute::<usize, WithColorFn>(menu.with_color),
+         with_color:        Some(std::mem::transmute::<usize, WithColorFn>(menu.with_color)),
          vec_push:          std::mem::transmute::<usize, VecPushFn>(menu.vec_push),
          layout:            menu.layout,
       }
@@ -323,8 +330,11 @@ unsafe extern "C" fn build_context_menu_detour(
       (0, 0)
    };
 
+   let Some(orig_build) = syms.orig_build else {
+      return sret;
+   };
    // SAFETY: forwards all arguments verbatim to the original menu builder.
-   let out = unsafe { (syms.orig_build)(sret, input, a2, a3, s0, s1, s2, s3) };
+   let out = unsafe { orig_build(sret, input, a2, a3, s0, s1, s2, s3) };
 
    if message_id == 0 || sret.is_null() || ACTIVE_COUNT.load(Ordering::Acquire) == 0 {
       return out;
@@ -405,8 +415,10 @@ fn append_plugin_actions(
 
    // Push a native separator first if the menu already has Discord's own items.
    // SAFETY: `vec` is the live `Vec<MenuItem>` just returned by `orig_build`.
+   // arm64's separator tag isn't verified, so its items follow Discord's
+   // without one.
    let has_existing = unsafe { (*vec).len > 0 };
-   if has_existing {
+   if has_existing && crate::X86_CODE {
       let mut sep = RawMenuItem::zeroed();
       sep.put(0, layout::MENU_ITEM_SEPARATOR_TAG);
       // SAFETY: `vec_push` copies one `MenuItem`, which fits `sep`.
@@ -420,8 +432,13 @@ fn append_plugin_actions(
          message: message_id,
          channel: channel_id,
       });
-      let Some(rc_ptr) = gpui::alloc_rc_u64(token) else {
-         continue;
+      let rc_ptr = if crate::X86_CODE {
+         let Some(rc_ptr) = gpui::alloc_rc_u64(token) else {
+            continue;
+         };
+         rc_ptr
+      } else {
+         gpui::pinned_rc_u64(token)
       };
       let label_ss = SharedString::from_str(&action.label);
       let id_str = gpui::intern_str(&format!("sunbird-msg-action-{}", action.id));
@@ -450,13 +467,179 @@ fn append_plugin_actions(
             item = next;
          }
 
-         if action.danger {
+         if action.danger
+            && let Some(with_color) = syms.with_color
+         {
             let mut next = RawMenuItem::zeroed();
-            (syms.with_color)(&raw mut next, &raw mut item, 2);
+            with_color(&raw mut next, &raw mut item, 2);
             item = next;
          }
 
          (syms.vec_push)(vec, &raw mut item);
       }
+   }
+}
+
+/// `MessageContextMenu` on macOS, arm64
+/// ([`phoenix_sigs::macos::message_context_menu`]).
+///
+/// The builder takes `x0` input, `x1` the context the item constructors take,
+/// `x2`..`x5` and `d0`, and returns `Vec<MenuItem>` through `x8`, which a
+/// Rust `extern "C"` function returning a 24-byte struct does too, so the
+/// detour is native. The item constructors take their result slot in `x8`
+/// and are called through `image::sret_caller` thunks, so
+/// [`append_plugin_actions`] calls them the x86 way.
+#[cfg(target_os = "macos")]
+mod arm64 {
+   use std::{
+      ffi::c_void,
+      sync::{
+         OnceLock,
+         atomic::Ordering,
+      },
+   };
+
+   use phoenix_hook::image::{
+      Image,
+      sret_caller,
+   };
+
+   use super::{
+      ACTIVE_COUNT,
+      MENU_SYMS,
+      MenuSymbols,
+      RawMenuVec,
+      append_plugin_actions,
+   };
+
+   type BuildFn = unsafe extern "C" fn(
+      input: *const c_void,
+      a1: usize,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+      a6: usize,
+      a7: usize,
+      f0: f64,
+      f1: f64,
+      f2: f64,
+      f3: f64,
+   ) -> RawMenuVec;
+
+   static ORIG: OnceLock<BuildFn> = OnceLock::new();
+   static IDS: OnceLock<(usize, usize)> = OnceLock::new();
+
+   /// Discord ids are snowflakes: a millisecond timestamp past 2015 in the top
+   /// 42 bits, so anything far smaller or in the future isn't one.
+   fn snowflake(value: u64) -> bool {
+      (1 << 32..1 << 63).contains(&value)
+   }
+
+   pub fn install(image: &Image<'static>) {
+      let menu = match phoenix_sigs::macos::message_context_menu(image) {
+         Ok(menu) => menu,
+         Err(err) => {
+            log::warn!("desktop context menu: {err}, skipping");
+            return;
+         },
+      };
+      let thunks = (
+         sret_caller(menu.props_new),
+         sret_caller(menu.with_id),
+         sret_caller(menu.with_icon),
+      );
+      let (Some(props_new), Some(with_id), Some(with_icon)) = thunks else {
+         log::warn!("desktop context menu: no memory for the constructor thunks");
+         return;
+      };
+      let pro = phoenix_sigs::desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
+      // SAFETY: runs from `prepare` before Discord's threads; `detour` has the
+      // builder's arm64 signature.
+      let trampoline = match unsafe {
+         image.hook_entry(
+            menu.build_fn,
+            pro.pattern,
+            pro.len,
+            detour as *const () as usize,
+         )
+      } {
+         Ok(trampoline) => trampoline,
+         Err(err) => {
+            log::warn!("desktop context menu: hook failed: {err}");
+            return;
+         },
+      };
+      // SAFETY: the trampoline runs the builder's displaced instructions, so
+      // it has the builder's signature; the thunks take the constructors'
+      // arguments the x86 way, result slot first, and `vec_push` is plain.
+      unsafe {
+         let _ = ORIG.set(std::mem::transmute::<usize, BuildFn>(trampoline));
+         let _ = MENU_SYMS.set(MenuSymbols {
+            orig_build:        None,
+            msg_ptr_offset:    0,
+            msg_id_offset:     menu.message_id_offset,
+            channel_id_offset: menu.channel_id_offset,
+            props_new:         std::mem::transmute::<usize, super::PropsNewFn>(props_new),
+            with_id:           std::mem::transmute::<usize, super::WithIdFn>(with_id),
+            with_icon:         std::mem::transmute::<usize, super::WithIconFn>(with_icon),
+            with_color:        None,
+            vec_push:          std::mem::transmute::<usize, super::VecPushFn>(menu.vec_push),
+            layout:            menu.layout,
+         });
+      }
+      let _ = IDS.set((menu.message_id_offset, menu.channel_id_offset));
+      log::info!(
+         "desktop context menu: hooked MessageContextMenu @ {:#x} (id +{:#x}, channel +{:#x}) \
+          {:x?}",
+         menu.build_fn,
+         menu.message_id_offset,
+         menu.channel_id_offset,
+         menu.layout,
+      );
+   }
+
+   unsafe extern "C" fn detour(
+      input: *const c_void,
+      a1: usize,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+      a6: usize,
+      a7: usize,
+      f0: f64,
+      f1: f64,
+      f2: f64,
+      f3: f64,
+   ) -> RawMenuVec {
+      let orig = *ORIG.get().expect("the detour only runs once ORIG is set");
+      // The input is consumed by the builder, so its ids are read first.
+      let ids = match (
+         IDS.get(),
+         input.is_null(),
+         ACTIVE_COUNT.load(Ordering::Acquire),
+      ) {
+         (Some(&(id_at, channel_at)), false, 1..) => {
+            // SAFETY: `input` is the live `MessageContextMenu` input, whose
+            // ids the builder loads from these offsets.
+            let (id, channel) = unsafe {
+               (
+                  input.byte_add(id_at).cast::<u64>().read_unaligned(),
+                  input.byte_add(channel_at).cast::<u64>().read_unaligned(),
+               )
+            };
+            (snowflake(id) && snowflake(channel)).then_some((id, channel))
+         },
+         _ => None,
+      };
+      // SAFETY: forwards every register to the original builder.
+      let mut out = unsafe { orig(input, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3) };
+      if let (Some((message, channel)), Some(syms)) = (ids, MENU_SYMS.get()) {
+         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            append_plugin_actions(syms, &raw mut out, message, channel);
+         }));
+      }
+      out
    }
 }

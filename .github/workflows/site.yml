@@ -2,7 +2,7 @@ name: site
 on:
   push:
     branches: [main]
-    paths: ['web/**', 'plugins/**', 'crates/**', 'frida/**', 'Cargo.*', 'flake.*', 'nix/**', 'scripts/site.nu', 'scripts/sunbird-linux.sh', '.github/workflows/site.yml']
+    paths: ['web/**', 'plugins/**', 'crates/**', 'frida/**', 'Cargo.*', 'flake.*', 'nix/**', 'scripts/site.nu', 'scripts/sunbird-linux.sh', 'scripts/sunbird-macos.sh', '.github/workflows/site.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
     uses: ./.github/workflows/ios.yml
   # The desktop launchers and loaders. Ubuntu 22.04 links the Linux loader
   # against an older glibc than Discord's AppImage needs, so it loads anywhere
-  # Discord runs.
+  # Discord runs. macOS Phoenix is arm64 only, which macos-15 builds natively.
   desktop:
     strategy:
       matrix:
@@ -29,6 +29,9 @@ jobs:
           - os: ubuntu-22.04
             toolchain: stable
             files: target/release/libphoenix.so
+          - os: macos-15
+            toolchain: stable
+            files: target/release/libphoenix.dylib
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -36,6 +39,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
       - run: cargo +${{ matrix.toolchain }} build --locked --release -p phoenix-loader ${{ runner.os == 'Windows' && '-p phoenix-inject' || '' }}
+      # The linker's signature loads, but AMFI logs a complaint about it.
+      - if: runner.os == 'macOS'
+        run: codesign --force --sign - target/release/libphoenix.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ runner.os }}
@@ -61,7 +67,9 @@ jobs:
           mv desktop/desktop-Windows/phoenix.dll web/plugins/phoenix-windows-x86_64.dll
           mv desktop/desktop-Windows/phoenix-inject.exe web/plugins/sunbird-windows-x86_64.exe
           mv desktop/desktop-Linux/libphoenix.so web/plugins/libphoenix-linux-x86_64.so
+          mv desktop/desktop-macOS/libphoenix.dylib web/plugins/libphoenix-macos-arm64.dylib
           cp scripts/sunbird-linux.sh web/plugins/sunbird-linux.sh
+          cp scripts/sunbird-macos.sh web/plugins/sunbird-macos.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 24

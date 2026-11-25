@@ -376,7 +376,12 @@ unsafe extern "C" fn owned_bytes_drop(data: *mut (), _ptr: *const u8, _len: usiz
 /// Locates Desktop Phoenix's `ReqwestTransport` and `SendFuture` vtable slots
 /// and installs request/response interception.
 pub fn install(image: &Image<'static>) {
-   let found = match DesktopHttpTransport::locate(image) {
+   let located = if crate::X86_CODE {
+      DesktopHttpTransport::locate(image)
+   } else {
+      phoenix_sigs::macos::http_transport(image)
+   };
+   let found = match located {
       Ok(found) => found,
       Err(err) => {
          log::warn!("discord desktop: HTTP transport: {err}");

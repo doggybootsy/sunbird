@@ -750,7 +750,8 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
 /// The `cmp <arg2>, 0xf` immediate in `is_page_visible`, which the runtime
 /// lowers so page 24 is always shown.
 pub fn settings_visibility(image: &Image<'_>) -> Found<usize> {
-   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja ...`
+   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja
+   // ...`
    let (guard, imm) = match Abi::of(image) {
       Abi::Win64 => {
          (
@@ -794,6 +795,7 @@ pub fn settings_section(image: &Image<'_>) -> Found<Section> {
 }
 
 /// Discord's own GPUI and Mana builders the settings page calls.
+#[derive(Debug, Clone)]
 pub struct Gpui {
    /// The `Location` `div_new` takes, a static in `.rdata`.
    pub caller_loc:       usize,
@@ -1099,7 +1101,6 @@ fn debug_offsets(image: &Image<'_>, func: usize, depth: usize) -> HashMap<String
 
 /// `<StyleRefinement as Debug>::fmt`, the one loader of a `StyleRefinement`
 /// literal that prints `text`, `padding` and `gap`.
-#[expect(clippy::too_many_lines, reason = "one line per decoded field")]
 fn style_offsets(image: &Image<'_>, bytes: usize) -> Found<StyleOffsets> {
    let leas = string_leas(image, &[b"StyleRefinement"]);
    let mut funcs: Vec<usize> = leas
@@ -1124,6 +1125,15 @@ fn style_offsets(image: &Image<'_>, bytes: usize) -> Found<StyleOffsets> {
          found.len()
       ));
    };
+   style_from_fields(fields, bytes)
+}
+
+/// [`StyleOffsets`] from `StyleRefinement`'s fields by name, as either
+/// architecture's `Debug` reader returns them, checked against its size.
+pub(crate) fn style_from_fields(
+   fields: &HashMap<String, usize>,
+   bytes: usize,
+) -> Found<StyleOffsets> {
    let get = |name: &str| -> Found<usize> {
       fields
          .get(name)
@@ -1752,7 +1762,8 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageContextMenu> {
       .ok_or("MessageContextMenu channel_id offset not found")?;
 
    // Find the `Copy Message ID` and `Delete Message` `lea`s inside `build_fn`
-   // directly (scanning only the ~19 KiB function instead of the whole `.text`).
+   // directly (scanning only the ~19 KiB function instead of the whole
+   // `.text`).
    let build_bytes = image
       .read(build_fn, build_end - build_fn)
       .ok_or("MessageContextMenu body is unmapped")?;
@@ -2774,7 +2785,8 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
             .map(|w| usize::from(w[3]))
       })
    };
-   // `text_get` is the member of C called by the most other members of C (>= 3).
+   // `text_get` is the member of C called by the most other members of C (>=
+   // 3).
    let mut caller_counts: HashMap<usize, usize> = HashMap::new();
    for (func, calls) in &c_calls {
       let mut seen = HashSet::new();
@@ -2852,8 +2864,8 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
    }
    let (set_value, sv_calls) = set_value_hits[0];
 
-   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48 FF
-   // 08`).
+   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48
+   // FF 08`).
    let arc_drop_slow = sv_calls
       .iter()
       .find_map(|&(site, callee)| {
