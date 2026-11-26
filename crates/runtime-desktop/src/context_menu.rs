@@ -629,7 +629,10 @@ mod arm64 {
                   input.byte_add(channel_at).cast::<u64>().read_unaligned(),
                )
             };
-            (snowflake(id) && snowflake(channel)).then_some((id, channel))
+            // The input keeps both as one pair. A message is always newer
+            // than its channel (a thread's id is its starter message's), so
+            // the larger snowflake is the message, whichever field it is in.
+            (snowflake(id) && snowflake(channel)).then(|| (id.max(channel), id.min(channel)))
          },
          _ => None,
       };

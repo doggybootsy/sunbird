@@ -662,6 +662,8 @@ pub fn staff(image: &Image<'_>) -> Found<crate::StaffField> {
 pub struct MessageMenu {
    /// `fn(x0 input, x1 cx, x2..x5, d0) -> Vec<MenuItem>` through `x8`.
    pub build_fn:          usize,
+   /// The message and channel ids, one `ldp` pair. Which is which isn't
+   /// decoded; the runtime takes the newer snowflake as the message.
    pub message_id_offset: usize,
    pub channel_id_offset: usize,
    /// `props_new(x8 out, x0 &SharedString, w1, w2)`.
@@ -1365,10 +1367,80 @@ fn option_string_field(image: &Image<'_>, setter: usize) -> Option<usize> {
    None
 }
 
-/// [`crate::desktop::GpuiLayout`] for arm64, from the builders [`gpui`] found.
+/// The bytes Discord stores into a constructor's result right after calling
+/// it, most common first, as `(count, offset)`.
 ///
-/// The `Button`'s variant and size fields are left past its end, so the
-/// runtime never writes them and buttons keep Discord's default look.
+/// The result is the stack slot
+/// `x8` points at (`add x8, sp, #base`); a store lands at `sp + base + field`,
+/// directly or through a register set to `sp + k` after the call.
+#[must_use]
+pub fn post_ctor_byte_stores(image: &Image<'_>, ctor: usize, size: usize) -> Vec<(usize, usize)> {
+   let mut counts = std::collections::HashMap::<usize, usize>::new();
+   let mut funcs = arm64::code_refs(image, ctor..ctor + 1)
+      .into_iter()
+      .filter_map(|(site, _)| image.function_containing(site))
+      .collect::<Vec<_>>();
+   funcs.sort_unstable();
+   funcs.dedup();
+   for func in funcs {
+      let code = flattened_at(image, func);
+      for (at, &(_, insn)) in code.iter().enumerate() {
+         if insn != (Insn::Bl { target: ctor }) {
+            continue;
+         }
+         let Some(base) = code[at.saturating_sub(12)..at]
+            .iter()
+            .rev()
+            .find_map(|&(_, insn)| {
+               match insn {
+                  Insn::AddImm { rd: 8, rn: 31, imm } => Some(imm),
+                  _ => None,
+               }
+            })
+         else {
+            continue;
+         };
+         let mut regs = [None::<usize>; 32];
+         let mut seen = std::collections::HashSet::new();
+         for &(_, insn) in code[at + 1..].iter().take(14) {
+            match insn {
+               Insn::AddImm { rd, rn: 31, imm } => regs[usize::from(rd)] = Some(imm),
+               Insn::AddImm { rd, .. } | Insn::MovReg { rd, .. } => regs[usize::from(rd)] = None,
+               Insn::Store {
+                  rn,
+                  offset,
+                  size: 1,
+                  ..
+               } => {
+                  let from = if rn == 31 {
+                     Some(0)
+                  } else {
+                     regs[usize::from(rn)]
+                  };
+                  if let Some(field) = from
+                     .map(|from| from + offset)
+                     .and_then(|addr| addr.checked_sub(base))
+                     .filter(|&field| field < size)
+                     && seen.insert(field)
+                  {
+                     *counts.entry(field).or_default() += 1;
+                  }
+               },
+               Insn::Bl { .. } | Insn::B { .. } => break,
+               _ => {},
+            }
+         }
+      }
+   }
+   let mut ranked = counts
+      .into_iter()
+      .map(|(field, count)| (count, field))
+      .collect::<Vec<_>>();
+   ranked.sort_unstable_by(|a, b| b.cmp(a));
+   ranked
+}
+
+/// [`crate::desktop::GpuiLayout`] for arm64, from the builders [`gpui`] found.
 #[expect(
    clippy::too_many_lines,
    reason = "one block per decoded struct, as on x86"
@@ -1505,6 +1577,17 @@ pub fn gpui_layouts(
    if on_click + 16 > button_size || button_size > layout::SCRATCH_CAP {
       return Err("Button on_click sits past the Button".to_owned());
    }
+   // The variant is the byte set most often after `Button::new`, the size the
+   // next (666 and 117 stores, then 37, on 2026-11 builds). When that isn't
+   // clear, both are left past the scratch buffer so the runtime skips them.
+   let (variant, scale) = match post_ctor_byte_stores(image, gpui.button_new, button_size)[..] {
+      [(top, variant), (second, scale), ref rest @ ..]
+         if top >= 3 * second && rest.first().is_none_or(|&(third, _)| second >= 3 * third) =>
+      {
+         (variant, scale)
+      },
+      _ => (layout::SCRATCH_CAP, layout::SCRATCH_CAP),
+   };
 
    Ok(GpuiLayout {
       style,
@@ -1523,8 +1606,8 @@ pub fn gpui_layouts(
       button: ButtonLayout {
          size: button_size,
          on_click,
-         variant: layout::SCRATCH_CAP,
-         scale: layout::SCRATCH_CAP,
+         variant,
+         scale,
       },
    })
 }

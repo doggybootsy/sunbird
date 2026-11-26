@@ -339,8 +339,10 @@ byte pattern says nothing about arm32.
   `Interactivity::default`'s box, `Switch` (0x248; label +0x98 and description +0xb0 from the
   setters' `ldrb w8, [x, #off]!; cmp w8, #0xff`; the 0x1d8 copies are its leading field
   struct) and `Button` (0x328, `on_click` +0x298). Handler setters allocate the `Rc` (`mov w0,
-  #8; mov w1, #size; bl alloc`), store it, then copy out. The Button's variant and size aren't
-  decoded; their offsets are past the scratch buffer, so the runtime skips them.
+  #8; mov w1, #size; bl alloc`), store it, then copy out. The Button's variant (+0x323) and size
+  (+0x31d) are the bytes most often stored right after `Button::new` (`post_ctor_byte_stores`,
+  666 and 117 stores, then 37); when the ranking isn't clear they're left
+  past the scratch buffer and the runtime skips them.
   `SharedString::into_any_element` (beside `div_child_div`) checks tags 0xff and 0x19, the
   same as x86.
 - Accessories. `macos::message_row` is the common caller of the `\x10message-content-`
@@ -360,8 +362,9 @@ byte pattern says nothing about arm32.
   in `mov x3,x1; mov w1,#0; b core`, and each core runs `props_new` (`add x8,sp,#k; bl`), boxes
   the closure, copies the props (`add x0,x19,#0x20; add x1,sp; mov w2,#0x1c8; bl memcpy`) and
   writes `stp rc,vtable,[x19,#0x10]; mov w8,#2; stp x8,xzr,[x19]`. `push` strides by `mov w9,
-  #0x1f8; madd`. The input holds the message id at +0x80 and the channel id at +0x88 (one `ldp`;
-  the channel goes to the permission check). The detour is a native `extern "C"` function (a
+  #0x1f8; madd`. The input holds the message and channel ids at +0x80/+0x88 (one `ldp`). Reading
+  +0x88 as the channel sent `view-raw` to a 404, so the runtime takes the newer snowflake as the
+  message: a message is always newer than its channel. The detour is a native `extern "C"` function (a
   24-byte return goes through `x8`), and the constructors are called through `sret_caller`.
   `SharedString` keeps x86's tags (0x18 static). Discord's Rust heap may be its own malloc zone, so
   our `Rc` handlers are pinned (`gpui::pinned_rc_u64`) and never freed by Discord. The separator
