@@ -9,7 +9,11 @@ use std::{
    path::PathBuf,
    process::{Command, Stdio},
    ptr,
-   sync::Once,
+   sync::{
+      Once,
+      atomic::{AtomicUsize, Ordering},
+      mpsc,
+   },
    thread,
 };
 
@@ -27,6 +31,9 @@ pub struct Host;
 
 impl DesktopHost for Host {
    fn copy(text: &str) -> Result<(), Error> {
+      if copy_pasteboard(text) {
+         return Ok(());
+      }
       let fail = |message: String| Error::Platform { message };
       let mut child = Command::new("/usr/bin/pbcopy")
          .stdin(Stdio::piped())
@@ -49,6 +56,10 @@ impl DesktopHost for Host {
       spawn_reaped(Command::new("/usr/bin/open").arg("--").arg(target))
    }
 
+   fn open_window(url: &str, width: u32, height: u32) -> bool {
+      open_webview(url, width, height)
+   }
+
    fn app_browser() -> Option<Command> {
       let home = std::env::var_os("HOME").map(PathBuf::from);
       let roots = [
@@ -68,18 +79,12 @@ impl DesktopHost for Host {
    }
 
    fn pick_js_path() -> Option<PathBuf> {
-      let output = Command::new("/usr/bin/osascript")
-         .args([
-            "-e",
-            "POSIX path of (choose file with prompt \"Install Sunbird Plugin (.js)\" of type \
-             {\"js\", \"com.netscape.javascript-source\"})",
-         ])
-         .stderr(Stdio::null())
-         .output()
-         .ok()?;
-      let path = String::from_utf8(output.stdout).ok()?;
-      let path = path.trim_end_matches('\n');
-      (output.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
+      let (tx, rx) = mpsc::channel();
+      on_main_with(move || {
+         let picked = unsafe { pick_js_open_panel() };
+         let _ = tx.send(picked);
+      });
+      rx.recv().ok().flatten()
    }
 
    fn notify(title: &str, body: &str) {
@@ -167,6 +172,7 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+   fn dlopen(path: *const c_char, mode: std::ffi::c_int) -> *mut c_void;
    static _dispatch_main_q: c_void;
    fn dispatch_async_f(
       queue: *const c_void,
@@ -206,8 +212,10 @@ macro_rules! msg_send {
 msg_send!(send() -> Id);
 msg_send!(send_void() -> ());
 msg_send!(send_id(arg: Id) -> Id);
+msg_send!(send_id2(a: Id, b: Id) -> bool);
 msg_send!(send_bool(arg: bool) -> ());
 msg_send!(send_usize() -> usize);
+msg_send!(send_usize_unit(arg: usize) -> ());
 msg_send!(send_index(at: usize) -> Id);
 msg_send!(send_isize(arg: isize) -> ());
 msg_send!(send_f64(arg: f64) -> Id);
@@ -217,6 +225,193 @@ msg_send!(send_monitor(mask: u64, handler: *const Block) -> Id);
 msg_send!(send_symbol(name: Id, description: Id) -> Id);
 msg_send!(send_item(title: Id, action: Sel, key: Id) -> Id);
 msg_send!(send_tag() -> isize);
+msg_send!(send_modal() -> isize);
+msg_send!(send_window_init(rect: Rect, style: usize, backing: usize, defer: bool) -> Id);
+msg_send!(send_webview_init(frame: Rect, config: Id) -> Id);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rect {
+   x: f64,
+   y: f64,
+   width: f64,
+   height: f64,
+}
+
+fn copy_pasteboard(text: &str) -> bool {
+   // SAFETY: NSPasteboard is safe to message when AppKit is loaded.
+   unsafe {
+      let cls = class(c"NSPasteboard");
+      if cls.is_null() {
+         return false;
+      }
+      let pb = send(cls, sel(c"generalPasteboard"));
+      if pb.is_null() {
+         return false;
+      }
+      let _ = send_tag(pb, sel(c"clearContents"));
+      let value = ns_string(text);
+      if value.is_null() {
+         return false;
+      }
+      send_id2(
+         pb,
+         sel(c"setString:forType:"),
+         value,
+         ns_string("public.utf8-plain-text"),
+      )
+   }
+}
+
+/// Opens a native `NSOpenPanel` filtered to `.js` files on the main thread.
+///
+/// # Safety
+///
+/// Must run on the main thread inside an autorelease pool.
+unsafe fn pick_js_open_panel() -> Option<PathBuf> {
+   const MODAL_OK: isize = 1;
+   unsafe {
+      let cls = class(c"NSOpenPanel");
+      if cls.is_null() {
+         return None;
+      }
+      let panel = send(cls, sel(c"openPanel"));
+      if panel.is_null() {
+         return None;
+      }
+      send_id(panel, sel(c"setTitle:"), ns_string("Install Sunbird Plugin (.js)"));
+      send_bool(panel, sel(c"setCanChooseFiles:"), true);
+      send_bool(panel, sel(c"setCanChooseDirectories:"), false);
+      send_bool(panel, sel(c"setAllowsMultipleSelection:"), false);
+      let types = send_id(class(c"NSArray"), sel(c"arrayWithObject:"), ns_string("js"));
+      if !types.is_null() {
+         send_id(panel, sel(c"setAllowedFileTypes:"), types);
+      }
+      let app = send(class(c"NSApplication"), sel(c"sharedApplication"));
+      if !app.is_null() {
+         send_bool(app, sel(c"activateIgnoringOtherApps:"), true);
+      }
+      if send_modal(panel, sel(c"runModal")) != MODAL_OK {
+         return None;
+      }
+      let url = send(panel, sel(c"URL"));
+      if url.is_null() {
+         return None;
+      }
+      let path = send(url, sel(c"path"));
+      if path.is_null() {
+         return None;
+      }
+      let utf8 = send_cstr(path, sel(c"UTF8String"));
+      if utf8.is_null() {
+         return None;
+      }
+      let text = CStr::from_ptr(utf8).to_str().ok()?;
+      (!text.is_empty()).then(|| PathBuf::from(text))
+   }
+}
+
+/// Loads `WebKit.framework` once and returns whether `WKWebView` is available.
+fn ensure_webkit() -> bool {
+   static LOADED: Once = Once::new();
+   LOADED.call_once(|| {
+      const PATH: &CStr = c"/System/Library/Frameworks/WebKit.framework/WebKit";
+      // RTLD_LAZY (1) | RTLD_LOCAL (4) on Darwin
+      // SAFETY: dlopen loads a system framework by constant path.
+      unsafe {
+         dlopen(PATH.as_ptr(), 0x5);
+      }
+   });
+   !class(c"WKWebView").is_null() && !class(c"NSWindow").is_null()
+}
+
+/// Opens or reuses a native `WKWebView` window pointing at `url`.
+fn open_webview(url: &str, width: u32, height: u32) -> bool {
+   if !ensure_webkit() {
+      return false;
+   }
+   let url = url.to_owned();
+   let (tx, rx) = mpsc::channel();
+   on_main_with(move || {
+      // SAFETY: runs on the main thread inside an autorelease pool.
+      let ok = unsafe { show_webview(&url, width, height) };
+      let _ = tx.send(ok);
+   });
+   rx.recv().unwrap_or(false)
+}
+
+static WEBVIEW_WIN: AtomicUsize = AtomicUsize::new(0);
+static WEBVIEW_VIEW: AtomicUsize = AtomicUsize::new(0);
+
+/// # Safety
+///
+/// Runs on the main thread.
+unsafe fn show_webview(url: &str, width: u32, height: u32) -> bool {
+   const STYLE: usize = 1 | 2 | 4 | 8;
+   const BUFFERED: usize = 2;
+
+   unsafe {
+      let ns_url = send_id(class(c"NSURL"), sel(c"URLWithString:"), ns_string(url));
+      if ns_url.is_null() {
+         return false;
+      }
+      let req = send_id(class(c"NSURLRequest"), sel(c"requestWithURL:"), ns_url);
+      if req.is_null() {
+         return false;
+      }
+
+      let mut win = WEBVIEW_WIN.load(Ordering::Acquire) as Id;
+      let mut view = WEBVIEW_VIEW.load(Ordering::Acquire) as Id;
+      if win.is_null() || view.is_null() {
+         let frame = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(width),
+            height: f64::from(height),
+         };
+         win = send_window_init(
+            send(class(c"NSWindow"), sel(c"alloc")),
+            sel(c"initWithContentRect:styleMask:backing:defer:"),
+            frame,
+            STYLE,
+            BUFFERED,
+            false,
+         );
+         let cfg = send(send(class(c"WKWebViewConfiguration"), sel(c"alloc")), sel(c"init"));
+         view = send_webview_init(
+            send(class(c"WKWebView"), sel(c"alloc")),
+            sel(c"initWithFrame:configuration:"),
+            frame,
+            cfg,
+         );
+         if win.is_null() || view.is_null() {
+            return false;
+         }
+         send_bool(win, sel(c"setReleasedWhenClosed:"), false);
+         send_id(win, sel(c"setTitle:"), ns_string("Sunbird"));
+         let dark = send_id(
+            class(c"NSAppearance"),
+            sel(c"appearanceNamed:"),
+            ns_string("NSAppearanceNameDarkAqua"),
+         );
+         if !dark.is_null() {
+            send_id(win, sel(c"setAppearance:"), dark);
+         }
+         send_id(win, sel(c"setContentView:"), view);
+         send(win, sel(c"center"));
+         WEBVIEW_WIN.store(win as usize, Ordering::Release);
+         WEBVIEW_VIEW.store(view as usize, Ordering::Release);
+      }
+
+      let _ = send_id(view, sel(c"loadRequest:"), req);
+      send_id(win, sel(c"makeKeyAndOrderFront:"), ptr::null_mut());
+      let app = send(class(c"NSApplication"), sel(c"sharedApplication"));
+      if !app.is_null() {
+         send_bool(app, sel(c"activateIgnoringOtherApps:"), true);
+      }
+      true
+   }
+}
 
 mod panel;
 
@@ -365,19 +560,21 @@ fn start_status_item() {
          let menu_item = entry.map_or_else(
             || send(class(c"NSMenuItem"), sel(c"separatorItem")),
             |action| {
+               let (key, mask) = match action {
+                  TrayAction::OpenSettings => ("u", Some(CONTROL_SHIFT)),
+                  TrayAction::OpenDevtools => ("I", None),
+                  _ => ("", None),
+               };
                let menu_item = send_item(
                   send(class(c"NSMenuItem"), sel(c"alloc")),
                   sel(c"initWithTitle:action:keyEquivalent:"),
                   ns_string(action.label()),
                   sel(c"sunbirdTray:"),
-                  // An uppercase key adds Shift to the default Command, so
-                  // the menu shows the monitor's Shift-Command-I.
-                  ns_string(if matches!(action, TrayAction::OpenDevtools) {
-                     "I"
-                  } else {
-                     ""
-                  }),
+                  ns_string(key),
                );
+               if let Some(mask) = mask {
+                  send_usize_unit(menu_item, sel(c"setKeyEquivalentModifierMask:"), mask);
+               }
                send_id(menu_item, sel(c"setTarget:"), target);
                send_isize(menu_item, sel(c"setTag:"), at.cast_signed());
                menu_item

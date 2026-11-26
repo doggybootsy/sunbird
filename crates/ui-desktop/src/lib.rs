@@ -160,6 +160,12 @@ trait DesktopHost {
       Err(Error::Unsupported)
    }
 
+   /// Opens a URL inside a native in-process webview window if the backend
+   /// provides one. Returning `false` falls back to an app browser or `open`.
+   fn open_window(_url: &str, _width: u32, _height: u32) -> bool {
+      false
+   }
+
    /// A Chromium-family browser that takes `--app=<url>`, if one is installed.
    fn app_browser() -> Option<Command> {
       None
@@ -223,6 +229,9 @@ fn open_app_window(url: &str, width: u32, height: u32) {
    let Some(config) = config() else {
       return;
    };
+   if Os::open_window(url, width, height) {
+      return;
+   }
    if let Some(mut browser) = Os::app_browser() {
       let profile_dir = config
          .plugins_dir
