@@ -76,7 +76,7 @@ impl GatewayRegistry {
       if !entries.iter().any(|entry| entry.name == SPLIT_SEED)
          && let Ok(split) = walk_flat(image, SPLIT_SEED)
       {
-         merge_entries(&mut entries, split);
+         merge_split(&mut entries, split);
       }
 
       let by_name = entries
@@ -144,6 +144,25 @@ fn locate_primary(image: &Image<'_>) -> Result<Vec<GatewayEntry>, Error> {
             slots: seeds.iter().map(|(slot, _)| *slot).collect(),
          })
       },
+   }
+}
+
+/// macOS dispatches message events from the flat table, so where it and a
+/// domain table name different handlers for an event, its handler is the one
+/// that runs (`MESSAGE_CREATE`: the domain one is never called).
+fn merge_split(target: &mut Vec<GatewayEntry>, incoming: Vec<GatewayEntry>) {
+   for entry in incoming {
+      match target.iter_mut().find(|known| known.name == entry.name) {
+         Some(existing) if existing.handler != entry.handler => *existing = entry,
+         Some(existing) => {
+            for slot in entry.slots {
+               if !existing.slots.contains(&slot) {
+                  existing.slots.push(slot);
+               }
+            }
+         },
+         None => target.push(entry),
+      }
    }
 }
 

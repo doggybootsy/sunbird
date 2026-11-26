@@ -504,14 +504,18 @@ unsafe extern "C" fn optimistic_delete_detour<const N: usize>(
       let (ch_ptr, msg_ptr) = unsafe { (ptr::read(args), ptr::read(args.add(1))) };
       if !ch_ptr.is_null() && !msg_ptr.is_null() {
          let (channel_id, message_id) = unsafe { (ptr::read(ch_ptr), ptr::read(msg_ptr)) };
-         if channel_id != 0
-            && message_id != 0
-            && std::panic::catch_unwind(|| {
+         if channel_id != 0 && message_id != 0 {
+            let kept = std::panic::catch_unwind(|| {
                phoenix_runtime::gateway::check_optimistic_delete(channel_id, message_id)
             })
-            .unwrap_or(false)
-         {
-            return 0;
+            .unwrap_or(false);
+            log::info!(
+               "desktop accessories: own delete through #{N}, {}",
+               if kept { "kept by a plugin" } else { "passed" }
+            );
+            if kept {
+               return 0;
+            }
          }
       }
    }

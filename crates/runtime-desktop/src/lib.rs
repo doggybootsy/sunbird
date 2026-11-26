@@ -137,6 +137,9 @@ pub fn prepare() -> Result<(), Error> {
    if registry.is_ok() {
       discord::install(&image);
       accessories::install_optimistic_delete(&image);
+      if !X86_CODE {
+         route_direct_deletes(&image);
+      }
    }
    // The index is tens of MB and nothing reads it after startup.
    phoenix_sigs::desktop::release_call_index();
@@ -407,4 +410,31 @@ fn dialog(body: &[u8], sheet: bool) -> remote::Reply {
    let title = request.title.unwrap_or_else(|| "Sunbird".to_owned());
    let index = modal::ask(title, content, options, Duration::from_secs(120));
    remote::ok_json(&DialogAnswer { index })
+}
+
+/// macOS deletes your own message by calling `MESSAGE_DELETE`'s handler
+/// directly, past the registry, so the handler's entry goes through the
+/// gateway hooks as well, and the registry calls it through the trampoline.
+fn route_direct_deletes(image: &phoenix_hook::image::Image<'static>) {
+   let Some(handler) = phoenix_runtime::gateway::original_handler("MESSAGE_DELETE") else {
+      return;
+   };
+   let pro = phoenix_sigs::desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
+   // SAFETY: runs from `prepare` before Discord's threads; the gateway detour
+   // has the handler's ABI, and the registry is pointed at the trampoline
+   // before anything can call either.
+   match unsafe {
+      image.hook_entry(
+         handler,
+         pro.pattern,
+         pro.len,
+         phoenix_runtime::gateway::entry_detour(),
+      )
+   } {
+      Ok(trampoline) => {
+         phoenix_runtime::gateway::call_handler_through(handler, trampoline);
+         log::info!("desktop: MESSAGE_DELETE's handler hooked for direct calls");
+      },
+      Err(err) => log::warn!("desktop: MESSAGE_DELETE's handler not hooked: {err}"),
+   }
 }

@@ -139,7 +139,9 @@ fail() {
    exit 1
 }
 
-version=\$(fetch --max-time 5 "\$site/version.json" |
+# A \`pin\` file keeps the loader in place, for a build installed by hand.
+version=
+[ -f "\$home/pin" ] || version=\$(fetch --max-time 5 "\$site/version.json" |
    sed -n 's/.*"loader": *"\([^"]*\)".*/\1/p')
 if [ -n "\$version" ] && [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)" ]; then
    tmp=\$(mktemp "\$home/libphoenix.dylib.XXXXXX")

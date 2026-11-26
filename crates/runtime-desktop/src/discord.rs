@@ -436,10 +436,19 @@ pub fn install(image: &Image<'static>) {
       return;
    }
 
+   let detour = if crate::X86_CODE {
+      poll_detour as *const () as usize
+   } else {
+      let Some(detour) = arm64_poll::install(found.poll_fn) else {
+         log::warn!("discord desktop: no memory for the poll thunks");
+         return;
+      };
+      detour
+   };
    let polls = found
       .poll_slots
       .iter()
-      .map(|&slot| (slot, poll_detour as *const () as usize))
+      .map(|&slot| (slot, detour))
       .collect::<Vec<_>>();
    // SAFETY: every poll slot is an aligned `.rdata` vtable entry pointing to
    // `poll_fn`, and `poll_detour` matches its Rust ABI.
@@ -543,6 +552,238 @@ unsafe fn read_headers(map: &RawHeaderMap) -> Vec<(String, String)> {
    out
 }
 
+/// Where `TransportRequest` keeps each field. Rust reorders a struct's fields
+/// from one Discord build to the next, so the layout is found from the
+/// requests themselves: every read checks memory first, and a field is used
+/// only once one offset has held it on every request seen.
+#[derive(Clone, Copy, Debug, Default)]
+struct RequestLayout {
+   url:     Option<usize>,
+   headers: Option<usize>,
+   body:    Option<usize>,
+   method:  Option<usize>,
+}
+
+/// The bytes of a request searched for its fields; the struct is 0xF0 on the
+/// builds seen.
+const REQUEST_SPAN: usize = 0x100;
+/// Requests checked before the weaker fields (body, method) are trusted.
+const LAYOUT_SAMPLES: usize = 8;
+
+struct LayoutSearch {
+   layout:   RequestLayout,
+   seen:     usize,
+   bodies:   Vec<usize>,
+   /// Each candidate method offset, with the tags it has held.
+   methods:  Vec<(usize, std::collections::HashSet<u8>)>,
+   saw_body: bool,
+}
+
+static LAYOUT: std::sync::Mutex<Option<LayoutSearch>> = std::sync::Mutex::new(None);
+
+fn peek(at: usize, len: usize) -> Option<Vec<u8>> {
+   phoenix_hook::x86::read_memory(at, len).filter(|bytes| bytes.len() == len)
+}
+
+fn word(bytes: &[u8], at: usize) -> usize {
+   bytes
+      .get(at..at + 8)
+      .and_then(|word| word.try_into().ok())
+      .map_or(0, usize::from_le_bytes)
+}
+
+fn is_url(bytes: &[u8], at: usize) -> bool {
+   let (cap, ptr, len) = (word(bytes, at), word(bytes, at + 8), word(bytes, at + 16));
+   (7..=1 << 16).contains(&len)
+      && cap >= len
+      && cap < 1 << 24
+      && peek(ptr, 7).is_some_and(|head| head.starts_with(b"http"))
+}
+
+fn is_headers(bytes: &[u8], at: usize) -> bool {
+   let (cap, ptr, len) = (
+      word(bytes, at + 0x18),
+      word(bytes, at + 0x20),
+      word(bytes, at + 0x28),
+   );
+   if !(1..=256).contains(&len) || cap < len || cap > 1024 {
+      return false;
+   }
+   let Some(bucket) = peek(ptr, size_of::<RawHeaderBucket>()) else {
+      return false;
+   };
+   let (vtable, name, name_len) = (
+      word(&bucket, 0x40),
+      word(&bucket, 0x48),
+      word(&bucket, 0x50),
+   );
+   bucket[0] <= 2
+      && if vtable == 0 {
+         name < 0x80
+      } else {
+         (1..=64).contains(&name_len)
+            && peek(name, name_len).is_some_and(|name| {
+               name
+                  .iter()
+                  .all(|&byte| byte.is_ascii_lowercase() || byte == b'-' || byte.is_ascii_digit())
+            })
+      }
+}
+
+fn is_body(bytes: &[u8], at: usize) -> Option<bool> {
+   match word(bytes, at) {
+      0 => Some(false),
+      1 => {
+         let (vtable, ptr, len) = (
+            word(bytes, at + 8),
+            word(bytes, at + 16),
+            word(bytes, at + 24),
+         );
+         let vtable_ok = peek(vtable, size_of::<RawBytesVtable>())
+            .is_some_and(|table| (0..5).all(|slot| word(&table, slot * 8) != 0));
+         (vtable_ok && len < 1 << 26 && (len == 0 || peek(ptr, 1).is_some())).then_some(true)
+      },
+      _ => None,
+   }
+}
+
+fn method_tag(bytes: &[u8], at: usize) -> Option<u8> {
+   let tag = *bytes.get(at)?;
+   match tag {
+      0..=8 => Some(tag),
+      10 => {
+         (bytes
+            .get(at + 16)
+            .is_some_and(|&len| (1..=15).contains(&len)))
+         .then_some(tag)
+      },
+      11 => (peek(word(bytes, at + 8), 1).is_some() && word(bytes, at + 16) <= 64).then_some(tag),
+      _ => None,
+   }
+}
+
+impl LayoutSearch {
+   fn new() -> Self {
+      Self {
+         layout:   RequestLayout::default(),
+         seen:     0,
+         bodies:   (0..=REQUEST_SPAN - size_of::<RawBody>())
+            .step_by(8)
+            .collect(),
+         methods:  (0..=REQUEST_SPAN - size_of::<RawMethod>())
+            .step_by(8)
+            .map(|at| (at, std::collections::HashSet::new()))
+            .collect(),
+         saw_body: false,
+      }
+   }
+
+   fn learn(&mut self, bytes: &[u8]) {
+      let only = |found: Vec<usize>| {
+         match found.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+         }
+      };
+      if self.layout.url.is_none() {
+         self.layout.url = only(
+            (0..=REQUEST_SPAN - 24)
+               .step_by(8)
+               .filter(|&at| is_url(bytes, at))
+               .collect(),
+         );
+      }
+      if self.layout.headers.is_none() {
+         self.layout.headers = only(
+            (0..=REQUEST_SPAN - size_of::<RawHeaderMap>())
+               .step_by(8)
+               .filter(|&at| is_headers(bytes, at))
+               .collect(),
+         );
+      }
+      let (Some(url), Some(headers)) = (self.layout.url, self.layout.headers) else {
+         return;
+      };
+      let free = |at: usize, len: usize| {
+         let overlaps = |start: usize, size: usize| at < start + size && start < at + len;
+         !overlaps(url, 24) && !overlaps(headers, size_of::<RawHeaderMap>())
+      };
+      self.seen += 1;
+      self
+         .bodies
+         .retain(|&at| free(at, size_of::<RawBody>()) && is_body(bytes, at).is_some());
+      if let [at] = self.bodies.as_slice() {
+         self.saw_body |= is_body(bytes, *at) == Some(true);
+      }
+      self.methods.retain_mut(|(at, tags)| {
+         let at = *at;
+         let fits = free(at, size_of::<RawMethod>());
+         match method_tag(bytes, at) {
+            Some(tag) if fits => {
+               tags.insert(tag);
+               true
+            },
+            _ => false,
+         }
+      });
+      if self.seen >= LAYOUT_SAMPLES {
+         if self.layout.body.is_none() && self.saw_body {
+            self.layout.body = only(self.bodies.clone());
+         }
+         // Zeroed words read as `OPTIONS`; the method is the one offset
+         // that has held more than one method.
+         if self.layout.method.is_none() {
+            // Clear of the body once that is known.
+            let body = self.layout.body;
+            let clear = |at: usize| {
+               body.is_none_or(|body| {
+                  at + size_of::<RawMethod>() <= body || body + size_of::<RawBody>() <= at
+               })
+            };
+            self.layout.method = only(
+               self
+                  .methods
+                  .iter()
+                  .filter(|&&(at, ref tags)| tags.len() >= 2 && clear(at))
+                  .map(|&(at, _)| at)
+                  .collect(),
+            );
+         }
+      }
+   }
+}
+
+/// The request's layout so far, after learning from `req`.
+fn request_layout(req: *const u8) -> Option<RequestLayout> {
+   let bytes = peek(req as usize, REQUEST_SPAN)?;
+   let (before, layout) = {
+      let mut guard = LAYOUT
+         .lock()
+         .unwrap_or_else(std::sync::PoisonError::into_inner);
+      let search = guard.get_or_insert_with(LayoutSearch::new);
+      let before = search.layout;
+      search.learn(&bytes);
+      let after = search.layout;
+      drop(guard);
+      (before, after)
+   };
+   if format!("{before:?}") != format!("{layout:?}") {
+      log::info!("discord desktop: request layout {layout:x?}");
+   }
+   // A request that doesn't fit the learned layout is passed through.
+   let fits = layout.url.is_some_and(|at| is_url(&bytes, at))
+      && layout.headers.is_some_and(|at| is_headers(&bytes, at))
+      && layout.body.is_none_or(|at| is_body(&bytes, at).is_some())
+      && layout
+         .method
+         .is_none_or(|at| method_tag(&bytes, at).is_some());
+   fits.then_some(layout)
+}
+
+#[expect(
+   clippy::cast_ptr_alignment,
+   reason = "the request is 8-aligned and every learned offset is a multiple of 8"
+)]
 unsafe fn send_detour(self_ptr: *const c_void, req: *mut RawTransportRequest) -> RawPinnedFuture {
    let installed = INSTALLED
       .get()
@@ -551,21 +792,32 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut RawTransportRequest) ->
    let mut watched = None;
 
    if !req.is_null()
+      && let Some(layout) = request_layout(req.cast())
       && panic::catch_unwind(AssertUnwindSafe(|| {
-         // SAFETY: `req` is a live owned `TransportRequest` passed by
-         // `libdiscord_http`.
-         let req_ref = unsafe { &mut *req };
-         // SAFETY: reading live fields of `req_ref`.
-         let url = unsafe { read_str(&req_ref.url) }
+         let base = req.cast::<u8>();
+         let (Some(url_at), Some(headers_at)) = (layout.url, layout.headers) else {
+            return;
+         };
+         // SAFETY: each offset held its field's shape in this live request,
+         // checked just now.
+         let url_field = unsafe { &mut *base.add(url_at).cast::<RawVec>() };
+         let url = unsafe { read_str(url_field) }
             .unwrap_or_default()
             .to_owned();
-         let method = unsafe { read_method(&req_ref.method) }.into_owned();
-         let headers = unsafe { read_headers(&req_ref.headers) };
-         let body = if req_ref.body.tag == 1 {
+         let headers = unsafe { read_headers(&*base.add(headers_at).cast::<RawHeaderMap>()) };
+         let method = layout.method.map_or(Cow::Borrowed(""), |at| {
+            // SAFETY: as above.
+            unsafe { read_method(&*base.add(at).cast::<RawMethod>()) }
+         });
+         let method = method.into_owned();
+         let body_field = layout
+            .body
+            // SAFETY: as above.
+            .map(|at| unsafe { &mut *base.add(at).cast::<RawBody>() });
+         let body = match &body_field {
             // SAFETY: `tag == 1` is `Body::Bytes(RawBytes)`.
-            unsafe { read_bytes(&req_ref.body.bytes) }
-         } else {
-            &[]
+            Some(body) if body.tag == 1 => unsafe { read_bytes(&body.bytes) },
+            _ => &[],
          };
 
          match observe(&method, &url, &headers, body) {
@@ -574,26 +826,32 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut RawTransportRequest) ->
                // Zeroing `url.len` keeps the host's `String` capacity/pointer
                // intact so `Url::parse("")` fails cleanly with zero network I/O
                // and the host drops every owned field with its own allocator.
-               req_ref.url.len = 0;
+               url_field.len = 0;
                return;
             },
             RequestAction::Replace(new_body) => {
-               if req_ref.body.tag == 1 && !req_ref.body.bytes.vtable.is_null() {
-                  let old_vtable = req_ref.body.bytes.vtable;
-                  let old_ptr = req_ref.body.bytes.ptr;
-                  let old_len = req_ref.body.bytes.len;
-                  let old_data = req_ref.body.bytes.data.load(Ordering::Relaxed);
+               let Some(body) = body_field else {
+                  log::warn!("discord desktop: body layout not learned yet, request kept");
+                  return;
+               };
+               if body.tag == 1 && !body.bytes.vtable.is_null() {
+                  let old_vtable = body.bytes.vtable;
+                  let old_ptr = body.bytes.ptr;
+                  let old_len = body.bytes.len;
+                  let old_data = body.bytes.data.load(Ordering::Relaxed);
                   // SAFETY: drops the old `Bytes` via its own vtable.
                   unsafe { ((*old_vtable).drop)(old_data, old_ptr, old_len) };
-                  req_ref.body.bytes = make_owned_bytes(new_body);
-               } else if req_ref.body.tag == 0 {
-                  req_ref.body.tag = 1;
-                  req_ref.body.bytes = make_owned_bytes(new_body);
+                  body.bytes = make_owned_bytes(new_body);
+               } else if body.tag == 0 {
+                  body.tag = 1;
+                  body.bytes = make_owned_bytes(new_body);
                }
             },
          }
 
-         watched = watch_response(&method, &url);
+         if layout.method.is_some() {
+            watched = watch_response(&method, &url);
+         }
       }))
       .is_err()
    {
@@ -612,6 +870,14 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut RawTransportRequest) ->
    future
 }
 
+/// Whether a ready response reads as one: a status code and a body `Vec`.
+fn response_fits(result: &RawPollResult) -> bool {
+   (100..=599).contains(&result.status)
+      && result.body.cap >= result.body.len
+      && result.body.len < 1 << 28
+      && (result.body.len == 0 || peek(result.body.ptr as usize, 1).is_some())
+}
+
 unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
    let installed = INSTALLED
       .get()
@@ -625,6 +891,7 @@ unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
 
    if let Some(in_flight) = take_response(future.addr() as u64)
       && result.is_ok()
+      && response_fits(&result)
       && panic::catch_unwind(AssertUnwindSafe(|| {
          let old_body = if result.body.len == 0 || result.body.ptr.is_null() {
             Vec::new()
@@ -649,6 +916,167 @@ unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
    }
 
    result
+}
+
+/// `SendFuture::poll` on arm64, without copying its result.
+///
+/// The result comes back through `x8`, and its size is the host's: Rust may
+/// grow or reorder it in any build. The detour gets the caller's slot through
+/// an `sret_callee` thunk, the original writes straight into it through an
+/// `sret_caller` thunk, and a response is only rewritten in place while it
+/// still matches [`RawPollResult`]'s fields.
+#[cfg(target_os = "macos")]
+mod arm64_poll {
+   use std::{
+      ffi::c_void,
+      panic::{
+         self,
+         AssertUnwindSafe,
+      },
+      sync::{
+         OnceLock,
+         atomic::{
+            AtomicBool,
+            Ordering,
+         },
+      },
+   };
+
+   use super::{
+      INSTALLED,
+      RawPollResult,
+      peek,
+      replace_host_vec,
+      run_response_hooks,
+      take_response,
+      word,
+   };
+
+   type PollThunk = unsafe extern "C" fn(*mut u8, *mut c_void, *mut c_void) -> *mut u8;
+   static ORIG: OnceLock<PollThunk> = OnceLock::new();
+
+   pub fn install(poll_fn: usize) -> Option<usize> {
+      let orig = phoenix_hook::image::sret_caller(poll_fn)?;
+      // SAFETY: the thunk calls `poll` the x86 way, slot first.
+      let _ = ORIG.set(unsafe { std::mem::transmute::<usize, PollThunk>(orig) });
+      phoenix_hook::image::sret_callee(detour as *const () as usize)
+   }
+
+   unsafe extern "C" fn detour(slot: *mut u8, future: *mut c_void, cx: *mut c_void) -> *mut u8 {
+      let orig = *ORIG.get().expect("the detour only runs once ORIG is set");
+      // SAFETY: forwards the caller's own slot and arguments.
+      unsafe { orig(slot, future, cx) };
+      let _ = panic::catch_unwind(AssertUnwindSafe(|| inspect(slot, future)));
+      slot
+   }
+
+   /// The bytes of a result searched for its fields; the old layout is 0x80.
+   const SPAN: usize = 0x100;
+   /// Ready responses checked before a field's offset is trusted.
+   const SAMPLES: usize = 4;
+
+   /// Where a ready `Response` keeps its status and body, learned like
+   /// [`super::RequestLayout`]: an offset is used once it alone held its
+   /// field in every ready response seen.
+   struct Search {
+      statuses:  Vec<usize>,
+      bodies:    Vec<usize>,
+      body_full: bool,
+      seen:      usize,
+   }
+
+   static SEARCH: std::sync::Mutex<Option<Search>> = std::sync::Mutex::new(None);
+
+   fn status_at(bytes: &[u8], at: usize) -> Option<u16> {
+      let status = u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?);
+      (100..=599).contains(&status).then_some(status)
+   }
+
+   fn body_at(bytes: &[u8], at: usize) -> Option<usize> {
+      let (cap, ptr, len) = (word(bytes, at), word(bytes, at + 8), word(bytes, at + 16));
+      (cap >= len && cap < 1 << 28 && (len == 0 || peek(ptr, 1).is_some())).then_some(len)
+   }
+
+   /// `(status, body)` offsets once known, after learning from `bytes`.
+   fn learn(bytes: &[u8]) -> Option<(usize, usize)> {
+      let mut guard = SEARCH
+         .lock()
+         .unwrap_or_else(std::sync::PoisonError::into_inner);
+      let search = guard.get_or_insert_with(|| {
+         Search {
+            statuses:  (0..SPAN - 2).step_by(2).collect(),
+            bodies:    (0..=SPAN - 24).step_by(8).collect(),
+            body_full: false,
+            seen:      0,
+         }
+      });
+      search.seen += 1;
+      search.statuses.retain(|&at| status_at(bytes, at).is_some());
+      search.bodies.retain(|&at| body_at(bytes, at).is_some());
+      if let [at] = search.bodies.as_slice() {
+         search.body_full |= body_at(bytes, *at).is_some_and(|len| len > 0);
+      }
+      let found = match (search.statuses.as_slice(), search.bodies.as_slice()) {
+         (&[status], &[body]) if search.seen >= SAMPLES && search.body_full => Some((status, body)),
+         _ => None,
+      };
+      drop(guard);
+      found
+   }
+
+   #[expect(
+      clippy::cast_ptr_alignment,
+      reason = "the result slot is the host's 8-aligned value, and learned offsets fit their \
+                fields"
+   )]
+   fn inspect(slot: *mut u8, future: *mut c_void) {
+      static LEARNED: AtomicBool = AtomicBool::new(false);
+      let Some(bytes) = peek(slot as usize, SPAN) else {
+         return;
+      };
+      // `Poll::Pending` and `Err` are niches in one of the result's words;
+      // which word is the build's, so any word holding either one counts.
+      let marked = |tag: u64| (0..SPAN / 8).any(|index| word(&bytes, index * 8) as u64 == tag);
+      if marked(RawPollResult::PENDING_TAG) {
+         return;
+      }
+      let Some(in_flight) = take_response(future.addr() as u64) else {
+         return;
+      };
+      if marked(RawPollResult::ERR_TAG) {
+         return;
+      }
+      let Some((status_at, body_at)) = learn(&bytes) else {
+         return;
+      };
+      if !LEARNED.swap(true, Ordering::Relaxed) {
+         log::info!("discord desktop: response layout: status +{status_at:#x}, body +{body_at:#x}");
+      }
+      let (Some(status), Some(_)) = (
+         self::status_at(&bytes, status_at),
+         self::body_at(&bytes, body_at),
+      ) else {
+         return;
+      };
+      let Some(installed) = INSTALLED.get() else {
+         return;
+      };
+      // SAFETY: both offsets held their fields in this live result just now.
+      let (status_field, body) = unsafe {
+         (
+            &mut *slot.add(status_at).cast::<u16>(),
+            &mut *slot.add(body_at).cast::<super::RawVec>(),
+         )
+      };
+      let old_body = peek(body.ptr as usize, body.len).unwrap_or_default();
+      let orig_len = old_body.len();
+      let (new_status, new_body) = run_response_hooks(in_flight, i32::from(status), old_body);
+      if let Ok(status) = u16::try_from(new_status) {
+         *status_field = status;
+      }
+      // SAFETY: `body` is the ready response's own body.
+      unsafe { replace_host_vec(body, orig_len, &new_body, installed) };
+   }
 }
 
 /// Replaces `vec`'s contents with `new_body` while staying 100% compatible

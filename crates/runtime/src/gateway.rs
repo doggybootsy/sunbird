@@ -13,6 +13,7 @@ use std::{
       PoisonError,
       atomic::{
          AtomicBool,
+         AtomicUsize,
          Ordering,
       },
    },
@@ -43,11 +44,43 @@ use crate::{
 /// which events a plugin listens to.
 struct Gateway {
    registry:  GatewayRegistry,
-   originals: Vec<GatewayHandler>,
+   /// The handlers' addresses, retargeted to a trampoline when the handler
+   /// itself is hooked too ([`call_handler_through`]).
+   originals: Vec<AtomicUsize>,
    hooked:    Vec<AtomicBool>,
 }
 
 static GATEWAY: OnceLock<Gateway> = OnceLock::new();
+
+impl Gateway {
+   fn original(&self, id: EventId) -> GatewayHandler {
+      let addr = self.originals[id.index()].load(Ordering::Acquire);
+      // SAFETY: a registry handler or the trampoline to one, both with the
+      // handler ABI.
+      unsafe { std::mem::transmute::<usize, GatewayHandler>(addr) }
+   }
+}
+
+/// The detour every registry slot points to, for a platform that also hooks
+/// a handler's own entry: some hosts call a handler directly, past the
+/// registry (macOS deletes your own message that way).
+#[must_use]
+pub fn entry_detour() -> usize {
+   detour as *const () as usize
+}
+
+/// Calls `handler`'s events through `trampoline` from now on, once the
+/// platform hooked `handler`'s entry to [`entry_detour`].
+pub fn call_handler_through(handler: usize, trampoline: usize) {
+   let Some(gateway) = GATEWAY.get() else {
+      return;
+   };
+   for (id, entry) in gateway.registry.iter() {
+      if entry.handler == handler {
+         gateway.originals[id.index()].store(trampoline, Ordering::Release);
+      }
+   }
+}
 /// Events plugins fed Phoenix from outside a hook. They run on the store
 /// thread ahead of the next event Phoenix handles, since only a handler call
 /// carries the store.
@@ -98,7 +131,7 @@ pub fn swap(
       .iter()
       // SAFETY: the registry walk only accepts entries whose handler starts a
       // function, and every registry handler has this ABI.
-      .map(|(_, entry)| unsafe { std::mem::transmute::<usize, GatewayHandler>(entry.handler) })
+      .map(|(_, entry)| AtomicUsize::new(entry.handler))
       .collect();
    let hooked = registry.iter().map(|_| AtomicBool::new(false)).collect();
 
@@ -153,7 +186,7 @@ pub fn dispatch(event: EventId, data: &str) -> Option<bool> {
 
    // SAFETY: `handling` holds the arguments of a handler call still on this
    // thread's stack, and the event borrows strings that outlive the call.
-   let original = gateway.originals[event.index()];
+   let original = gateway.original(event);
    let result = unsafe { original(handling.store, &raw const synthetic, handling.ctx) };
    Some(result.is_ok())
 }
@@ -250,7 +283,7 @@ fn flush(gateway: &Gateway, store: *mut c_void, ctx: *mut c_void, rest: [u64; RE
       };
       // SAFETY: `store` and `ctx` are the arguments of the handler call this
       // runs inside, and the event borrows strings that outlive the call.
-      let original = gateway.originals[event.index()];
+      let original = gateway.original(event);
       if unsafe { original(store, &raw const synthetic, ctx) }.is_ok() {
          continue;
       }
@@ -304,7 +337,7 @@ unsafe extern "C" fn detour(
       event: name,
       bytes: data.map_or(0, str::len),
    });
-   let original = gateway.originals[id.index()];
+   let original = gateway.original(id);
    // SAFETY: forwarded to the registry's own handler unchanged or with
    // replaced data.
    let call = |event: &GatewayEvent| unsafe { original(store, event, ctx) };

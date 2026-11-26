@@ -1,5 +1,5 @@
 // @description Replaces YouTube titles and thumbnails in embeds using DeArrow
-// @version 0.1.1
+// @version 0.1.2
 // @author amaanq
 
 const { gateway } = phoenix;
@@ -67,9 +67,9 @@ const lookup = (id: string) => {
   return pending;
 };
 
-const rebrand = async (message: Phoenix.GatewayMessage) => {
-  const embeds = message.embeds;
-  if (!embeds?.length) return;
+/// Rewrites `embeds` in place, and says whether anything changed.
+const rebrandEmbeds = async (embeds: Phoenix.GatewayMessage["embeds"]) => {
+  if (!embeds?.length) return false;
   let changed = false;
   for (const embed of embeds) {
     const id = videoId(embed.url);
@@ -84,14 +84,33 @@ const rebrand = async (message: Phoenix.GatewayMessage) => {
       changed = true;
     }
   }
-  if (!changed) return;
-  phoenix.enqueue(gateway.messageUpdate, {
-    id: message.id,
-    channel_id: message.channel_id,
-    ...(message.guild_id ? { guild_id: message.guild_id } : {}),
-    embeds,
-  });
+  return changed;
+};
+
+const rebrand = async (message: Phoenix.GatewayMessage) => {
+  const embeds = message.embeds;
+  if (!(await rebrandEmbeds(embeds))) return;
+  // The whole message: Desktop's handler skips an update that is only the
+  // changed fields.
+  phoenix.enqueue(gateway.messageUpdate, { ...message, embeds });
 };
 
 phoenix.on(gateway.messageCreate, rebrand);
 phoenix.on(gateway.messageUpdate, rebrand);
+
+// Desktop gets a link's embed with the channel's history rather than a
+// gateway update, so the reply is rebranded too.
+if (typeof (phoenix as { bridge?: unknown }).bridge === "undefined") {
+  phoenix.discord.onResponse(
+    { method: "GET", pathPrefix: "/channels/", pathSuffix: "/messages" },
+    async (res) => {
+      if (res.status < 200 || res.status >= 300) return;
+      const list = res.json<unknown>();
+      if (!Array.isArray(list)) return;
+      const changed = await Promise.all(
+        list.map((message) => rebrandEmbeds((message as Phoenix.GatewayMessage).embeds)),
+      );
+      if (changed.some(Boolean)) return { body: JSON.stringify(list) };
+    },
+  );
+}

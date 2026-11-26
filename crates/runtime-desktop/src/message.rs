@@ -140,9 +140,15 @@ pub unsafe fn json(message: *const u8, id: u64) -> Option<String> {
    out
 }
 
-const fn word(at: *const u8) -> u64 {
-   // SAFETY: callers pass addresses inside a `Value` Discord built.
-   unsafe { at.cast::<u64>().read_unaligned() }
+/// A word of a `Value`, read without faulting: a build whose `Value` lays out
+/// differently gives garbage that fails a check, never a crash. An unreadable
+/// word reads as a tag no variant has.
+fn word(at: *const u8) -> u64 {
+   peek_word(at).unwrap_or(u64::MAX)
+}
+
+fn byte(at: *const u8) -> Option<u8> {
+   peek(at, 1).map(|bytes| bytes[0])
 }
 
 /// A `String` or `Vec`, `{cap, ptr, len}`, as its pointer and length.
@@ -183,13 +189,12 @@ fn peek_text_is(at: *const u8, want: &str) -> bool {
    })
 }
 
-fn text<'a>(at: *const u8) -> Option<&'a str> {
+fn text(at: *const u8) -> Option<String> {
    let (ptr, len) = vec(at)?;
    if len == 0 {
-      return Some("");
+      return Some(String::new());
    }
-   // SAFETY: a `String`'s buffer holds `len` initialized bytes.
-   str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len) }).ok()
+   String::from_utf8(peek(ptr, len)?).ok()
 }
 
 /// Whether `value` is an object whose first entry is `"id": "<id>"`.
@@ -224,19 +229,15 @@ fn write_value(out: &mut String, value: *const u8, bucket: Bucket, depth: usize)
    let body = value.wrapping_add(8);
    match tag.checked_sub(NICHE) {
       Some(0) => out.push_str("null"),
-      // SAFETY: a `Bool` keeps its byte right after the tag.
+      // A `Bool` keeps its byte right after the tag.
       Some(1) => {
-         out.push_str(if unsafe { *body } == 0 {
-            "false"
-         } else {
-            "true"
-         });
+         out.push_str(if byte(body)? == 0 { "false" } else { "true" });
       },
       Some(2) => {
          let payload = word(body.wrapping_add(8));
-         // SAFETY: `N`'s tag is a byte at the start of the `Number`; the
-         // bytes after it are padding.
-         match unsafe { *body } {
+         // `N`'s tag is a byte at the start of the `Number`; the bytes after it
+         // are padding.
+         match byte(body)? {
             0 => write!(out, "{payload}").ok()?,
             #[expect(clippy::cast_possible_wrap, reason = "NegInt holds an i64")]
             1 => write!(out, "{}", payload as i64).ok()?,
@@ -244,7 +245,7 @@ fn write_value(out: &mut String, value: *const u8, bucket: Bucket, depth: usize)
             _ => return None,
          }
       },
-      Some(3) => out.push_str(&serde_json::to_string(text(body)?).ok()?),
+      Some(3) => out.push_str(&serde_json::to_string(&text(body)?).ok()?),
       Some(4) => {
          let (items, len) = vec(body)?;
          out.push('[');
@@ -270,7 +271,7 @@ fn write_value(out: &mut String, value: *const u8, bucket: Bucket, depth: usize)
             if index > 0 {
                out.push(',');
             }
-            out.push_str(&serde_json::to_string(text(entry.wrapping_add(bucket.key))?).ok()?);
+            out.push_str(&serde_json::to_string(&text(entry.wrapping_add(bucket.key))?).ok()?);
             out.push(':');
             write_value(out, entry.wrapping_add(bucket.value), bucket, depth + 1)?;
          }
