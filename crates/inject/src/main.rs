@@ -514,15 +514,41 @@ mod windows {
          &fresh.to_string_lossy(),
          &format!("{site}/plugins/phoenix-windows-x86_64.dll"),
       ])?;
+      // `curl -f` only rejects an HTTP error, so a captive portal or a wrong
+      // deploy still writes its body here; swapping that in would leave
+      // Discord without a working DLL.
+      if !is_loader(&fresh) {
+         let _ = fs::remove_file(&fresh);
+         misstep::bail!("the downloaded phoenix.dll is not a Windows loader");
+      }
       let old = home.join("phoenix.dll.old");
       let _ = fs::remove_file(&old);
-      if dll.is_file() {
+      let replaced = if dll.is_file() {
          fs::rename(dll, &old)?;
+         true
+      } else {
+         false
+      };
+      if let Err(install) = fs::rename(&fresh, dll) {
+         // A failed swap must not leave Sunbird without a DLL: the one moved
+         // aside goes back into place, and this launch carries on with it.
+         let _ = fs::remove_file(&fresh);
+         if replaced && fs::rename(&old, dll).is_ok() {
+            return Ok(());
+         }
+         misstep::bail!("installing phoenix.dll failed: {install}");
       }
-      fs::rename(&fresh, dll)?;
       let _ = fs::remove_file(&old);
       fs::write(stamp, version)?;
       Ok(())
+   }
+
+   /// Whether `path` is a Windows PE image carrying the version marker every
+   /// loader is built with (`crates/runtime/src/update.rs`).
+   fn is_loader(path: &Path) -> bool {
+      fs::read(path).is_ok_and(|bytes| {
+         bytes.starts_with(b"MZ") && bytes.windows(16).any(|window| window == b"phoenix-version:")
+      })
    }
 
    /// Runs Windows' own `curl.exe` and returns what it printed. Only
@@ -558,19 +584,24 @@ mod windows {
       rest.get(..rest.find('"')?)
    }
 
-   /// The Start Menu and Desktop shortcuts, through PowerShell's
-   /// `WScript.Shell`, so OneDrive-redirected desktops resolve. Adds them when
-   /// missing, or removes them. Paths reach the script through the
-   /// environment, never inside its text.
+   /// The Start Menu and Desktop shortcuts, and a Start Menu one for access
+   /// gate only, for when the runtime crashes on a Discord build it doesn't
+   /// know yet. Made through PowerShell's `WScript.Shell`, so
+   /// OneDrive-redirected desktops resolve. Adds them when missing, or removes
+   /// them. Paths reach the script through the environment, never inside its
+   /// text.
    fn shortcuts(local: &Path, launcher: &Path, remove: bool) -> misstep::Result<()> {
       use std::os::windows::process::CommandExt;
       let script = format!(
-         "$w = New-Object -ComObject WScript.Shell; foreach ($dir in \
-          @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) \
-          {{ $p = Join-Path $dir 'Sunbird.lnk'; if (${remove}) {{ Remove-Item -LiteralPath $p \
+         "$w = New-Object -ComObject WScript.Shell; $programs = \
+          [Environment]::GetFolderPath('Programs'); $sunbird = @('Sunbird', '', 'Discord with \
+          Sunbird'); foreach ($l in @((@($programs) + $sunbird), \
+          (@([Environment]::GetFolderPath('Desktop')) + $sunbird), @($programs, 'Sunbird (access \
+          gate only)', '--no-runtime', 'Discord past the access gate, without plugins'))) {{ $p = \
+          Join-Path $l[0] ($l[1] + '.lnk'); if (${remove}) {{ Remove-Item -LiteralPath $p \
           -ErrorAction SilentlyContinue; continue }}; if (Test-Path -LiteralPath $p) {{ continue \
-          }}; $s = $w.CreateShortcut($p); $s.TargetPath = $env:SB_TARGET; $s.IconLocation = \
-          $env:SB_ICON + ',0'; $s.Description = 'Discord with Sunbird'; $s.Save() }}"
+          }}; $s = $w.CreateShortcut($p); $s.TargetPath = $env:SB_TARGET; $s.Arguments = $l[2]; \
+          $s.IconLocation = $env:SB_ICON + ',0'; $s.Description = $l[3]; $s.Save() }}"
       );
       let status = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"))
          .args(["-NoProfile", "-NonInteractive", "-Command", &script])

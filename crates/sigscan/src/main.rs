@@ -18,32 +18,15 @@
 //! Addresses are hex at the file's preferred base. One below the base is an
 //! RVA. Every address printed carries its RVA too, for a live process's base.
 
-use std::{
-   collections::HashMap,
-   env,
-   fs,
-};
+use std::{collections::HashMap, env, fs};
 
-use misstep::{
-   OptionExt,
-   ResultExt,
-};
-use phoenix_hook::{
-   arm64,
-   image::Image,
-   pattern::Pattern,
-   x86,
-};
+use misstep::{OptionExt, ResultExt};
+use phoenix_hook::{arm64, image::Image, pattern::Pattern, x86};
 use phoenix_sigs::{
-   Found,
-   desktop,
-   file::{
-      BinaryFile,
-      Machine,
-   },
+   Found, desktop,
+   file::{BinaryFile, Machine},
    http::DesktopHttpTransport,
-   ios,
-   mobile,
+   ios, mobile,
    registry::GatewayRegistry,
 };
 
@@ -79,13 +62,11 @@ fn main() -> misstep::Result<()> {
    };
    match args.get(1).map(String::as_str) {
       None => dump(image),
-      Some("check") => {
-         check(
-            image,
-            parsed.machine(),
-            matches!(parsed, BinaryFile::MachO(_)),
-         )
-      },
+      Some("check") => check(
+         image,
+         parsed.machine(),
+         matches!(parsed, BinaryFile::MachO(_)),
+      ),
       Some("strings") => tools.strings(args.get(2).context(USAGE)?),
       Some("scan") => tools.scan(&args[2..].join(" ")),
       Some("refs") => {
@@ -118,14 +99,12 @@ const MACOS_DESKTOP: &[u8] = b"DESKTOP_ACCESS_GATE_TITLE";
 #[expect(clippy::too_many_lines, reason = "one report per locator")]
 fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()> {
    let mut missed = 0;
-   let mut report = |name: &str, found: Found<String>| {
-      match found {
-         Ok(detail) => println!("ok    {name:<20} {detail}"),
-         Err(why) => {
-            missed += 1;
-            println!("MISS  {name:<20} {why}");
-         },
-      }
+   let mut report = |name: &str, found: Found<String>| match found {
+      Ok(detail) => println!("ok    {name:<20} {detail}"),
+      Err(why) => {
+         missed += 1;
+         println!("MISS  {name:<20} {why}");
+      },
    };
    let at = |addr: usize| format!("{addr:#x}");
    let registry = GatewayRegistry::locate(image).map_err(|err| err.to_string());
@@ -147,8 +126,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                prologues
                   .frame
                   .at(image, http.send_fn)
-                  .then(|| at(http.send_fn))
+                  .then(|| format!("{} request {:x?}", at(http.send_fn), http.request))
                   .ok_or_else(|| "send prologue changed".to_owned())
+            }),
+         );
+         report(
+            "http responses",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               (http.poll_result <= phoenix_sigs::http::POLL_RESULT_SIZE)
+                  .then(|| at(http.poll_fn))
+                  .ok_or_else(|| format!("poll writes {:#x} bytes of its result", http.poll_result))
             }),
          );
          report(
@@ -161,13 +148,11 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                Some((Some(alloc), Some(dealloc))) => {
                   Ok(format!("alloc {}, dealloc {}", at(alloc), at(dealloc)))
                },
-               Some((alloc, dealloc)) => {
-                  Err(format!(
-                     "alloc {}, dealloc {}",
-                     alloc.map_or_else(|| "missing".to_owned(), at),
-                     dealloc.map_or_else(|| "missing".to_owned(), at)
-                  ))
-               },
+               Some((alloc, dealloc)) => Err(format!(
+                  "alloc {}, dealloc {}",
+                  alloc.map_or_else(|| "missing".to_owned(), at),
+                  dealloc.map_or_else(|| "missing".to_owned(), at)
+               )),
                None => Err("no http transport".to_owned()),
             },
          );
@@ -211,14 +196,12 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "gpui builders",
             gpui.as_ref().map_err(Clone::clone).and_then(|gpui| {
                match (gpui.div_push_any, gpui.str_into_any) {
-                  (Some(push), Some(text)) => {
-                     Ok(format!(
-                        "{} (push_any {}, str_into_any {})",
-                        at(gpui.div_new),
-                        at(push),
-                        at(text)
-                     ))
-                  },
+                  (Some(push), Some(text)) => Ok(format!(
+                     "{} (push_any {}, str_into_any {})",
+                     at(gpui.div_new),
+                     at(push),
+                     at(text)
+                  )),
                   (push, text) => Err(format!("push_any {push:x?}, str_into_any {text:x?}")),
                }
             }),
@@ -370,16 +353,24 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(|&found| at(found))
                .ok_or_else(|| "the loader can't tell a launch that never re-execs".to_owned()),
          );
+         let http = phoenix_sigs::macos::http_transport(image);
          report(
             "http transport",
-            phoenix_sigs::macos::http_transport(image).map(|http| {
+            http.as_ref().map_err(Clone::clone).map(|http| {
                format!(
-                  "send {} ({} slots), poll {} ({} slots)",
+                  "send {} ({} slots) request {:x?}",
                   at(http.send_fn),
                   http.send_slots.len(),
-                  at(http.poll_fn),
-                  http.poll_slots.len()
+                  http.request,
                )
+            }),
+         );
+         report(
+            "http responses",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               (http.poll_result <= phoenix_sigs::http::POLL_RESULT_SIZE)
+                  .then(|| format!("{} ({} slots)", at(http.poll_fn), http.poll_slots.len()))
+                  .ok_or_else(|| format!("poll writes {:#x} bytes of its result", http.poll_result))
             }),
          );
          report(
@@ -500,14 +491,15 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             }),
          );
          let names = ["Networking.request", "@http", "headers"];
-         report("host names", match ios::host_names(image, &names)[..] {
-            [Some(request), Some(http), Some(headers)] => {
-               Ok(format!(
+         report(
+            "host names",
+            match ios::host_names(image, &names)[..] {
+               [Some(request), Some(http), Some(headers)] => Ok(format!(
                   "request {request}, @http {http}, headers {headers}"
-               ))
+               )),
+               ref numbers => Err(format!("{names:?} read as {numbers:?}")),
             },
-            ref numbers => Err(format!("{names:?} read as {numbers:?}")),
-         });
+         );
          report(
             "access gate",
             ios::access_gate(image).map(|[a, b]| format!("{a:#x}, {b:#x}")),
@@ -583,7 +575,7 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
 struct Tools<'a> {
    image: &'a Image<'a>,
-   base:  usize,
+   base: usize,
    /// Mach-O files are arm64, everything else sigscan reads as x86-64 here.
    arm64: bool,
 }
@@ -608,17 +600,15 @@ impl Tools<'_> {
          }
          let text = match insn {
             Insn::Bl { target } => format!("call {target:#x}"),
-            Insn::AddImm { rd, rn, imm } => {
-               match pages[usize::from(rn)] {
-                  Some(page) if rn != 31 => {
-                     let addr = page + imm;
-                     let preview = self.image.read(addr, 24).map_or_else(String::new, |bytes| {
-                        String::from_utf8_lossy(bytes).replace(|c: char| c.is_control(), ".")
-                     });
-                     format!("x{rd} = {addr:#x} \"{preview}\"")
-                  },
-                  _ => format!("{insn:x?}"),
-               }
+            Insn::AddImm { rd, rn, imm } => match pages[usize::from(rn)] {
+               Some(page) if rn != 31 => {
+                  let addr = page + imm;
+                  let preview = self.image.read(addr, 24).map_or_else(String::new, |bytes| {
+                     String::from_utf8_lossy(bytes).replace(|c: char| c.is_control(), ".")
+                  });
+                  format!("x{rd} = {addr:#x} \"{preview}\"")
+               },
+               _ => format!("{insn:x?}"),
             },
             Insn::Adrp { .. } => continue,
             other => format!("{other:x?}"),

@@ -21,14 +21,18 @@ site=${SUNBIRD_SITE:-https://assets.sunbird.tools}
 home="$HOME/Library/Application Support/Sunbird"
 # /Applications is writable by admin accounts only.
 if [ -w /Applications ]; then
-   app=/Applications/Sunbird.app
+   apps=/Applications
 else
-   app="$HOME/Applications/Sunbird.app"
+   apps="$HOME/Applications"
 fi
+app="$apps/Sunbird.app"
+gate_app="$apps/Sunbird (access gate only).app"
 bundle_id=com.discord.DesktopGpui
 
 if [ "${1:-}" = --uninstall ]; then
-   rm -rf "$home" /Applications/Sunbird.app "$HOME/Applications/Sunbird.app"
+   rm -rf "$home" \
+      /Applications/Sunbird.app "$HOME/Applications/Sunbird.app" \
+      "/Applications/Sunbird (access gate only).app" "$HOME/Applications/Sunbird (access gate only).app"
    echo "Sunbird is uninstalled. Discord itself was not changed."
    exit 0
 fi
@@ -113,10 +117,11 @@ echo "Using Discord Phoenix at $discord"
 q() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
 
 # An earlier install may have used the other folder.
-for other in /Applications/Sunbird.app "$HOME/Applications/Sunbird.app"; do
-   [ "$other" = "$app" ] || rm -rf "$other"
+for other_dir in /Applications "$HOME/Applications"; do
+   [ "$other_dir" = "$apps" ] || rm -rf "$other_dir/Sunbird.app" "$other_dir/Sunbird (access gate only).app"
 done
-mkdir -p "$home" "$app/Contents/MacOS" "$app/Contents/Resources"
+mkdir -p "$home" "$app/Contents/MacOS" "$app/Contents/Resources" \
+   "$gate_app/Contents/MacOS" "$gate_app/Contents/Resources"
 
 # The launcher brings the loader up to the site's version and the copy up to
 # Discord's before each start, and keeps what it has when offline. Each run
@@ -259,6 +264,7 @@ JS
 }
 if make_icon "$home/Sunbird.icns"; then
    cp "$home/Sunbird.icns" "$app/Contents/Resources/Sunbird.icns"
+   cp "$home/Sunbird.icns" "$gate_app/Contents/Resources/Sunbird.icns"
 else
    echo "Couldn't draw Sunbird's icon; it keeps a plain one." >&2
 fi
@@ -279,8 +285,33 @@ cat >"$app/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+# For when the plugin runtime crashes on a Discord build it doesn't know yet.
+cat >"$gate_app/Contents/MacOS/sunbird-gate-only" <<EOF
+#!/bin/sh
+exec $(q "$app/Contents/MacOS/sunbird") --no-runtime "\$@"
+EOF
+chmod +x "$gate_app/Contents/MacOS/sunbird-gate-only"
+cat >"$gate_app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+   <key>CFBundleExecutable</key><string>sunbird-gate-only</string>
+   <key>CFBundleIdentifier</key><string>tools.sunbird.launcher.gate-only</string>
+   <key>CFBundleName</key><string>Sunbird (access gate only)</string>
+   <key>CFBundleDisplayName</key><string>Sunbird (access gate only)</string>
+   <key>CFBundleIconFile</key><string>Sunbird</string>
+   <key>CFBundlePackageType</key><string>APPL</string>
+   <key>CFBundleShortVersionString</key><string>1.0</string>
+   <key>LSMinimumSystemVersion</key><string>13.0</string>
+   <key>LSUIElement</key><true/>
+</dict>
+</plist>
+EOF
 /usr/bin/codesign --force --sign - "$app" >/dev/null 2>&1 || true
+/usr/bin/codesign --force --sign - "$gate_app" >/dev/null 2>&1 || true
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" 2>/dev/null || true
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$gate_app" 2>/dev/null || true
 
 # First download now, so a missing network shows up here rather than as a
 # Discord without Sunbird.
