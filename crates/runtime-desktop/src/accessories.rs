@@ -444,16 +444,11 @@ pub fn install_optimistic_delete(image: &Image<'static>) {
       );
       return;
    };
-   let started = std::time::Instant::now();
    let found = if crate::X86_CODE {
       desktop::optimistic_delete(image, del_fn)
    } else {
       phoenix_sigs::macos::optimistic_delete(image, del_fn)
    };
-   log::info!(
-      "desktop accessories: optimistic delete located in {:?}",
-      started.elapsed()
-   );
    let opt_del = match found {
       Ok(opt_del) => opt_del,
       Err(err) => {
@@ -621,8 +616,10 @@ mod arm64 {
             return;
          },
       };
-      let muted = body.colors[..body.color_count]
-         .contains(&(body.row_colors + super::ROW_COLORS_MUTED_DELTA));
+      let muted = body
+         .colors
+         .binary_search(&(body.row_colors + super::ROW_COLORS_MUTED_DELTA))
+         .is_ok();
       let pro = phoenix_sigs::desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
       // SAFETY: runs from `prepare` before Discord's threads; `body_detour`
       // has the builder's signature.

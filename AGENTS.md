@@ -401,8 +401,13 @@ byte pattern says nothing about arm32.
   ids, read with `read_memory`, before serializing.
 - Optimistic delete: `macos::optimistic_delete` is the x86 rule with stubs resolved (the one other
   parent of `MESSAGE_DELETE`'s callees sharing at least 4 and taking a lock, LSE `cas` or
-  `ldaxr`). It costs about 0.6 s at startup. Host allocator: `__rust_alloc(size, align)` is
+  `ldaxr`); callers through stubs come from the stubs whose tail `b` hits a callee. Host allocator: `__rust_alloc(size, align)` is
   `alloc_or_oom`'s first real call, and `__rust_dealloc(ptr, size, align)` the next function,
   which subtracts the size from Discord's live-byte counter (`neg`, `ldadd`).
+- Startup. `prepare` runs in the loader's constructor, so Discord's window waits for every
+  locator; on macOS that is about 1.2 s. Each `arm64::code_refs` is a full pass over ~330 MB of
+  code (about 0.25 s, split across threads), so look up several targets with one
+  `code_refs_to`, never one pass per string copy: `StyleRefinement` alone once cost 10 s that
+  way. Prefilter whole-code scans on the raw word before `decode`.
 - `X86_CODE` in `runtime-desktop` now only picks the locator. Handlers keep the desktop result
   ABI: 96 bytes, `Ok` is `u64::MAX - 1`, returned through `x8`.

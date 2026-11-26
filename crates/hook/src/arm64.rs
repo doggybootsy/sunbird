@@ -301,30 +301,93 @@ const PAIR_REACH: usize = 12;
 /// instruction.
 #[must_use]
 pub fn code_refs(image: &Image<'_>, targets: Range<usize>) -> Vec<(usize, usize)> {
+   refs_where(image, |target| targets.contains(&target))
+}
+
+/// [`code_refs`] for several targets in one pass over the code.
+#[must_use]
+pub fn code_refs_to(image: &Image<'_>, targets: &[usize]) -> Vec<(usize, usize)> {
+   let mut sorted = targets.to_vec();
+   sorted.sort_unstable();
+   sorted.dedup();
+   let (Some(&first), Some(&last)) = (sorted.first(), sorted.last()) else {
+      return Vec::new();
+   };
+   refs_where(image, |target| {
+      (first..=last).contains(&target) && sorted.binary_search(&target).is_ok()
+   })
+}
+
+/// Words each thread of [`refs_where`] scans; the code is a few hundred MB.
+const CHUNK_WORDS: usize = 1 << 21;
+
+fn refs_where(image: &Image<'_>, wanted: impl Fn(usize) -> bool + Sync) -> Vec<(usize, usize)> {
    let mut found = Vec::new();
    for segment in image.segments.iter().filter(|segment| segment.executable) {
-      // The last `adrp` each register got, by its instruction index.
-      let mut pages = [(usize::MAX, 0usize); 32];
-      for (index, &word) in segment.bytes.as_chunks::<4>().0.iter().enumerate() {
-         let pc = segment.addr + index * 4;
-         let word = u32::from_le_bytes(word);
-         let paired = |rn: Reg, imm: usize| {
-            let (at, page) = pages[usize::from(rn)];
-            (at != usize::MAX && index - at <= PAIR_REACH).then(|| page.wrapping_add(imm))
-         };
-         let target = match decode(word, pc) {
-            Insn::Adrp { rd, page } => {
-               pages[usize::from(rd)] = (index, page);
-               None
-            },
-            Insn::AddImm { rn, imm, .. } => paired(rn, imm),
-            Insn::Load { rn, offset, .. } | Insn::Store { rn, offset, .. } => paired(rn, offset),
-            Insn::Bl { target } | Insn::B { target } => Some(target),
-            _ => None,
-         };
-         if let Some(target) = target.filter(|target| targets.contains(target)) {
-            found.push((pc, target));
-         }
+      let words = segment.bytes.as_chunks::<4>().0;
+      let chunks = words.len().div_ceil(CHUNK_WORDS);
+      let parts: Vec<Vec<(usize, usize)>> = std::thread::scope(|scope| {
+         let handles: Vec<_> = (0..chunks)
+            .map(|chunk| {
+               let wanted = &wanted;
+               scope.spawn(move || {
+                  let start = chunk * CHUNK_WORDS;
+                  let end = (start + CHUNK_WORDS).min(words.len());
+                  // Starts early enough to see an `adrp` paired across the
+                  // boundary, and keeps only sites inside the chunk.
+                  scan_refs(
+                     segment.addr,
+                     words,
+                     start.saturating_sub(PAIR_REACH),
+                     start,
+                     end,
+                     wanted,
+                  )
+               })
+            })
+            .collect();
+         handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect()
+      });
+      found.extend(parts.into_iter().flatten());
+   }
+   found
+}
+
+fn scan_refs(
+   base: usize,
+   words: &[[u8; 4]],
+   warm: usize,
+   start: usize,
+   end: usize,
+   wanted: &impl Fn(usize) -> bool,
+) -> Vec<(usize, usize)> {
+   let mut found = Vec::new();
+   // The last `adrp` each register got, by its instruction index.
+   let mut pages = [(usize::MAX, 0usize); 32];
+   for (index, &word) in words.iter().enumerate().take(end).skip(warm) {
+      let pc = base + index * 4;
+      let word = u32::from_le_bytes(word);
+      let paired = |rn: Reg, imm: usize| {
+         let (at, page) = pages[usize::from(rn)];
+         (at != usize::MAX && index - at <= PAIR_REACH).then(|| page.wrapping_add(imm))
+      };
+      let target = match decode(word, pc) {
+         Insn::Adrp { rd, page } => {
+            pages[usize::from(rd)] = (index, page);
+            None
+         },
+         Insn::AddImm { rn, imm, .. } => paired(rn, imm),
+         Insn::Load { rn, offset, .. } | Insn::Store { rn, offset, .. } => paired(rn, offset),
+         Insn::Bl { target } | Insn::B { target } => Some(target),
+         _ => None,
+      };
+      if index >= start
+         && let Some(target) = target.filter(|&target| wanted(target))
+      {
+         found.push((pc, target));
       }
    }
    found

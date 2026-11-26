@@ -516,10 +516,8 @@ pub(crate) fn debug_offsets(
 /// loads the bare name and prints `padding` and `gap`.
 pub fn style_fields(image: &Image<'_>) -> Found<std::collections::HashMap<String, usize>> {
    const NAME: &[u8] = b"StyleRefinement";
-   let mut funcs = image
-      .find_bytes(NAME)
+   let mut funcs = arm64::code_refs_to(image, &image.find_bytes(NAME))
       .into_iter()
-      .flat_map(|name| arm64::code_refs(image, name..name + 1))
       .filter_map(|(site, _)| image.function_containing(site))
       .collect::<Vec<_>>();
    funcs.sort_unstable();
@@ -559,6 +557,10 @@ fn option_u64_reads(image: &Image<'_>) -> Vec<(usize, usize)> {
             .map(|&word| arm64::decode(u32::from_le_bytes(word), segment.addr + index * 4))
       };
       for index in 0..words.len().saturating_sub(24) {
+         // `ldr wT, [xN, #imm]`, checked on the raw word before decoding.
+         if u32::from_le_bytes(words[index]) & 0xFFC0_0000 != 0xB940_0000 {
+            continue;
+         }
          let Some(Insn::Load {
             rt,
             rn,
@@ -778,10 +780,8 @@ fn most_common(values: impl IntoIterator<Item = usize>, least: usize) -> Option<
 )]
 pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    const NAME: &[u8] = b"MessageContextMenu";
-   let mut builders = image
-      .find_bytes(NAME)
+   let mut builders = arm64::code_refs_to(image, &image.find_bytes(NAME))
       .into_iter()
-      .flat_map(|name| arm64::code_refs(image, name..name + 1))
       .filter_map(|(site, _)| image.function_containing(site))
       .collect::<Vec<_>>();
    builders.sort_unstable();
@@ -1094,10 +1094,8 @@ fn built(insns: &[(usize, Insn)]) -> Vec<Built> {
 /// The function holding the one code reference to the exact bytes `name`,
 /// flattened, and the index the reference completes at.
 fn anchored(image: &Image<'_>, name: &[u8], what: &str) -> Found<(Vec<(usize, Insn)>, usize)> {
-   let mut sites = image
-      .find_bytes(name)
+   let mut sites = arm64::code_refs_to(image, &image.find_bytes(name))
       .into_iter()
-      .flat_map(|at| arm64::code_refs(image, at..at + 1))
       .filter_map(|(site, target)| Some((image.function_containing(site)?, target)))
       .collect::<Vec<_>>();
    sites.sort_unstable();
@@ -1675,10 +1673,8 @@ pub struct MessageRow {
 pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
    // A format piece: its length byte, then the text.
    const TEMPLATE: &[u8] = b"\x10message-content-";
-   let mut refs = image
-      .find_bytes(TEMPLATE)
+   let mut refs = arm64::code_refs_to(image, &image.find_bytes(TEMPLATE))
       .into_iter()
-      .flat_map(|at| arm64::code_refs(image, at..at + 1))
       .filter_map(|(site, target)| Some((image.function_containing(site)?, site, target)))
       .collect::<Vec<_>>();
    refs.sort_unstable();
@@ -1689,10 +1685,13 @@ pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
          refs.len()
       ));
    }
+   let helpers: Vec<usize> = refs.iter().map(|&(helper, ..)| helper).collect();
+   let calls = arm64::code_refs_to(image, &helpers);
    let callers_of = |helper: usize| {
-      arm64::code_refs(image, helper..helper + 1)
-         .into_iter()
-         .filter_map(|(site, _)| Some((image.function_containing(site)?, site)))
+      calls
+         .iter()
+         .filter(|&&(_, target)| target == helper)
+         .filter_map(|&(site, _)| Some((image.function_containing(site)?, site)))
          .collect::<Vec<_>>()
    };
    let mut common: Option<Vec<usize>> = None;
@@ -1953,13 +1952,8 @@ fn loaded_addresses(code: &[(usize, Insn)]) -> Vec<usize> {
 /// most often.
 pub fn message_json(image: &Image<'_>) -> Found<MessageJson> {
    let names = image.find_bytes(b"mention_everyone");
-   let (Some(&first), Some(&last)) = (names.iter().min(), names.iter().max()) else {
-      return Err("no mention_everyone string".to_owned());
-   };
-   // One pass over the code for every copy of the name.
-   let mut funcs: Vec<usize> = arm64::code_refs(image, first..last + 1)
+   let mut funcs: Vec<usize> = arm64::code_refs_to(image, &names)
       .into_iter()
-      .filter(|(_, target)| names.contains(target))
       .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
       .collect();
    funcs.sort_unstable();
@@ -2132,34 +2126,42 @@ pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usiz
       .function_bounds(message_delete)
       .ok_or("MESSAGE_DELETE handler has no bounds")?;
    let shared_with = real_callees(image, handler);
-   // Each of the handler's callees' callers, through stubs too.
-   let mut stubs: HashMap<usize, Option<usize>> = HashMap::new();
+   // Each of the handler's callees' callers: direct ones, then those that
+   // reach it through a stub ending in `b callee`.
+   let callees: Vec<usize> = shared_with.iter().copied().collect();
+   let direct = arm64::code_refs_to(image, &callees);
+   let mut stubs: HashMap<usize, usize> = HashMap::new();
+   for &(site, target) in &direct {
+      let Some(word) = image.read_u32(site) else {
+         continue;
+      };
+      if !matches!(arm64::decode(word, site), Insn::B { .. }) {
+         continue;
+      }
+      if let Some(start) = image.function_containing(site)
+         && site - start < 6 * 4
+         && stub(image, start).and_then(|(_, tail)| tail) == Some(target)
+      {
+         stubs.insert(start, target);
+      }
+   }
+   let stub_starts: Vec<usize> = stubs.keys().copied().collect();
+   let through_stubs = arm64::code_refs_to(image, &stub_starts)
+      .into_iter()
+      .filter_map(|(site, stub)| Some((site, *stubs.get(&stub)?)));
    let mut parents: HashMap<usize, HashSet<usize>> = HashMap::new();
-   for segment in image.segments.iter().filter(|segment| segment.executable) {
-      for (index, word) in segment.bytes.as_chunks::<4>().0.iter().enumerate() {
-         let word = u32::from_le_bytes(*word);
-         if word & 0x7C00_0000 != 0x1400_0000 {
-            continue;
-         }
-         let pc = segment.addr + index * 4;
-         let (Insn::Bl { target } | Insn::B { target }) = arm64::decode(word, pc) else {
-            continue;
-         };
-         let real = if shared_with.contains(&target) {
-            Some(target)
-         } else {
-            *stubs.entry(target).or_insert_with(|| {
-               stub(image, target)
-                  .and_then(|(_, tail)| tail)
-                  .filter(|tail| shared_with.contains(tail))
-            })
-         };
-         if let Some(real) = real
-            && let Some((parent, _)) = image.function_bounds(pc)
-            && parent != real
-         {
-            parents.entry(real).or_default().insert(parent);
-         }
+   for (site, real) in direct.iter().copied().chain(through_stubs) {
+      let Some(word) = image.read_u32(site) else {
+         continue;
+      };
+      if !matches!(arm64::decode(word, site), Insn::Bl { .. } | Insn::B { .. }) {
+         continue;
+      }
+      if let Some((parent, _)) = image.function_bounds(site)
+         && parent != real
+         && !stubs.contains_key(&parent)
+      {
+         parents.entry(real).or_default().insert(parent);
       }
    }
    let mut candidates: Vec<usize> = parents
@@ -2193,13 +2195,13 @@ pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usiz
 
 /// `build_message_body`, which `MessageRow::render` calls once per row, and
 /// where its config (`x1`) keeps the row's text colors.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MessageBody {
-   pub func:        usize,
-   pub row_colors:  usize,
-   /// Every color offset the builder loads, to check another one against.
-   pub colors:      [usize; 16],
-   pub color_count: usize,
+   pub func:       usize,
+   pub row_colors: usize,
+   /// Every color offset the builder loads, sorted, to check another one
+   /// against.
+   pub colors:     Vec<usize>,
 }
 
 /// [`crate::desktop::message_body`] for arm64.
@@ -2271,21 +2273,16 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
       })
       .collect();
    let row_colors = most_common(passed, 1).ok_or("message body row colors not found")?;
-   let mut colors = [0; 16];
-   let mut color_count = 0;
-   for &start in &triples {
-      for offset in [start + 4, start + 8, start + 12] {
-         if color_count < colors.len() {
-            colors[color_count] = offset;
-            color_count += 1;
-         }
-      }
-   }
+   let mut colors: Vec<usize> = triples
+      .iter()
+      .flat_map(|&start| [start + 4, start + 8, start + 12])
+      .collect();
+   colors.sort_unstable();
+   colors.dedup();
    Ok(MessageBody {
       func,
       row_colors,
       colors,
-      color_count,
    })
 }
 
