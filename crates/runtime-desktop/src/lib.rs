@@ -113,6 +113,7 @@ pub fn prepare() -> Result<(), Error> {
    }
    // The index is tens of MB and nothing reads it after startup.
    phoenix_sigs::desktop::release_call_index();
+   phoenix_hook::arm64::release_ref_index();
    *PREPARED.lock().unwrap_or_else(PoisonError::into_inner) = Some((image, registry?));
    Ok(())
 }
