@@ -486,6 +486,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "access gate",
             phoenix_sigs::macos::access_gate(image).map(at),
          );
+         report(
+            "pages under frame",
+            phoenix_sigs::macos::pages_under_frame(image).map(at),
+         );
       },
       Machine::Aarch64 if macho => {
          report(

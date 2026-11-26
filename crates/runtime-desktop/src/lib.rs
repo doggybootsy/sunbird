@@ -187,6 +187,25 @@ fn open_arm64_access_gate(image: &Image<'static>) {
       Ok(()) => log::info!("access gate: open"),
       Err(err) => log::error!("access gate: {err}"),
    }
+   keep_pages_over_frame(image);
+}
+
+/// Keeps macOS embedded webviews above `GPUIView` so mouse clicks reach
+/// interactive modals like hCaptcha (release builds ignore
+/// `LIBDISCORD_MAC_PAGES_OVER_FRAME`).
+fn keep_pages_over_frame(image: &Image<'static>) {
+   let func = match phoenix_sigs::macos::pages_under_frame(image) {
+      Ok(func) => func,
+      Err(err) => {
+         log::warn!("webview pages_under_frame: {err}, leaving it");
+         return;
+      },
+   };
+   // SAFETY: Discord's own code, written from the constructor before it runs.
+   match unsafe { image.write_code(func, &phoenix_sigs::macos::PAGES_OVER_FRAME) } {
+      Ok(()) => log::info!("webview: pages_under_frame disabled @ {func:#x}"),
+      Err(err) => log::error!("webview pages_under_frame: {err}"),
+   }
 }
 
 impl Platform for Desktop {

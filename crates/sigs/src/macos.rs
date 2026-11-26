@@ -100,6 +100,72 @@ pub fn access_gate(image: &Image<'_>) -> Found<usize> {
 /// `mov w0, #2; ret`: the access function's "no gate".
 pub const NO_GATE: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
 
+/// `mov w0, #0; ret`: disables `pages_under_frame`, keeping embedded webviews
+/// above `GPUIView` so mouse clicks reach them on macOS.
+pub const PAGES_OVER_FRAME: [u8; 8] = [0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
+
+/// `discord_desktop_platform::webview::pages_under_frame` on macOS.
+///
+/// Release builds ignore `LIBDISCORD_MAC_PAGES_OVER_FRAME`, so callers of the
+/// helper that logs `"webview: ordered under the window's frame"` gate it with
+/// `bl pages_under_frame; tbz w0, #0, ...`.
+pub fn pages_under_frame(image: &Image<'_>) -> Found<usize> {
+   const ANCHOR: &[u8] = b"webview: ordered under the window's frame";
+   const LOOKBACK: usize = 8;
+
+   let anchor = one("webview under-frame anchor", &image.find_bytes(ANCHOR))?;
+   let mut helpers = arm64::code_refs(image, anchor..anchor + 1)
+      .into_iter()
+      .filter_map(|(site, _)| image.function_containing(site))
+      .collect::<Vec<_>>();
+   helpers.sort_unstable();
+   helpers.dedup();
+   let helper = one("webview under-frame helper", &helpers)?;
+
+   let mut found = Vec::new();
+   for segment in image.segments.iter().filter(|segment| segment.executable) {
+      let words = segment.bytes.as_chunks::<4>().0;
+      for (index, &word) in words.iter().enumerate() {
+         let raw = u32::from_le_bytes(word);
+         if (raw & 0xFC00_0000) != 0x9400_0000 {
+            continue;
+         }
+         let pc = segment.addr + index * 4;
+         if arm64::decode(raw, pc) != (Insn::Bl { target: helper }) {
+            continue;
+         }
+         let start = index.saturating_sub(LOOKBACK);
+         for at in (start..index).rev() {
+            let call_pc = segment.addr + at * 4;
+            let Insn::Bl { target } = arm64::decode(u32::from_le_bytes(words[at]), call_pc) else {
+               continue;
+            };
+            let next = arm64::decode(u32::from_le_bytes(words[at + 1]), call_pc + 4);
+            let branches_on_false = matches!(
+               next,
+               Insn::Tbz {
+                  rt: 0,
+                  bit: 0,
+                  nonzero: false,
+                  ..
+               } | Insn::Cbz {
+                  rt: 0,
+                  nonzero: false,
+                  ..
+               }
+            );
+            if branches_on_false && image.is_function(target) {
+               if !found.contains(&target) {
+                  found.push(target);
+               }
+               break;
+            }
+         }
+      }
+   }
+   one("pages_under_frame", &found)
+}
+
 /// [`crate::http::DesktopHttpTransport::locate`] for arm64.
 ///
 /// It finds `send` by the anchor string it loads, its `dyn Transport` slots by
