@@ -10,11 +10,7 @@
 use memchr::memchr_iter;
 use phoenix_hook::{
    image::Image,
-   x86::{
-      Abi,
-      call_target,
-      jump_target,
-   },
+   x86::{Abi, call_target, jump_target},
 };
 
 use crate::Found;
@@ -38,11 +34,27 @@ pub const POLL_RESULT_SIZE: usize = 0x80;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestLayout {
    /// The body enum's tag, followed by its `Bytes`.
-   pub body:   usize,
+   pub body: usize,
    /// The URL `String`.
-   pub url:    usize,
+   pub url: usize,
    /// The `http::Method`.
    pub method: usize,
+}
+
+/// Layout of `SendFuture::poll`'s return value (`Poll<Result<Response, _>>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseLayout {
+   /// Legacy `0x80`-byte response with an inline `Vec<u8>` body.
+   Legacy,
+   /// `libdiscord_net_seam` response with a 3-variant `ResponseBody` enum
+   /// (`0` buffered `Bytes`, `1` boxed `Stream`, `2` empty).
+   Stream {
+      size: usize,
+      err_tag: u64,
+      pending_tag: u64,
+      body: usize,
+      status: usize,
+   },
 }
 
 /// Located vtable slots and host allocator entry points for Desktop Phoenix's
@@ -51,20 +63,22 @@ pub struct RequestLayout {
 pub struct DesktopHttpTransport {
    /// All `.rdata` vtable slots holding `ReqwestTransport::send` (may be
    /// duplicated across LLVM CGUs).
-   pub send_slots:   Vec<usize>,
+   pub send_slots: Vec<usize>,
    /// Original `ReqwestTransport::send` function address.
-   pub send_fn:      usize,
+   pub send_fn: usize,
    /// Where `send`'s request keeps its fields.
-   pub request:      RequestLayout,
+   pub request: RequestLayout,
    /// All `.rdata` vtable slots holding `SendFuture::poll`.
-   pub poll_slots:   Vec<usize>,
+   pub poll_slots: Vec<usize>,
    /// Original `SendFuture::poll` function address.
-   pub poll_fn:      usize,
+   pub poll_fn: usize,
    /// How many bytes of its result `poll` writes, as far as it can be
    /// followed. A build past [`POLL_RESULT_SIZE`] changed the response.
-   pub poll_result:  usize,
+   pub poll_result: usize,
+   /// Decoded `poll` response layout when supported by the runtime.
+   pub response: Option<ResponseLayout>,
    /// Host's `__rust_alloc(size, align)` if located.
-   pub host_alloc:   Option<usize>,
+   pub host_alloc: Option<usize>,
    /// Host's `__rust_dealloc(ptr, size, align)` if located.
    pub host_dealloc: Option<usize>,
 }
@@ -142,6 +156,7 @@ impl DesktopHttpTransport {
          poll_slots,
          poll_fn,
          poll_result,
+         response: (poll_result <= POLL_RESULT_SIZE).then_some(ResponseLayout::Legacy),
          host_alloc,
          host_dealloc,
       })
@@ -498,8 +513,8 @@ mod tests {
       assert_eq!(
          request_layout(Abi::SysV, SEND, 0x1000),
          Ok(RequestLayout {
-            body:   0x78,
-            url:    0xB0,
+            body: 0x78,
+            url: 0xB0,
             method: 0xF8,
          })
       );

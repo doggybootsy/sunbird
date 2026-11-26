@@ -368,8 +368,15 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "http responses",
             http.as_ref().map_err(Clone::clone).and_then(|http| {
-               (http.poll_result <= phoenix_sigs::http::POLL_RESULT_SIZE)
-                  .then(|| format!("{} ({} slots)", at(http.poll_fn), http.poll_slots.len()))
+               http
+                  .response
+                  .map(|layout| {
+                     format!(
+                        "{} ({} slots) {layout:x?}",
+                        at(http.poll_fn),
+                        http.poll_slots.len()
+                     )
+                  })
                   .ok_or_else(|| format!("poll writes {:#x} bytes of its result", http.poll_result))
             }),
          );

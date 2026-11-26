@@ -147,7 +147,7 @@ pub fn http_transport(image: &Image<'_>) -> Found<crate::http::DesktopHttpTransp
             if !poll_slots.contains(&(vtable + 24)) {
                poll_slots.push(vtable + 24);
             }
-            let poll_result = poll_result_size(image, poll_fn);
+            let (poll_result, response) = poll_response_layout(image, poll_fn);
             return Ok(crate::http::DesktopHttpTransport {
                send_slots,
                send_fn,
@@ -155,6 +155,7 @@ pub fn http_transport(image: &Image<'_>) -> Found<crate::http::DesktopHttpTransp
                poll_slots,
                poll_fn,
                poll_result,
+               response,
                host_alloc: None,
                host_dealloc: None,
             });
@@ -434,9 +435,206 @@ fn request_layout_in(code: &[Insn]) -> Found<crate::http::RequestLayout> {
    Ok(RequestLayout { body, url, method })
 }
 
-/// How many bytes `SendFuture::poll` writes through its `x8` sret pointer.
-fn poll_result_size(image: &Image<'_>, poll_fn: usize) -> usize {
-   poll_result_size_in(&flattened(image, poll_fn))
+/// Measures `SendFuture::poll`'s return size and decodes its `ResponseLayout`.
+fn poll_response_layout(
+   image: &Image<'_>,
+   poll_fn: usize,
+) -> (usize, Option<crate::http::ResponseLayout>) {
+   let code = flattened(image, poll_fn);
+   let size = poll_result_size_in(&code);
+   if size <= crate::http::POLL_RESULT_SIZE {
+      return (size, Some(crate::http::ResponseLayout::Legacy));
+   }
+   let layout = stream_response_layout_in(&code, size, |vtable| is_stream_vtable(image, vtable));
+   (size, layout)
+}
+
+fn is_stream_vtable(image: &Image<'_>, vtable: usize) -> bool {
+   let read = |at: usize| image.read_usize(vtable + at);
+   let (Some(drop_fn), Some(size), Some(align), Some(poll_next), Some(size_hint)) =
+      (read(0), read(8), read(16), read(24), read(32))
+   else {
+      return false;
+   };
+   image.is_function(drop_fn)
+      && image.is_function(poll_next)
+      && image.is_function(size_hint)
+      && (1..=0x1000).contains(&size)
+      && align.is_power_of_two()
+      && align <= 64
+}
+
+#[expect(
+   clippy::too_many_lines,
+   reason = "tracks sret, immediates, and adrp pairs in one pass over poll"
+)]
+fn stream_response_layout_in(
+   code: &[Insn],
+   size: usize,
+   valid_vtable: impl Fn(usize) -> bool,
+) -> Option<crate::http::ResponseLayout> {
+   let mut sret = [None::<usize>; 32];
+   let mut pages = [None::<usize>; 32];
+   let mut addrs = [None::<usize>; 32];
+   let mut imms = [None::<u64>; 32];
+   sret[8] = Some(0);
+
+   let mut body = None::<usize>;
+   let mut status = None::<usize>;
+   let mut err_tag = None::<u64>;
+   let mut pending_tag = None::<u64>;
+   // stores of `(tag_val == 1)` via `stp xTag, xData, [sret, #off]` before the vtable store
+   let mut stream_tag_off = None::<usize>;
+
+   for &insn in code {
+      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
+         if load {
+            for r in [rt, rt2] {
+               sret[usize::from(r)] = None;
+               pages[usize::from(r)] = None;
+               addrs[usize::from(r)] = None;
+               imms[usize::from(r)] = None;
+            }
+         } else if let Some(base) = sret[usize::from(rn)]
+            && let Some(at) = base.checked_add_signed(off)
+         {
+            if at == 0
+               && let Some(tag) = imms[usize::from(rt)]
+               && tag < 16
+            {
+               err_tag = Some(tag);
+            } else if imms[usize::from(rt)] == Some(1) {
+               stream_tag_off = Some(at);
+            }
+         }
+         continue;
+      }
+
+      match insn {
+         Insn::Adrp { rd, page } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = Some(page);
+            addrs[r] = None;
+            imms[r] = None;
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            if rd != 31 {
+               let dst = usize::from(rd);
+               let src = usize::from(rn);
+               sret[dst] = sret[src].map(|base| base + imm);
+               addrs[dst] = pages[src].map(|page| page + imm);
+               pages[dst] = None;
+               imms[dst] = None;
+            }
+         },
+         Insn::MovReg { rd, rm, .. } => {
+            let dst = usize::from(rd);
+            let src = usize::from(rm);
+            sret[dst] = sret[src];
+            pages[dst] = pages[src];
+            addrs[dst] = addrs[src];
+            imms[dst] = imms[src];
+         },
+         Insn::MovZ { rd, imm, .. } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = Some(imm);
+         },
+         Insn::MovN { rd, imm, wide } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = Some(if wide {
+               !imm
+            } else {
+               !imm & u64::from(u32::MAX)
+            });
+         },
+         Insn::Store {
+            rt,
+            rn,
+            offset,
+            size: store_size,
+         } => {
+            if let Some(base) = sret[usize::from(rn)] {
+               let at = base + offset;
+               if store_size == 8
+                  && at == 0
+                  && let Some(tag) = imms[usize::from(rt)]
+               {
+                  if tag == u64::MAX {
+                     pending_tag = Some(tag);
+                  } else if tag < 16 {
+                     err_tag = Some(tag);
+                  }
+               } else if store_size == 8
+                  && let Some(vtable) = addrs[usize::from(rt)]
+                  && let Some(tag_off) = stream_tag_off
+                  && at == tag_off + 0x10
+                  && valid_vtable(vtable)
+               {
+                  body = Some(tag_off);
+               } else if store_size == 2
+                  && let Some(body_off) = body
+                  && at >= body_off + 0x28
+                  && status.is_none()
+               {
+                  status = Some(at);
+               }
+            }
+         },
+         Insn::Bl { .. } => {
+            for r in 0..=18 {
+               sret[r] = None;
+               pages[r] = None;
+               addrs[r] = None;
+               imms[r] = None;
+            }
+         },
+         Insn::Load { rt: rd, .. } | Insn::Cset { rd, .. } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = None;
+         },
+         Insn::Writeback { rt, rn, load, .. } => {
+            for r in [rn, if load { rt } else { rn }] {
+               let idx = usize::from(r);
+               sret[idx] = None;
+               pages[idx] = None;
+               addrs[idx] = None;
+               imms[idx] = None;
+            }
+         },
+         _ => {},
+      }
+   }
+
+   let (Some(body), Some(status), Some(err_tag), Some(pending_tag)) =
+      (body, status, err_tag, pending_tag)
+   else {
+      return None;
+   };
+   if body < 0x28
+      || body + 0x28 > size
+      || status + 2 > size
+      || !body.is_multiple_of(8)
+      || !status.is_multiple_of(2)
+   {
+      return None;
+   }
+   Some(crate::http::ResponseLayout::Stream {
+      size,
+      err_tag,
+      pending_tag,
+      body,
+      status,
+   })
 }
 
 fn poll_result_size_in(code: &[Insn]) -> usize {
@@ -2735,16 +2933,34 @@ mod tests {
    fn measures_arm64_poll_result_size() {
       let poll_2233 = decode_words(&[
          0xAA08_03F5, // mov x21, x8
+         0x5280_0056, // mov w22, #2
          0xA900_5EB6, // stp x22, x23, [x21]
          0x9100_A2A0, // add x0, x21, #0x28
          0x5280_2A02, // mov w2, #0x150
          0x9400_0010, // bl memcpy
+         0x5280_0028, // mov w8, #1
+         0xA917_D2A8, // stp x8, x20, [x21, #0x178]
+         0xB000_0009, // adrp x9, 0x2000
+         0x9108_0129, // add x9, x9, #0x200
+         0xF900_C6A9, // str x9, [x21, #0x188]
          0xAD0C_86A0, // stp q0, q1, [x21, #0x190]
          0x7903_82B9, // strh w25, [x21, #0x1c0]
          0x3907_0ABA, // strb w26, [x21, #0x1c2]
+         0x9280_0008, // mov x8, #-1
+         0xF900_02A8, // str x8, [x21]
          0xAA00_03F5, // mov x21, x0 (clobbered in unwind pad)
          0xF90F_FEA8, // str x8, [x21, #0x1ff8] (must be ignored)
       ]);
       assert_eq!(poll_result_size_in(&poll_2233), 0x1C8);
+      assert_eq!(
+         stream_response_layout_in(&poll_2233, 0x1C8, |vt| vt == 0x2200),
+         Some(crate::http::ResponseLayout::Stream {
+            size: 0x1C8,
+            err_tag: 2,
+            pending_tag: u64::MAX,
+            body: 0x178,
+            status: 0x1C0,
+         })
+      );
    }
 }

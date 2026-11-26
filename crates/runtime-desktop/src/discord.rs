@@ -14,49 +14,25 @@
 use std::{
    borrow::Cow,
    ffi::c_void,
-   panic::{
-      self,
-      AssertUnwindSafe,
-   },
-   ptr,
-   slice,
-   str,
+   panic::{self, AssertUnwindSafe},
+   ptr, slice, str,
    sync::{
-      Arc,
-      OnceLock,
-      atomic::{
-         AtomicPtr,
-         Ordering,
-      },
+      Arc, OnceLock,
+      atomic::{AtomicPtr, Ordering},
    },
 };
 
 use phoenix_hook::image::Image;
 use phoenix_runtime::{
    discord::{
-      Authorization,
-      DiscordError,
-      RequestAction,
-      api_path,
-      observe_request,
-      run_response_hooks,
-      session_request,
-      take_response,
-      track_response,
-      watch_response,
+      Authorization, DiscordError, InFlight, RequestAction, api_path, observe_request,
+      run_response_hooks, session_request, take_response, track_response, watch_response,
    },
-   fetch::{
-      self,
-      Request,
-      Response,
-   },
+   fetch::{self, Request, Response},
 };
 use phoenix_sigs::{
    desktop,
-   http::{
-      self,
-      DesktopHttpTransport,
-   },
+   http::{self, DesktopHttpTransport},
 };
 
 /// Standard HTTP/1.x `http::header::StandardHeader` names in discriminant
@@ -164,44 +140,44 @@ struct RawVec {
 
 #[repr(C)]
 struct RawBytesVtable {
-   clone:     unsafe extern "C" fn(&AtomicPtr<()>, *const u8, usize) -> RawBytes,
-   to_vec:    unsafe extern "C" fn(*mut (), *const u8, usize) -> RawVec,
-   to_mut:    unsafe extern "C" fn(*mut (), *const u8, usize) -> RawBytes,
+   clone: unsafe extern "C" fn(&AtomicPtr<()>, *const u8, usize) -> RawBytes,
+   to_vec: unsafe extern "C" fn(*mut (), *const u8, usize) -> RawVec,
+   to_mut: unsafe extern "C" fn(*mut (), *const u8, usize) -> RawBytes,
    is_unique: unsafe extern "C" fn(&AtomicPtr<()>) -> bool,
-   drop:      unsafe extern "C" fn(*mut (), *const u8, usize),
+   drop: unsafe extern "C" fn(*mut (), *const u8, usize),
 }
 
 #[repr(C)]
 struct RawBytes {
    vtable: *const RawBytesVtable,
-   ptr:    *const u8,
-   len:    usize,
-   data:   AtomicPtr<()>,
+   ptr: *const u8,
+   len: usize,
+   data: AtomicPtr<()>,
 }
 
 #[repr(C)]
 struct RawHeaderBucket {
-   tag:   u64,
+   tag: u64,
    _pad0: [u64; 2],
    value: RawBytes,
    _sens: u64,
-   name:  RawBytes,
+   name: RawBytes,
    _pad1: u64,
 }
 const _: () = assert!(size_of::<RawHeaderBucket>() == 0x68);
 
 #[repr(C)]
 struct RawHeaderMap {
-   _head:       [u64; 3],
+   _head: [u64; 3],
    entries_cap: usize,
    entries_ptr: *const RawHeaderBucket,
    entries_len: usize,
-   _tail:       [u64; 6],
+   _tail: [u64; 6],
 }
 
 #[repr(C)]
 struct RawBody {
-   tag:   u64,
+   tag: u64,
    bytes: RawBytes,
    _rest: [u64; 2],
 }
@@ -221,9 +197,9 @@ const _: () = assert!(
 /// `send`'s request, at the offsets its build keeps the fields at.
 struct HostRequest<'a> {
    headers: &'a RawHeaderMap,
-   body:    &'a mut RawBody,
-   url:     &'a mut RawVec,
-   method:  &'a RawMethod,
+   body: &'a mut RawBody,
+   url: &'a mut RawVec,
+   method: &'a RawMethod,
 }
 
 impl HostRequest<'_> {
@@ -236,9 +212,9 @@ impl HostRequest<'_> {
       unsafe {
          Self {
             headers: &*req.cast(),
-            body:    &mut *req.byte_add(layout.body).cast(),
-            url:     &mut *req.byte_add(layout.url).cast(),
-            method:  &*req.byte_add(layout.method).cast(),
+            body: &mut *req.byte_add(layout.body).cast(),
+            url: &mut *req.byte_add(layout.url).cast(),
+            method: &*req.byte_add(layout.method).cast(),
          }
       }
    }
@@ -247,16 +223,16 @@ impl HostRequest<'_> {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawPinnedFuture {
-   data:   *mut c_void,
+   data: *mut c_void,
    vtable: *const c_void,
 }
 
 #[repr(C)]
 struct RawPollResult {
    headers: [u64; 12],
-   body:    RawVec,
-   status:  u16,
-   _pad:    [u8; 6],
+   body: RawVec,
+   status: u16,
+   _pad: [u8; 6],
 }
 const _: () = assert!(size_of::<RawPollResult>() == http::POLL_RESULT_SIZE);
 
@@ -279,16 +255,78 @@ impl RawPollResult {
 // `RawPollResult` through a hidden sret pointer in the first argument register.
 type SendFn = unsafe fn(*const c_void, *mut c_void) -> RawPinnedFuture;
 type PollFn = unsafe fn(*mut c_void, *mut c_void) -> RawPollResult;
+#[cfg(target_os = "macos")]
+type PollSretFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 type HostAllocFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
 type HostDeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
 
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct StreamPollResult {
+   tag: u64,
+   payload: [u64; 4],
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<StreamPollResult>() == 40);
+
+#[cfg(target_os = "macos")]
+impl StreamPollResult {
+   const CHUNK: u64 = 0;
+   const ERR: u64 = 1;
+   const EOF: u64 = 2;
+   const PENDING: u64 = u64::MAX;
+
+   const fn pending() -> Self {
+      Self {
+         tag: Self::PENDING,
+         payload: [0; 4],
+      }
+   }
+
+   const fn eof() -> Self {
+      Self {
+         tag: Self::EOF,
+         payload: [0; 4],
+      }
+   }
+
+   fn chunk(bytes: RawBytes) -> Self {
+      // SAFETY: `RawBytes` is 32 bytes (`[u64; 4]`) and repr(C).
+      let payload = unsafe { std::mem::transmute::<RawBytes, [u64; 4]>(bytes) };
+      Self {
+         tag: Self::CHUNK,
+         payload,
+      }
+   }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct RawSizeHint {
+   lower: usize,
+   upper_tag: usize,
+   upper_val: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct StreamVtable {
+   drop: unsafe fn(*mut c_void),
+   size: usize,
+   align: usize,
+   poll_next: unsafe fn(*mut c_void, *mut c_void) -> StreamPollResult,
+   size_hint: unsafe fn(*const c_void) -> RawSizeHint,
+}
+
 struct Installed {
-   send:         SendFn,
-   /// Whether `poll` is hooked, so responses reach the plugins.
-   responses:    bool,
-   request:      http::RequestLayout,
-   poll:         PollFn,
-   host_alloc:   Option<HostAllocFn>,
+   send: SendFn,
+   response: Option<http::ResponseLayout>,
+   request: http::RequestLayout,
+   poll: PollFn,
+   #[cfg(target_os = "macos")]
+   poll_sret: Option<PollSretFn>,
+   host_alloc: Option<HostAllocFn>,
    host_dealloc: Option<HostDeallocFn>,
 }
 
@@ -299,11 +337,11 @@ static INSTALLED: OnceLock<Installed> = OnceLock::new();
 // ---------------------------------------------------------------------------
 
 static OWNED_BYTES_VTABLE: RawBytesVtable = RawBytesVtable {
-   clone:     owned_bytes_clone,
-   to_vec:    owned_bytes_to_vec,
-   to_mut:    owned_bytes_to_mut,
+   clone: owned_bytes_clone,
+   to_vec: owned_bytes_to_vec,
+   to_mut: owned_bytes_to_mut,
    is_unique: owned_bytes_is_unique,
-   drop:      owned_bytes_drop,
+   drop: owned_bytes_drop,
 };
 
 fn make_owned_bytes(data: Vec<u8>) -> RawBytes {
@@ -398,6 +436,37 @@ unsafe extern "C" fn owned_bytes_drop(data: *mut (), _ptr: *const u8, _len: usiz
 // Vtable installation & detours
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
+fn prepare_poll_hook(
+   found: &DesktopHttpTransport,
+) -> (
+   Option<http::ResponseLayout>,
+   Option<PollSretFn>,
+   Option<usize>,
+) {
+   match found.response {
+      Some(http::ResponseLayout::Legacy) => (
+         Some(http::ResponseLayout::Legacy),
+         None,
+         Some(poll_detour as *const () as usize),
+      ),
+      Some(layout @ http::ResponseLayout::Stream { .. }) => {
+         if let (Some(orig_thunk), Some(detour_thunk)) = (
+            phoenix_hook::image::sret_caller(found.poll_fn),
+            phoenix_hook::image::sret_callee(poll_stream_detour as *const () as usize),
+         ) {
+            // SAFETY: `sret_caller` adapts `poll_fn`'s arm64 `x8` sret to first arg.
+            let poll_sret = unsafe { std::mem::transmute::<usize, PollSretFn>(orig_thunk) };
+            (Some(layout), Some(poll_sret), Some(detour_thunk))
+         } else {
+            log::warn!("discord desktop: could not allocate sret thunks for streaming poll");
+            (None, None, None)
+         }
+      },
+      None => (None, None, None),
+   }
+}
+
 /// Locates Desktop Phoenix's `ReqwestTransport` and `SendFuture` vtable slots
 /// and installs request/response interception.
 pub fn install(image: &Image<'static>) {
@@ -445,37 +514,49 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
+   #[cfg(target_os = "macos")]
+   let (response, poll_sret, poll_hook_target) = prepare_poll_hook(&found);
+   #[cfg(not(target_os = "macos"))]
+   let (response, poll_hook_target) = match found.response {
+      Some(http::ResponseLayout::Legacy) => (
+         Some(http::ResponseLayout::Legacy),
+         Some(poll_detour as *const () as usize),
+      ),
+      _ => (None, None),
+   };
+
    // SAFETY: `DesktopHttpTransport::locate` verified every target against
    // `.pdata`, and the trampoline replays `send`'s prologue.
    let installed = Installed {
-      send:         unsafe { std::mem::transmute::<usize, SendFn>(trampoline) },
-      responses:    found.poll_result <= http::POLL_RESULT_SIZE,
-      request:      found.request,
-      poll:         unsafe { std::mem::transmute::<usize, PollFn>(found.poll_fn) },
-      host_alloc:   found
+      send: unsafe { std::mem::transmute::<usize, SendFn>(trampoline) },
+      response,
+      request: found.request,
+      poll: unsafe { std::mem::transmute::<usize, PollFn>(found.poll_fn) },
+      #[cfg(target_os = "macos")]
+      poll_sret,
+      host_alloc: found
          .host_alloc
          .map(|addr| unsafe { std::mem::transmute::<usize, HostAllocFn>(addr) }),
       host_dealloc: found
          .host_dealloc
          .map(|addr| unsafe { std::mem::transmute::<usize, HostDeallocFn>(addr) }),
    };
-   let responses = installed.responses;
    if INSTALLED.set(installed).is_err() {
       return;
    }
-   if !responses {
+   let Some(poll_hook_target) = poll_hook_target else {
       log::warn!(
          "discord desktop: hooked HTTP send, but poll writes {:#x} bytes of its result, so \
           responses are left alone",
          found.poll_result
       );
       return;
-   }
+   };
 
    let polls = found
       .poll_slots
       .iter()
-      .map(|&slot| (slot, poll_detour as *const () as usize))
+      .map(|&slot| (slot, poll_hook_target))
       .collect::<Vec<_>>();
    // SAFETY: every poll slot is an aligned `.rdata` vtable entry pointing to
    // `poll_fn`, and `poll_detour` matches its Rust ABI.
@@ -629,7 +710,7 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
             },
          }
 
-         if installed.responses {
+         if installed.response.is_some() {
             watched = watch_response(&method, &url);
          }
       }))
@@ -687,6 +768,221 @@ unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
    }
 
    result
+}
+
+#[cfg(target_os = "macos")]
+struct InterceptStream {
+   inner_data: *mut c_void,
+   inner_vtable: *const StreamVtable,
+   in_flight: Option<InFlight>,
+   status: i32,
+   buf: Vec<u8>,
+   yielded: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for InterceptStream {
+   fn drop(&mut self) {
+      if self.inner_data.is_null() || self.inner_vtable.is_null() {
+         return;
+      }
+      // SAFETY: `inner_data`/`inner_vtable` came from Discord's `Pin<Box<dyn Stream>>`.
+      unsafe {
+         let vtable = &*self.inner_vtable;
+         (vtable.drop)(self.inner_data);
+         if vtable.size > 0
+            && let Some(dealloc) = INSTALLED.get().and_then(|i| i.host_dealloc)
+         {
+            dealloc(self.inner_data.cast(), vtable.size, vtable.align);
+         }
+      }
+      self.inner_data = ptr::null_mut();
+      self.inner_vtable = ptr::null();
+   }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn intercept_stream_drop(ptr: *mut c_void) {
+   if !ptr.is_null() {
+      // SAFETY: `ptr` points to a live `InterceptStream` allocated via `host_alloc`.
+      unsafe { ptr::drop_in_place(ptr.cast::<InterceptStream>()) };
+   }
+}
+
+#[cfg(target_os = "macos")]
+const unsafe fn intercept_stream_size_hint(_ptr: *const c_void) -> RawSizeHint {
+   RawSizeHint {
+      lower: 0,
+      upper_tag: 0,
+      upper_val: 0,
+   }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn intercept_stream_poll_next(ptr: *mut c_void, cx: *mut c_void) -> StreamPollResult {
+   const MAX_BUFFERED: usize = 16 * 1024 * 1024;
+   if ptr.is_null() {
+      return StreamPollResult::eof();
+   }
+   panic::catch_unwind(AssertUnwindSafe(|| {
+      // SAFETY: `ptr` is a pinned `InterceptStream` owned by Discord's `ResponseBody::Stream`.
+      let stream = unsafe { &mut *ptr.cast::<InterceptStream>() };
+      if stream.yielded {
+         return StreamPollResult::eof();
+      }
+      loop {
+         if stream.inner_data.is_null() || stream.inner_vtable.is_null() {
+            stream.yielded = true;
+            return StreamPollResult::eof();
+         }
+         // SAFETY: `inner_vtable` is the original stream vtable from `SendFuture::poll`.
+         let inner_res = unsafe { ((*stream.inner_vtable).poll_next)(stream.inner_data, cx) };
+         match inner_res.tag {
+            StreamPollResult::PENDING => return StreamPollResult::pending(),
+            StreamPollResult::CHUNK => {
+               // SAFETY: `tag == 0` holds a live `RawBytes` in `payload`.
+               let raw = unsafe { std::mem::transmute::<[u64; 4], RawBytes>(inner_res.payload) };
+               let chunk = unsafe { read_bytes(&raw) };
+               if stream.buf.len().saturating_add(chunk.len()) <= MAX_BUFFERED {
+                  stream.buf.extend_from_slice(chunk);
+               }
+               if !raw.vtable.is_null() {
+                  let data = raw.data.load(Ordering::Relaxed);
+                  unsafe { ((*raw.vtable).drop)(data, raw.ptr, raw.len) };
+               }
+            },
+            StreamPollResult::ERR => {
+               stream.yielded = true;
+               return inner_res;
+            },
+            StreamPollResult::EOF => {
+               stream.yielded = true;
+               let body = std::mem::take(&mut stream.buf);
+               let final_body = match stream.in_flight.take() {
+                  Some(in_flight) => run_response_hooks(in_flight, stream.status, body).1,
+                  None => body,
+               };
+               return StreamPollResult::chunk(make_owned_bytes(final_body));
+            },
+            _ => {
+               stream.yielded = true;
+               return StreamPollResult::eof();
+            },
+         }
+      }
+   }))
+   .unwrap_or_else(|_| {
+      log::error!("discord desktop: intercept_stream_poll_next panicked");
+      StreamPollResult::eof()
+   })
+}
+
+#[cfg(target_os = "macos")]
+static INTERCEPT_STREAM_VTABLE: StreamVtable = StreamVtable {
+   drop: intercept_stream_drop,
+   size: size_of::<InterceptStream>(),
+   align: align_of::<InterceptStream>(),
+   poll_next: intercept_stream_poll_next,
+   size_hint: intercept_stream_size_hint,
+};
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn poll_stream_detour(
+   sret: *mut c_void,
+   future: *mut c_void,
+   cx: *mut c_void,
+) -> *mut c_void {
+   let installed = INSTALLED
+      .get()
+      .expect("poll_stream_detour only runs after INSTALLED is set");
+   let Some(poll_sret) = installed.poll_sret else {
+      return sret;
+   };
+   // SAFETY: forwards to original `SendFuture::poll` writing directly into `sret`.
+   unsafe { poll_sret(sret, future, cx) };
+
+   let Some(http::ResponseLayout::Stream {
+      err_tag,
+      pending_tag,
+      body,
+      status,
+      ..
+   }) = installed.response
+   else {
+      return sret;
+   };
+
+   // SAFETY: `sret` holds the live `Poll<Result<Response, NetError>>` written by `poll_sret`.
+   let tag = unsafe { sret.cast::<u64>().read() };
+   if tag == pending_tag {
+      return sret;
+   }
+
+   if let Some(in_flight) = take_response(future.addr() as u64)
+      && tag != err_tag
+      && panic::catch_unwind(AssertUnwindSafe(|| {
+         // SAFETY: `body` and `status` offsets were validated against `poll`'s return size.
+         unsafe {
+            let status_ptr = sret.byte_add(status).cast::<u16>();
+            let resp_status = status_ptr.read();
+            let body_ptr = sret.byte_add(body);
+            let body_tag = body_ptr.cast::<u64>().read();
+            match body_tag {
+               // `ResponseBody::Buffered(Bytes)`
+               0 => {
+                  let raw_ptr = body_ptr.byte_add(8).cast::<RawBytes>();
+                  let raw = &mut *raw_ptr;
+                  let old_body = read_bytes(raw).to_vec();
+                  let (new_status, new_body) =
+                     run_response_hooks(in_flight, i32::from(resp_status), old_body);
+                  if let Ok(code) = u16::try_from(new_status) {
+                     status_ptr.write(code);
+                  }
+                  if !raw.vtable.is_null() {
+                     let data = raw.data.load(Ordering::Relaxed);
+                     ((*raw.vtable).drop)(data, raw.ptr, raw.len);
+                  }
+                  *raw = make_owned_bytes(new_body);
+               },
+               // `ResponseBody::Stream(Pin<Box<dyn Stream>>)`
+               1 => {
+                  let (Some(alloc), Some(_)) = (installed.host_alloc, installed.host_dealloc)
+                  else {
+                     return;
+                  };
+                  let data_slot = body_ptr.byte_add(8).cast::<*mut c_void>();
+                  let vtbl_slot = body_ptr.byte_add(16).cast::<*const StreamVtable>();
+                  let inner_data = data_slot.read();
+                  let inner_vtable = vtbl_slot.read();
+                  if inner_data.is_null() || inner_vtable.is_null() {
+                     return;
+                  }
+                  // allocate via Discord's allocator so Box::drop frees cleanly
+                  let wrapper = alloc(size_of::<InterceptStream>(), align_of::<InterceptStream>());
+                  if wrapper.is_null() {
+                     return;
+                  }
+                  wrapper.cast::<InterceptStream>().write(InterceptStream {
+                     inner_data,
+                     inner_vtable,
+                     in_flight: Some(in_flight),
+                     status: i32::from(resp_status),
+                     buf: Vec::new(),
+                     yielded: false,
+                  });
+                  data_slot.write(wrapper.cast());
+                  vtbl_slot.write(&raw const INTERCEPT_STREAM_VTABLE);
+               },
+               _ => {},
+            }
+         }
+      }))
+      .is_err()
+   {
+      log::error!("discord desktop: poll_stream_detour panicked");
+   }
+
+   sret
 }
 
 /// Replaces `vec`'s contents with `new_body` while staying 100% compatible
@@ -768,11 +1064,9 @@ fn observe(method: &str, url: &str, headers: &[(String, String)], body: &[u8]) -
    match sent {
       RequestAction::Pass => observe_request(method, url, headers, body),
       RequestAction::Drop => RequestAction::Drop,
-      RequestAction::Replace(sent) => {
-         match observe_request(method, url, headers, &sent) {
-            RequestAction::Pass => RequestAction::Replace(sent),
-            hooked => hooked,
-         }
+      RequestAction::Replace(sent) => match observe_request(method, url, headers, &sent) {
+         RequestAction::Pass => RequestAction::Replace(sent),
+         hooked => hooked,
       },
    }
 }
@@ -790,11 +1084,9 @@ pub fn send(
       headers: merged,
       body: (!body.is_empty()).then_some(body),
    };
-   fetch::send(&request).map_err(|err| {
-      DiscordError::Network {
-         path:    path.to_owned(),
-         message: err.to_string(),
-      }
+   fetch::send(&request).map_err(|err| DiscordError::Network {
+      path: path.to_owned(),
+      message: err.to_string(),
    })
 }
 
