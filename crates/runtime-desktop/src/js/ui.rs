@@ -8,10 +8,7 @@
 use std::{
    sync::{
       Arc,
-      atomic::{
-         AtomicU64,
-         Ordering,
-      },
+      atomic::{AtomicU64, Ordering},
    },
    time::Duration,
 };
@@ -19,88 +16,60 @@ use std::{
 use phoenix_runtime::{
    discord::RequestAction,
    js::{
-      Engine,
-      Registry,
-      background::{
-         Settlement,
-         in_background,
-      },
+      Engine, Registry,
+      background::{Settlement, in_background},
    },
-   store::{
-      self,
-      Cell,
-   },
+   store::{self, Cell},
 };
-use rquickjs::{
-   Array,
-   CatchResultExt,
-   Ctx,
-   Exception,
-   Function,
-   Object,
-   Value,
-   function::Opt,
-};
+use rquickjs::{Array, CatchResultExt, Ctx, Exception, Function, Object, Value, function::Opt};
 
 use crate::{
-   accessories::{
-      self,
-      RenderedAccessory,
-   },
-   context_menu::{
-      self,
-      ActionMeta,
-   },
-   emoji,
-   icons,
+   accessories::{self, RenderedAccessory},
+   context_menu::{self, ActionMeta},
+   emoji, icons,
    js::Desktop,
    members::Place,
-   modal::{
-      self,
-      ModalButton,
-      ModalSection,
-      PageModalSpec,
-   },
+   modal::{self, ModalButton, ModalSection, PageModalSpec},
 };
 
 #[derive(Clone)]
 pub struct DesktopAccessory<'js> {
-   pub id:       u64,
-   pub plugin:   String,
+   pub id: u64,
+   pub plugin: String,
    pub priority: i32,
-   pub render:   Function<'js>,
+   pub render: Function<'js>,
 }
 
 /// A `phoenix.ui.addMemberDecoration` or `addMessageHeaderDecoration`
 /// callback.
 #[derive(Clone)]
 pub struct DesktopMember<'js> {
-   pub id:       u64,
-   pub plugin:   String,
+   pub id: u64,
+   pub plugin: String,
    pub priority: i32,
-   pub render:   Function<'js>,
+   pub render: Function<'js>,
 }
 
 #[derive(Clone)]
 pub struct DesktopAction<'js> {
-   pub id:       u64,
-   pub plugin:   String,
-   pub label:    String,
-   pub icon:     Option<String>,
-   pub danger:   bool,
+   pub id: u64,
+   pub plugin: String,
+   pub label: String,
+   pub icon: Option<String>,
+   pub danger: bool,
    pub priority: i32,
-   pub visible:  Option<Function<'js>>,
+   pub visible: Option<Function<'js>>,
    pub on_press: Function<'js>,
 }
 
 impl DesktopAction<'_> {
    pub fn meta(&self) -> ActionMeta {
       ActionMeta {
-         id:          self.id,
-         label:       self.label.clone(),
-         icon:        self.icon.clone(),
-         danger:      self.danger,
-         priority:    self.priority,
+         id: self.id,
+         label: self.label.clone(),
+         icon: self.icon.clone(),
+         danger: self.danger,
+         priority: self.priority,
          has_visible: self.visible.is_some(),
       }
    }
@@ -453,13 +422,17 @@ fn cached_message_and_me(channel_id: u64, message_id: u64) -> (Option<String>, O
    };
    // Phoenix keys messages `<channel>:<message>`, each zero-padded to 20 digits.
    let rows = if channel_id != 0 {
-      store::query(&db, "SELECT v FROM messages WHERE k = ?", &[format!(
-         "{channel_id:020}:{message_id:020}"
-      )])
+      store::query(
+         &db,
+         "SELECT v FROM messages WHERE k = ?",
+         &[format!("{channel_id:020}:{message_id:020}")],
+      )
    } else {
-      store::query(&db, "SELECT v FROM messages WHERE k LIKE ? LIMIT 1", &[
-         format!("%:{message_id:020}"),
-      ])
+      store::query(
+         &db,
+         "SELECT v FROM messages WHERE k LIKE ? LIMIT 1",
+         &[format!("%:{message_id:020}")],
+      )
    };
    let msg_json = rows
       .ok()
@@ -936,13 +909,13 @@ fn parse_choice_options<'js>(options: &Object<'js>) -> rquickjs::Result<Vec<moda
       .filter_map(|option| {
          if let Some(label) = option.as_string() {
             return Some(modal::ChoiceOption {
-               label:  label.to_string().ok()?,
+               label: label.to_string().ok()?,
                danger: false,
             });
          }
          let option = option.as_object()?;
          Some(modal::ChoiceOption {
-            label:  option.get::<_, Option<String>>("label").ok().flatten()?,
+            label: option.get::<_, Option<String>>("label").ok().flatten()?,
             danger: option
                .get::<_, Option<bool>>("danger")
                .ok()

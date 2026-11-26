@@ -27,8 +27,8 @@ use phoenix_hook::image::Image;
 use phoenix_runtime::discord::InFlight;
 use phoenix_runtime::{
    discord::{
-      Authorization, DiscordError, RequestAction, api_path, observe_request,
-      run_response_hooks, session_request, take_response, track_response, watch_response,
+      Authorization, DiscordError, RequestAction, api_path, observe_request, run_response_hooks,
+      session_request, take_response, track_response, watch_response,
    },
    fetch::{self, Request, Response},
 };

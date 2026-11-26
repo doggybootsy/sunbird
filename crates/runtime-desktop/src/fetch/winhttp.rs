@@ -1,18 +1,9 @@
 //! HTTP through Windows' native `WinHTTP` stack (`winhttp.dll`), using the
 //! system's TLS certificates, proxy, and VPN without bundling TLS libraries.
 
-use std::{
-   ffi::c_void,
-   ptr,
-};
+use std::{ffi::c_void, ptr};
 
-use phoenix_runtime::fetch::{
-   FetchError,
-   LIMIT,
-   Request,
-   Response,
-   TIMEOUT_MS,
-};
+use phoenix_runtime::fetch::{FetchError, LIMIT, Request, Response, TIMEOUT_MS};
 
 const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
 const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
@@ -25,20 +16,20 @@ const INTERNET_SCHEME_HTTPS: i32 = 2;
 
 #[repr(C)]
 struct UrlComponents {
-   struct_size:    u32,
-   scheme:         *mut u16,
-   scheme_len:     u32,
-   scheme_kind:    i32,
-   host_name:      *mut u16,
-   host_name_len:  u32,
-   port:           u16,
-   user_name:      *mut u16,
-   user_name_len:  u32,
-   password:       *mut u16,
-   password_len:   u32,
-   url_path:       *mut u16,
-   url_path_len:   u32,
-   extra_info:     *mut u16,
+   struct_size: u32,
+   scheme: *mut u16,
+   scheme_len: u32,
+   scheme_kind: i32,
+   host_name: *mut u16,
+   host_name_len: u32,
+   port: u16,
+   user_name: *mut u16,
+   user_name_len: u32,
+   password: *mut u16,
+   password_len: u32,
+   url_path: *mut u16,
+   url_path_len: u32,
+   extra_info: *mut u16,
    extra_info_len: u32,
 }
 
@@ -130,7 +121,7 @@ fn wide(text: &str) -> Vec<u16> {
 
 fn os_err(url: &str, context: &str) -> FetchError {
    FetchError::Platform {
-      url:     url.to_owned(),
+      url: url.to_owned(),
       message: format!("{context}: {}", std::io::Error::last_os_error()),
    }
 }
@@ -147,20 +138,20 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
    let mut extra_buf = vec![0u16; wide_url.len().max(256)];
 
    let mut parts = UrlComponents {
-      struct_size:    u32::try_from(size_of::<UrlComponents>()).unwrap_or(0),
-      scheme:         ptr::null_mut(),
-      scheme_len:     0,
-      scheme_kind:    0,
-      host_name:      host_buf.as_mut_ptr(),
-      host_name_len:  u32::try_from(host_buf.len()).unwrap_or(0),
-      port:           0,
-      user_name:      ptr::null_mut(),
-      user_name_len:  0,
-      password:       ptr::null_mut(),
-      password_len:   0,
-      url_path:       path_buf.as_mut_ptr(),
-      url_path_len:   u32::try_from(path_buf.len()).unwrap_or(0),
-      extra_info:     extra_buf.as_mut_ptr(),
+      struct_size: u32::try_from(size_of::<UrlComponents>()).unwrap_or(0),
+      scheme: ptr::null_mut(),
+      scheme_len: 0,
+      scheme_kind: 0,
+      host_name: host_buf.as_mut_ptr(),
+      host_name_len: u32::try_from(host_buf.len()).unwrap_or(0),
+      port: 0,
+      user_name: ptr::null_mut(),
+      user_name_len: 0,
+      password: ptr::null_mut(),
+      password_len: 0,
+      url_path: path_buf.as_mut_ptr(),
+      url_path_len: u32::try_from(path_buf.len()).unwrap_or(0),
+      extra_info: extra_buf.as_mut_ptr(),
       extra_info_len: u32::try_from(extra_buf.len()).unwrap_or(0),
    };
 
@@ -254,10 +245,8 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
 
    let (body_ptr, body_len) = match &request.body {
       Some(bytes) => {
-         let len = u32::try_from(bytes.len()).map_err(|_| {
-            FetchError::TooLarge {
-               url: url.to_owned(),
-            }
+         let len = u32::try_from(bytes.len()).map_err(|_| FetchError::TooLarge {
+            url: url.to_owned(),
          })?;
          (bytes.as_ptr().cast::<c_void>(), len)
       },

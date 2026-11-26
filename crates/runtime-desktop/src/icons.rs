@@ -8,12 +8,7 @@
 
 use std::{
    collections::HashMap,
-   sync::{
-      LazyLock,
-      OnceLock,
-      PoisonError,
-      RwLock,
-   },
+   sync::{LazyLock, OnceLock, PoisonError, RwLock},
 };
 
 #[cfg(not(target_os = "macos"))]

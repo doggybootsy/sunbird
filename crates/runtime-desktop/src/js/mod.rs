@@ -4,26 +4,13 @@
 pub mod native;
 pub mod ui;
 
-use std::{
-   cell::RefCell,
-   collections::HashMap,
-};
+use std::{cell::RefCell, collections::HashMap};
 
-use rquickjs::{
-   Ctx,
-   Function,
-   JsLifetime,
-};
+use rquickjs::{Ctx, Function, JsLifetime};
 
 use crate::{
-   accessories,
-   context_menu,
-   emoji,
-   js::ui::{
-      DesktopAccessory,
-      DesktopAction,
-      DesktopMember,
-   },
+   accessories, context_menu, emoji,
+   js::ui::{DesktopAccessory, DesktopAction, DesktopMember},
    members::Place,
 };
 
@@ -32,15 +19,15 @@ use crate::{
 #[derive(Default)]
 pub struct Desktop<'js> {
    /// `phoenix.ui.addMessageAccessory` callbacks.
-   pub accessories:   RefCell<Vec<DesktopAccessory<'js>>>,
+   pub accessories: RefCell<Vec<DesktopAccessory<'js>>>,
    /// `phoenix.ui.addMemberDecoration` callbacks.
-   pub members:       RefCell<Vec<DesktopMember<'js>>>,
+   pub members: RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageHeaderDecoration` callbacks.
-   pub headers:       RefCell<Vec<DesktopMember<'js>>>,
+   pub headers: RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageAction` callbacks.
-   pub actions:       RefCell<Vec<DesktopAction<'js>>>,
+   pub actions: RefCell<Vec<DesktopAction<'js>>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
-   pub page_buttons:  RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   pub page_buttons: RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
    /// no picker presses to give them, only the unlock they turn on.
    pub emoji_pickers: RefCell<Vec<(u64, String)>>,

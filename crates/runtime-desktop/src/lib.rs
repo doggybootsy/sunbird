@@ -15,8 +15,7 @@ mod discord;
 mod emoji;
 mod fetch;
 mod gpui;
-#[cfg(not(target_os = "macos"))]
-mod headers;
+#[cfg(not(target_os = "macos"))] mod headers;
 mod icons;
 mod js;
 mod members;
@@ -28,33 +27,60 @@ mod staff;
 
 use std::{
    ffi::c_void,
-   path::{Path, PathBuf},
-   sync::{Arc, Mutex, PoisonError},
+   path::{
+      Path,
+      PathBuf,
+   },
+   sync::{
+      Arc,
+      Mutex,
+      PoisonError,
+   },
    time::Duration,
 };
 
 use phoenix_hook::image::Image;
 use phoenix_runtime::{
-   Error, Notice, Platform, Plugin, Started,
-   discord::{Authorization, DiscordError},
-   fetch::{FetchError, Request, Response},
-   remote::{self, Done},
-   store::{Rows, StoreError},
+   Error,
+   Notice,
+   Platform,
+   Plugin,
+   Started,
+   discord::{
+      Authorization,
+      DiscordError,
+   },
+   fetch::{
+      FetchError,
+      Request,
+      Response,
+   },
+   remote::{
+      self,
+      Done,
+   },
+   store::{
+      Rows,
+      StoreError,
+   },
 };
 use phoenix_sigs::registry::GatewayRegistry;
-use rquickjs::{Ctx, Object};
+use rquickjs::{
+   Ctx,
+   Object,
+};
 
 struct Desktop;
 
 /// A `POST /ui/choose` or `POST /ui/sheet` body.
 #[derive(serde::Deserialize)]
 struct DialogRequest {
-   title: Option<String>,
-   message: Option<String>,
-   text: Option<String>,
+   title:     Option<String>,
+   message:   Option<String>,
+   text:      Option<String>,
    monospace: Option<bool>,
    highlight: Option<bool>,
-   options: Option<Vec<DialogItem>>,
+   options:   Option<Vec<DialogItem>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -62,7 +88,7 @@ struct DialogRequest {
 enum DialogItem {
    Label(String),
    Item {
-      label: String,
+      label:  String,
       #[serde(default)]
       danger: bool,
    },
@@ -98,8 +124,8 @@ pub fn prepare() -> Result<(), Error> {
    #[cfg(not(target_os = "macos"))]
    {
       modal::install(&image);
-      // Before accessories hooks `MessageRow::render`, whose prologue the header
-      // locators check.
+      // Before accessories hooks `MessageRow::render`, whose prologue the
+      // header locators check.
       let header = headers::locate(&image);
       accessories::install(&image);
       members::install(&image);
@@ -125,7 +151,7 @@ pub fn prepare() -> Result<(), Error> {
       discord::install(&image);
       accessories::install_optimistic_delete(&image);
       if !X86_CODE {
-         route_direct_deletes(&image);
+         route_direct_calls(&image);
       }
    }
    // The index is tens of MB and nothing reads it after startup.
@@ -293,9 +319,9 @@ impl Platform for Desktop {
       remote::require_token(&state.plugins_dir().with_file_name("debug-shell-token"));
       remote::ensure_started();
       phoenix_ui_desktop::start_tray(phoenix_ui_desktop::TrayConfig {
-         dashboard_url: remote::dashboard_url(),
-         plugins_dir: state.plugins_dir(),
-         on_reload_all: Some(Arc::new(phoenix_runtime::reload_all)),
+         dashboard_url:    remote::dashboard_url(),
+         plugins_dir:      state.plugins_dir(),
+         on_reload_all:    Some(Arc::new(phoenix_runtime::reload_all)),
          on_check_updates: Some(Arc::new(phoenix_runtime::update::check_now)),
       });
       let ready_body = format!(
@@ -385,20 +411,26 @@ fn dialog(body: &[u8], sheet: bool) -> remote::Reply {
       .options
       .unwrap_or_default()
       .into_iter()
-      .map(|item| match item {
-         DialogItem::Label(label) => modal::ChoiceOption {
-            label,
-            danger: false,
-         },
-         DialogItem::Item { label, danger } => modal::ChoiceOption { label, danger },
+      .map(|item| {
+         match item {
+            DialogItem::Label(label) => {
+               modal::ChoiceOption {
+                  label,
+                  danger: false,
+               }
+            },
+            DialogItem::Item { label, danger } => modal::ChoiceOption { label, danger },
+         }
       })
       .collect::<Vec<_>>();
    let content = if sheet {
-      request.text.map(|text| modal::ModalSection::Code {
-         title: None,
-         text,
-         monospace: request.monospace.unwrap_or_default(),
-         highlight: request.highlight.unwrap_or_default(),
+      request.text.map(|text| {
+         modal::ModalSection::Code {
+            title: None,
+            text,
+            monospace: request.monospace.unwrap_or_default(),
+            highlight: request.highlight.unwrap_or_default(),
+         }
       })
    } else {
       request
@@ -420,31 +452,32 @@ fn dialog(body: &[u8], sheet: bool) -> remote::Reply {
    remote::ok_json(&DialogAnswer { index })
 }
 
-/// macOS deletes your own message by calling `MESSAGE_DELETE`'s handler
-/// directly, past the registry, so the handler's entry goes through the
+/// macOS calls most gateway handlers directly, past the registry: build 2233
+/// does so for `MESSAGE_CREATE`, `MESSAGE_UPDATE` and presence, and every
+/// build for your own deletes. So each handler's entry goes through the
 /// gateway hooks as well, and the registry calls it through the trampoline.
-fn route_direct_deletes(image: &phoenix_hook::image::Image<'static>) {
-   let Some(handler) = phoenix_runtime::gateway::original_handler("MESSAGE_DELETE") else {
-      return;
-   };
+/// A handler whose entry can't be relocated keeps only its registry hook.
+fn route_direct_calls(image: &phoenix_hook::image::Image<'static>) {
    let pro = phoenix_sigs::desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
-   // SAFETY: runs from `prepare` before Discord's threads; the gateway detour
-   // has the handler's ABI, and the registry is pointed at the trampoline
-   // before anything can call either.
-   match unsafe {
-      image.hook_entry(
-         handler,
-         pro.pattern,
-         pro.len,
-         phoenix_runtime::gateway::entry_detour(),
-      )
-   } {
-      Ok(trampoline) => {
-         phoenix_runtime::gateway::call_handler_through(handler, trampoline);
-         log::info!("desktop: MESSAGE_DELETE's handler hooked for direct calls");
-      },
-      Err(err) => log::warn!("desktop: MESSAGE_DELETE's handler not hooked: {err}"),
+   let detour = phoenix_runtime::gateway::entry_detour();
+   let handlers = phoenix_runtime::gateway::handlers();
+   let mut hooked = 0;
+   for &handler in &handlers {
+      // SAFETY: runs from `prepare` before Discord's threads; the gateway
+      // detour has every handler's ABI, and the registry is pointed at the
+      // trampoline before anything can call either.
+      match unsafe { image.hook_entry(handler, pro.pattern, pro.len, detour) } {
+         Ok(trampoline) => {
+            phoenix_runtime::gateway::call_handler_through(handler, trampoline);
+            hooked += 1;
+         },
+         Err(err) => log::warn!("desktop: gateway handler {handler:#x} not hooked: {err}"),
+      }
    }
+   log::info!(
+      "desktop: {hooked} of {} gateway handlers hooked for direct calls",
+      handlers.len()
+   );
 }
 
 #[cfg(target_os = "macos")]

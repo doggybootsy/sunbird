@@ -297,7 +297,8 @@ byte pattern says nothing about arm32.
   where `T` is `cmp wB,#0; cset ne`. That is the out-of-line `is_page_visible` and the copy inlined
   into the sidebar; the sidebar uses only the inlined one. The runtime lowers each `cmp` to `#0xe`. `settings_section` finds
   `host::section` (x8 return, x0-x4 args, active page `ldrb [copy of x0, #0x61f]` on this build).
-  `settings::install_arm64` relabels page 24 to Sunbird, unhides it and hooks the section through
+  `settings::install_arm64` relabels the last guarded page (24: the guard's `sub` and `cmp`
+  immediates, 9 + 15, read per build) to Sunbird, unhides it and hooks the section through
   the thunks. Until the GPUI builders exist it renders Discord's own page 24 and opens the
   dashboard window once per visit. Verified: the entry shows above Log Out (window screenshot), and 26
   section renders went through the hook with no crash. Clicking the entry is untested.
@@ -315,6 +316,13 @@ byte pattern says nothing about arm32.
   `&Location`), `Switch::new` 0x106859a98 (x8 out, x0/x1 id, w2 checked), `switch_label`
   0x106e6ec7c and `switch_desc` 0x106eb61b0 (store at +0x98/+0xb0). `Switch` is 0x1d8 bytes
   (the memcpy size), and `on_change` is generic, monomorphized per closure.
+- Gateway registry. `MESSAGE_CREATE` is in both a domain table and the flat table with different
+  handlers; only the flat one runs, so `registry::merge_split` lets the flat table win a conflict.
+  Discord also calls handlers directly, past the registry: every build for your own deletes, and
+  build 2233 for `MESSAGE_CREATE`, `MESSAGE_UPDATE`, presence and most others. So
+  `route_direct_calls` hooks every handler's entry to the gateway detour as well, and
+  `gateway::call_handler_through` points the registry's original at the trampoline (155 of 155 on
+  2208 and 2233). Verified: DeArrow and message-logger see live messages and own deletes on both.
 - Gateway registry. macOS keeps `MESSAGE_UPDATE`, `MESSAGE_DELETE`, reactions, presence, typing
   and more in a flat table apart from the domain tables. `registry.rs` walks it from
   `MESSAGE_UPDATE` when the other walks miss that event, which takes macOS from 87 to 175 events.
@@ -410,8 +418,9 @@ byte pattern says nothing about arm32.
   `MESSAGE_DELETE` handler's rare callees (2-8 callers, the map removals), takes the store lock
   first with its third argument (`mov x1, x2; bl lock`), and dereferences a pointer pair from its
   second (`ldp xC, xM, [args]`); both are hooked. Found with a temporary caller tracer on the
-  removals, since lldb on a live copy made it exit when the session ended. Verified with
-  message-logger: other users' deletes stay; your own were still to be checked. Host allocator: `__rust_alloc(size, align)` is
+  removals, since lldb on a live copy made it exit when the session ended. Both hooks fire, but
+  the client then calls the `MESSAGE_DELETE` handler directly, which `route_direct_calls` covers.
+  Verified with message-logger: own and other users' deletes stay. Host allocator: `__rust_alloc(size, align)` is
   `alloc_or_oom`'s first real call, and `__rust_dealloc(ptr, size, align)` the next function,
   which subtracts the size from Discord's live-byte counter (`neg`, `ldadd`).
 - Startup. `prepare` runs in the loader's constructor, so Discord's window waits for every
@@ -419,5 +428,12 @@ byte pattern says nothing about arm32.
   code (about 0.25 s, split across threads), so look up several targets with one
   `code_refs_to`, never one pass per string copy: `StyleRefinement` alone once cost 10 s that
   way. Prefilter whole-code scans on the raw word before `decode`.
+- Message JSON decodes Discord's `serde_json::Value` through `read_memory`, so a build whose
+  `Value` lays out differently falls back to the cache instead of faulting.
+- Launcher `pin`: a `pin` file in Sunbird's home stops the launcher replacing the loader, for a
+  build installed by hand. The in-app loader update still can.
+- Comparing builds: keep the previous `Discord Phoenix.app` (Discord's updater moves it to the
+  Trash), clone it, add `DYLD_INSERT_LIBRARIES` and `LIBDISCORD_DATA_DIR` to the clone's
+  `LSEnvironment`, sign it ad hoc and `open -n` it beside Sunbird.
 - `X86_CODE` in `runtime-desktop` now only picks the locator. Handlers keep the desktop result
   ABI: 96 bytes, `Ok` is `u64::MAX - 1`, returned through `x8`.

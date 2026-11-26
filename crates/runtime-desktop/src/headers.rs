@@ -12,26 +12,15 @@
 use std::{
    collections::HashMap,
    ffi::c_void,
-   sync::{
-      LazyLock,
-      OnceLock,
-      RwLock,
-      mpsc,
-   },
+   sync::{LazyLock, OnceLock, RwLock, mpsc},
 };
 
 use phoenix_hook::image::Image;
 use phoenix_sigs::desktop;
 
 use crate::{
-   accessories::{
-      self,
-      invalidate_discord_windows,
-   },
-   members::{
-      HEADERS,
-      MIN_SNOWFLAKE,
-   },
+   accessories::{self, invalidate_discord_windows},
+   members::{HEADERS, MIN_SNOWFLAKE},
 };
 
 /// `child_node(node, child) -> node`, `Rc<Node>` handles in and out.
@@ -52,11 +41,11 @@ const SITES: usize = desktop::MAX_HEADER_BUILDERS;
 
 pub(crate) struct Symbols {
    child_node: ChildNodeFn,
-   svg_new:    SvgNewFn,
-   push_svg:   PushSvgFn,
-   svg_color:  usize,
+   svg_new: SvgNewFn,
+   push_svg: PushSvgFn,
+   svg_color: usize,
    /// `[frame+slot]` holds the message id at each site.
-   slots:      Vec<usize>,
+   slots: Vec<usize>,
 }
 
 static SYMBOLS: OnceLock<Symbols> = OnceLock::new();
@@ -117,10 +106,10 @@ pub fn locate(image: &Image<'_>) -> Result<Located, String> {
    let symbols = unsafe {
       Symbols {
          child_node: std::mem::transmute::<usize, ChildNodeFn>(header.child_node),
-         svg_new:    std::mem::transmute::<usize, SvgNewFn>(svg.new),
-         push_svg:   std::mem::transmute::<usize, PushSvgFn>(svg.push),
-         svg_color:  svg.color,
-         slots:      header.sites.iter().map(|site| site.slot).collect(),
+         svg_new: std::mem::transmute::<usize, SvgNewFn>(svg.new),
+         push_svg: std::mem::transmute::<usize, PushSvgFn>(svg.push),
+         svg_color: svg.color,
+         slots: header.sites.iter().map(|site| site.slot).collect(),
       }
    };
    let sites = header.sites.iter().map(|site| site.site).collect();

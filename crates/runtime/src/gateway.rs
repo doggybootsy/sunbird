@@ -69,6 +69,23 @@ pub fn entry_detour() -> usize {
    detour as *const () as usize
 }
 
+/// Every distinct handler the registry holds, for a platform that hooks their
+/// entries too.
+#[must_use]
+pub fn handlers() -> Vec<usize> {
+   let Some(gateway) = GATEWAY.get() else {
+      return Vec::new();
+   };
+   let mut handlers: Vec<usize> = gateway
+      .registry
+      .iter()
+      .map(|(_, entry)| entry.handler)
+      .collect();
+   handlers.sort_unstable();
+   handlers.dedup();
+   handlers
+}
+
 /// Calls `handler`'s events through `trampoline` from now on, once the
 /// platform hooked `handler`'s entry to [`entry_detour`].
 pub fn call_handler_through(handler: usize, trampoline: usize) {

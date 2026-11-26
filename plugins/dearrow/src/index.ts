@@ -1,5 +1,5 @@
 // @description Replaces YouTube titles and thumbnails in embeds using DeArrow
-// @version 0.1.2
+// @version 0.1.3
 // @author amaanq
 
 const { gateway } = phoenix;
@@ -30,9 +30,23 @@ interface Replacement {
 }
 
 const cache = new Map<string, Promise<Replacement>>();
+/// Finished lookups, which a `before` hook can read without waiting.
+const resolved = new Map<string, Replacement>();
 
-const videoId = (url: string | undefined) =>
-  url?.match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/)|youtu\.be\/)([\w-]{11})/)?.[1];
+const VIDEO = /(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/)|youtu\.be\/)([\w-]{11})/;
+
+const videoId = (url: string | undefined) => url?.match(VIDEO)?.[1];
+
+/// Every video a message links to, in its text or its embeds.
+const videosIn = (message: Phoenix.GatewayMessage) => {
+  const ids = new Set<string>();
+  for (const match of (message.content ?? "").matchAll(new RegExp(VIDEO, "g"))) ids.add(match[1]);
+  for (const embed of message.embeds ?? []) {
+    const id = videoId(embed.url);
+    if (id) ids.add(id);
+  }
+  return ids;
+};
 
 const trusted = (entry: { original: boolean; votes: number; locked: boolean }) =>
   !entry.original && (entry.votes >= 0 || entry.locked);
@@ -47,13 +61,16 @@ const lookup = (id: string) => {
         const branding = response.json<Branding>();
         const title = branding.titles.find(trusted)?.title.replace(/(^|\s)>(\S)/g, "$1$2");
         const thumbnail = branding.thumbnails.find(trusted);
-        return {
+        const result: Replacement = {
           title,
           thumbnail:
             thumbnail?.timestamp == null
               ? undefined
               : `https://dearrow-thumb.ajay.app/api/v1/getThumbnail?videoID=${id}&time=${thumbnail.timestamp}`,
         };
+        resolved.set(id, result);
+        if (resolved.size > 512) resolved.delete(resolved.keys().next().value!);
+        return result;
       })
       .catch((err) => {
         cache.delete(id);
@@ -67,22 +84,28 @@ const lookup = (id: string) => {
   return pending;
 };
 
-/// Rewrites `embeds` in place, and says whether anything changed.
-const rebrandEmbeds = async (embeds: Phoenix.GatewayMessage["embeds"]) => {
-  if (!embeds?.length) return false;
+type Embed = NonNullable<Phoenix.GatewayMessage["embeds"]>[number];
+
+/// Rewrites `embed` in place from `replacement`, and says whether it changed.
+const apply = (embed: Embed, { title, thumbnail }: Replacement) => {
   let changed = false;
-  for (const embed of embeds) {
+  if (title && settings.titles && embed.title !== title) {
+    embed.title = title;
+    changed = true;
+  }
+  if (thumbnail && settings.thumbnails && embed.thumbnail && embed.thumbnail.url !== thumbnail) {
+    embed.thumbnail = { ...embed.thumbnail, url: thumbnail, proxy_url: thumbnail };
+    changed = true;
+  }
+  return changed;
+};
+
+/// Rewrites `embeds` in place, waiting for lookups, and says whether anything changed.
+const rebrandEmbeds = async (embeds: Phoenix.GatewayMessage["embeds"]) => {
+  let changed = false;
+  for (const embed of embeds ?? []) {
     const id = videoId(embed.url);
-    if (!id) continue;
-    const { title, thumbnail } = await lookup(id);
-    if (title && settings.titles && embed.title !== title) {
-      embed.title = title;
-      changed = true;
-    }
-    if (thumbnail && settings.thumbnails && embed.thumbnail && embed.thumbnail.url !== thumbnail) {
-      embed.thumbnail = { ...embed.thumbnail, url: thumbnail, proxy_url: thumbnail };
-      changed = true;
-    }
+    if (id && apply(embed, await lookup(id))) changed = true;
   }
   return changed;
 };
@@ -95,6 +118,22 @@ const rebrand = async (message: Phoenix.GatewayMessage) => {
   phoenix.enqueue(gateway.messageUpdate, { ...message, embeds });
 };
 
+// A new message's embed usually arrives a moment later in an update, so its
+// links are looked up as soon as the message does, and the embed is rewritten
+// before the client stores it. Links still being looked up fall back to an
+// update once the lookup ends.
+const rewrite = {
+  before(message: Phoenix.GatewayMessage) {
+    for (const id of videosIn(message)) if (!resolved.has(id)) lookup(id);
+    for (const embed of message.embeds ?? []) {
+      const known = resolved.get(videoId(embed.url) ?? "");
+      if (known) apply(embed, known);
+    }
+    return message;
+  },
+};
+phoenix.hook(gateway.messageCreate, rewrite);
+phoenix.hook(gateway.messageUpdate, rewrite);
 phoenix.on(gateway.messageCreate, rebrand);
 phoenix.on(gateway.messageUpdate, rebrand);
 

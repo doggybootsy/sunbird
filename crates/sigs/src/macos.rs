@@ -2025,19 +2025,6 @@ fn handler_store(image: &Image<'_>, setter: usize) -> Option<(usize, usize)> {
 /// `None` (`cmp w8, #0xff`). On build 2233 `Switch::label` wraps an inner
 /// setter, so one level of direct `bl` callees is checked if needed.
 fn option_string_field(image: &Image<'_>, setter: usize) -> Option<usize> {
-   option_string_store(image, setter).or_else(|| {
-      // Some builds wrap the setter: it copies the `Switch` and calls the real
-      // one on its leading field struct, which starts at the same offset.
-      flattened(image, setter).into_iter().find_map(|insn| {
-         match insn {
-            Insn::Bl { target } => option_string_store(image, target),
-            _ => None,
-         }
-      })
-   })
-}
-
-fn option_string_store(image: &Image<'_>, setter: usize) -> Option<usize> {
    let code = flattened(image, setter);
    if let Some(offset) = option_string_field_in(&code) {
       return Some(offset);

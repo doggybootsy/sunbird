@@ -20,20 +20,14 @@ use std::{
    ffi::c_void,
    sync::{
       OnceLock,
-      atomic::{
-         AtomicUsize,
-         Ordering,
-      },
+      atomic::{AtomicUsize, Ordering},
    },
 };
 
 use phoenix_hook::image::Image;
 use phoenix_sigs::desktop;
 
-use crate::gpui::{
-   self,
-   RawAnyElement,
-};
+use crate::gpui::{self, RawAnyElement};
 
 /// The last flag-gated settings page, which Sunbird takes over: 24 on every
 /// build seen, read on arm64 from the visibility guard (`sub wA, wB, #first;
