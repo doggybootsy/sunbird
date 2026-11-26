@@ -6,13 +6,27 @@
 //! Discord.exe print as RVAs like `+0x6fc5220`, the same numbers `sigscan`
 //! prints at the file's base, and either form is accepted back.
 
-use phoenix_hook::{image::Image, pattern::Pattern, x86};
-use rquickjs::{Ctx, Exception, Function, Object, Value, function::Opt};
+use phoenix_hook::{
+   image::Image,
+   pattern::Pattern,
+   x86,
+};
+use rquickjs::{
+   Ctx,
+   Exception,
+   Function,
+   Object,
+   Value,
+   function::Opt,
+};
 use serde::Serialize;
 
 use crate::{
    X86_CODE,
-   os::{DesktopOs, Os},
+   os::{
+      DesktopOs,
+      Os,
+   },
 };
 
 const MAX_LIST: usize = 64;
@@ -82,7 +96,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[derive(Serialize)]
 struct Site {
-   at: String,
+   at:   String,
    #[serde(rename = "fn")]
    func: String,
    text: String,
@@ -91,7 +105,7 @@ struct Site {
 impl From<&x86::CodeRef> for Site {
    fn from(site: &x86::CodeRef) -> Self {
       Self {
-         at: place(site.line.addr),
+         at:   place(site.line.addr),
          func: place(site.function),
          text: site.line.text.clone(),
       }
@@ -115,14 +129,10 @@ fn code_refs(image: &Image<'_>, addr: usize, literal: bool) -> Vec<Site> {
          let func = image.function_containing(site).unwrap_or(site);
          let text = image
             .read(site, 4)
-            .and_then(|bytes| {
-               phoenix_hook::arm64::disasm(bytes, site, 1)
-                  .into_iter()
-                  .next()
-            })
+            .and_then(|bytes| phoenix_hook::arm64::disasm(bytes, site, 1).into_iter().next())
             .map_or_else(String::new, |(_, text)| text);
          Site {
-            at: place(site),
+            at:   place(site),
             func: place(func),
             text,
          }
@@ -157,7 +167,7 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
       Function::new(ctx.clone(), |ctx: Ctx<'js>, text: String| {
          #[derive(Serialize)]
          struct Found {
-            at: String,
+            at:    String,
             loads: Vec<Site>,
          }
          let image = image().ok_or_else(|| Exception::throw_internal(&ctx, "not started"))?;
@@ -165,9 +175,11 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
             .find_bytes(text.as_bytes())
             .into_iter()
             .take(16)
-            .map(|at| Found {
-               at: place(at),
-               loads: code_refs(image, at, true),
+            .map(|at| {
+               Found {
+                  at:    place(at),
+                  loads: code_refs(image, at, true),
+               }
             })
             .collect::<Vec<_>>();
          json(&ctx, &found)
@@ -178,13 +190,13 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
       Function::new(ctx.clone(), |ctx: Ctx<'js>, addr: Value<'js>| {
          #[derive(Serialize)]
          struct Refs {
-            code: Vec<Site>,
+            code:     Vec<Site>,
             pointers: Vec<String>,
          }
          let image = image().ok_or_else(|| Exception::throw_internal(&ctx, "not started"))?;
          let addr = parse(&ctx, &addr)?;
          let refs = Refs {
-            code: code_refs(image, addr, false),
+            code:     code_refs(image, addr, false),
             pointers: image
                .pointers_to(addr)
                .into_iter()
@@ -301,21 +313,38 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
 mod observe {
    use std::{
       cell::Cell,
-      panic::{self, AssertUnwindSafe},
+      panic::{
+         self,
+         AssertUnwindSafe,
+      },
       sync::{
-         Mutex, PoisonError,
-         atomic::{AtomicU64, AtomicUsize, Ordering},
+         Mutex,
+         PoisonError,
+         atomic::{
+            AtomicU64,
+            AtomicUsize,
+            Ordering,
+         },
       },
    };
 
    use phoenix_hook::{
       image::Image,
-      x86::{Observed, Regs},
+      x86::{
+         Observed,
+         Regs,
+      },
    };
    use serde::Serialize;
 
-   use super::{hex, place};
-   use crate::os::{DesktopOs, Os};
+   use super::{
+      hex,
+      place,
+   };
+   use crate::os::{
+      DesktopOs,
+      Os,
+   };
 
    const MAX_HOOKS: usize = 32;
    const PEEK: usize = 16;
@@ -331,33 +360,33 @@ mod observe {
    /// One call into a hooked function, as `/events` shows it.
    #[derive(Serialize)]
    pub struct Hit {
-      hook: usize,
-      at: String,
+      hook:   usize,
+      at:     String,
       /// `rcx`, `rdx`, `r8` and `r9`.
-      args: [String; 4],
+      args:   [String; 4],
       /// The first bytes behind each argument that points at readable memory.
-      peek: [Option<String>; 4],
+      peek:   [Option<String>; 4],
       caller: String,
       thread: u32,
    }
 
    #[derive(Serialize)]
    pub struct Listed {
-      id: usize,
-      at: String,
+      id:   usize,
+      at:   String,
       hits: u64,
    }
 
    struct Slot {
-      addr: AtomicUsize,
-      hits: AtomicU64,
+      addr:  AtomicUsize,
+      hits:  AtomicU64,
       limit: AtomicU64,
    }
 
    static SLOTS: [Slot; MAX_HOOKS] = [const {
       Slot {
-         addr: AtomicUsize::new(0),
-         hits: AtomicU64::new(0),
+         addr:  AtomicUsize::new(0),
+         hits:  AtomicU64::new(0),
          limit: AtomicU64::new(0),
       }
    }; MAX_HOOKS];
@@ -449,10 +478,10 @@ mod observe {
             .map(|bytes| hex(&bytes))
       };
       phoenix_runtime::remote::record(&Trace::Native(Hit {
-         hook: id,
-         at: place(slot.addr.load(Ordering::Relaxed)),
-         args: args.map(|arg| format!("{arg:#x}")),
-         peek: args.map(peek),
+         hook:   id,
+         at:     place(slot.addr.load(Ordering::Relaxed)),
+         args:   args.map(|arg| format!("{arg:#x}")),
+         peek:   args.map(peek),
          caller: usize::try_from(regs.ret).map_or_else(|_| format!("{:#x}", regs.ret), place),
          thread: Os::current_thread_id(),
       }));

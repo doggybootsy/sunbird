@@ -20,8 +20,13 @@ use std::{
    ffi::c_void,
    ptr,
    sync::{
-      LazyLock, OnceLock, RwLock,
-      atomic::{AtomicUsize, Ordering},
+      LazyLock,
+      OnceLock,
+      RwLock,
+      atomic::{
+         AtomicUsize,
+         Ordering,
+      },
       mpsc,
    },
 };
@@ -29,7 +34,10 @@ use std::{
 use phoenix_hook::image::Image;
 use phoenix_sigs::desktop;
 
-use crate::gpui::{self, RawAnyElement};
+use crate::gpui::{
+   self,
+   RawAnyElement,
+};
 
 /// Offset of the pending/sending message text color inside `RowColors`
 /// (verified at `0x14a741c1f`: `mov edx, [r12 + 0x34]`).
@@ -65,18 +73,18 @@ type RenderRowFn = unsafe extern "C" fn(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedAccessory {
    pub priority: i32,
-   pub text: String,
-   pub color: Option<u32>,
-   pub tint: Option<u32>,
+   pub text:     String,
+   pub color:    Option<u32>,
+   pub tint:     Option<u32>,
    /// Discord's own SVG icons with their colors, drawn in place of `text`
    /// where icons can be drawn.
-   pub icons: Vec<(&'static str, Option<u32>)>,
+   pub icons:    Vec<(&'static str, Option<u32>)>,
 }
 
 impl RenderedAccessory {
    pub fn piece(&self) -> gpui::Piece {
       gpui::Piece {
-         text: self.text.clone(),
+         text:  self.text.clone(),
          color: self.color,
          icons: self.icons.clone(),
       }
@@ -552,11 +560,18 @@ mod tests {
 /// words are read from the caller's frame and passed back unchanged.
 #[cfg(target_os = "macos")]
 mod arm64 {
-   use std::sync::{OnceLock, atomic::Ordering};
+   use std::sync::{
+      OnceLock,
+      atomic::Ordering,
+   };
 
    use phoenix_hook::image::Image;
 
-   use super::{ACTIVE_COUNT, RawAnyElement, decorate};
+   use super::{
+      ACTIVE_COUNT,
+      RawAnyElement,
+      decorate,
+   };
 
    type RenderFn = unsafe extern "C" fn(
       row: *const u8,

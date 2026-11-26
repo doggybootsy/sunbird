@@ -10,8 +10,13 @@ use std::{
    collections::HashMap,
    ffi::c_void,
    sync::{
-      LazyLock, OnceLock, RwLock,
-      atomic::{AtomicUsize, Ordering},
+      LazyLock,
+      OnceLock,
+      RwLock,
+      atomic::{
+         AtomicUsize,
+         Ordering,
+      },
       mpsc,
    },
 };
@@ -21,7 +26,10 @@ use phoenix_hook::image::Image;
 #[cfg(not(target_os = "macos"))]
 use phoenix_sigs::desktop;
 
-use crate::accessories::{RenderedAccessory, invalidate_discord_windows};
+use crate::accessories::{
+   RenderedAccessory,
+   invalidate_discord_windows,
+};
 #[cfg(not(target_os = "macos"))]
 use crate::gpui;
 
@@ -58,9 +66,9 @@ impl Place {
 /// What a [`Place`]'s decorations drew per user, filled on a worker thread so
 /// Discord's render never waits on plugins.
 pub struct Decorations {
-   place: Place,
+   place:  Place,
    active: AtomicUsize,
-   cache: LazyLock<RwLock<HashMap<u64, CacheEntry>>>,
+   cache:  LazyLock<RwLock<HashMap<u64, CacheEntry>>>,
    worker: OnceLock<mpsc::Sender<u64>>,
 }
 

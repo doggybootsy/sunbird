@@ -2,12 +2,14 @@
 //! instead of a bundled TLS library. `WinHTTP` follows the system proxy,
 //! libcurl (the system's own on macOS) the `*_proxy` environment variables.
 
-#[cfg(unix)]
-mod curl;
-#[cfg(windows)]
-mod winhttp;
+#[cfg(unix)] mod curl;
+#[cfg(windows)] mod winhttp;
 
-use phoenix_runtime::fetch::{FetchError, Request, Response};
+use phoenix_runtime::fetch::{
+   FetchError,
+   Request,
+   Response,
+};
 
 pub fn send(request: &Request) -> Result<Response, FetchError> {
    // A line break would smuggle extra headers in. The value is never echoed,
@@ -18,7 +20,7 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
          .any(|part| part.contains(['\r', '\n', '\0']))
    }) {
       return Err(FetchError::Platform {
-         url: request.url.clone(),
+         url:     request.url.clone(),
          message: format!("header {name} has a line break or NUL"),
       });
    }

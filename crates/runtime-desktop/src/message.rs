@@ -8,11 +8,17 @@
 
 use std::{
    fmt::Write as _,
-   panic::{self, AssertUnwindSafe},
+   panic::{
+      self,
+      AssertUnwindSafe,
+   },
    sync::OnceLock,
 };
 
-use phoenix_hook::{image::Image, x86};
+use phoenix_hook::{
+   image::Image,
+   x86,
+};
 use phoenix_sigs::desktop;
 
 /// `Result<Value, Error>` is 9 words; the slack covers a larger build.
@@ -35,7 +41,7 @@ const MAX_DEPTH: usize = 64;
 
 #[derive(Clone, Copy)]
 struct Bucket {
-   key: usize,
+   key:   usize,
    value: usize,
 }
 

@@ -12,17 +12,35 @@ use std::{
    ffi::c_void,
    mem::MaybeUninit,
    ptr,
-   sync::{LazyLock, Mutex, OnceLock, PoisonError},
+   sync::{
+      LazyLock,
+      Mutex,
+      OnceLock,
+      PoisonError,
+   },
 };
 
 use phoenix_hook::image::Image;
 use phoenix_runtime::{
-   Chosen, Control,
-   update::{self, Catalog, Listed},
+   Chosen,
+   Control,
+   update::{
+      self,
+      Catalog,
+      Listed,
+   },
 };
-use phoenix_sigs::desktop::{self, GpuiLayout, StyleOffsets, layout};
+use phoenix_sigs::desktop::{
+   self,
+   GpuiLayout,
+   StyleOffsets,
+   layout,
+};
 
-use crate::modal::{FieldKind, SettingField};
+use crate::modal::{
+   FieldKind,
+   SettingField,
+};
 
 /// `gpui::SharedString` (24 bytes): tag `0x18` is `Static(&'static str)` and
 /// `0x19` is `Arc<str>`, the `ArcInner` at `ptr` with the bytes at `+0x10`.
@@ -30,7 +48,7 @@ use crate::modal::{FieldKind, SettingField};
 #[repr(C)]
 pub struct SharedString {
    pub tag: u8,
-   _pad: [u8; 7],
+   _pad:    [u8; 7],
    pub ptr: *const u8,
    pub len: usize,
 }
@@ -38,10 +56,10 @@ pub struct SharedString {
 impl SharedString {
    pub const fn from_static(s: &'static str) -> Self {
       Self {
-         tag: 0x18,
+         tag:  0x18,
          _pad: [0; 7],
-         ptr: s.as_ptr(),
-         len: s.len(),
+         ptr:  s.as_ptr(),
+         len:  s.len(),
       }
    }
 
@@ -63,10 +81,10 @@ impl SharedString {
          ptr::copy_nonoverlapping(s.as_ptr(), inner.add(16), s.len());
       }
       Self {
-         tag: 0x19,
+         tag:  0x19,
          _pad: [0; 7],
-         ptr: inner.cast_const(),
-         len: s.len(),
+         ptr:  inner.cast_const(),
+         len:  s.len(),
       }
    }
 }
@@ -129,8 +147,8 @@ pub struct RawAnyElement([u8; layout::ANY_ELEMENT]);
 
 #[repr(C)]
 pub struct RcInner {
-   strong: usize,
-   weak: usize,
+   strong:    usize,
+   weak:      usize,
    action_id: u64,
 }
 
@@ -139,8 +157,8 @@ pub struct RcInner {
 /// its own malloc zone). Leaks 24 bytes.
 pub fn pinned_rc_u64(value: u64) -> *mut RcInner {
    Box::into_raw(Box::new(RcInner {
-      strong: usize::MAX / 4,
-      weak: usize::MAX / 4,
+      strong:    usize::MAX / 4,
+      weak:      usize::MAX / 4,
       action_id: value,
    }))
 }
@@ -148,12 +166,12 @@ pub fn pinned_rc_u64(value: u64) -> *mut RcInner {
 #[repr(C)]
 pub struct RcFnVtbl {
    pub drop_in_place: *const c_void,
-   pub size: usize,
-   pub align: usize,
-   pub call_once: *const c_void,
-   pub call_mut: *const c_void,
-   pub call: *const c_void,
-   pub extra: *const c_void,
+   pub size:          usize,
+   pub align:         usize,
+   pub call_once:     *const c_void,
+   pub call_mut:      *const c_void,
+   pub call:          *const c_void,
+   pub extra:         *const c_void,
 }
 
 // SAFETY: vtables contain only function pointers and plain integers.
@@ -161,36 +179,36 @@ unsafe impl Sync for RcFnVtbl {}
 
 static SWITCH_FN_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
-   size: size_of::<u64>(),
-   align: align_of::<u64>(),
-   call_once: switch_callback as *const c_void,
-   call_mut: switch_callback as *const c_void,
-   call: switch_callback as *const c_void,
-   extra: ptr::null(),
+   size:          size_of::<u64>(),
+   align:         align_of::<u64>(),
+   call_once:     switch_callback as *const c_void,
+   call_mut:      switch_callback as *const c_void,
+   call:          switch_callback as *const c_void,
+   extra:         ptr::null(),
 };
 
 static BUTTON_FN_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
-   size: size_of::<u64>(),
-   align: align_of::<u64>(),
-   call_once: button_callback as *const c_void,
-   call_mut: button_callback as *const c_void,
-   call: button_callback as *const c_void,
-   extra: ptr::null(),
+   size:          size_of::<u64>(),
+   align:         align_of::<u64>(),
+   call_once:     button_callback as *const c_void,
+   call_mut:      button_callback as *const c_void,
+   call:          button_callback as *const c_void,
+   extra:         ptr::null(),
 };
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum BtnVariant {
-   Primary = 0,
+   Primary   = 0,
    Secondary = 1,
-   Critical = 3,
+   Critical  = 3,
 }
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum BtnSize {
-   Small = 1,
+   Small  = 1,
    Medium = 2,
 }
 
@@ -228,23 +246,23 @@ type ActionRowFn = unsafe extern "C" fn(
 type AllocOrOomFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
 
 struct GpuiSymbols {
-   caller_loc: *const c_void,
-   div_new: DivNewFn,
-   div_flex: DivMutFn,
-   div_flex_col: DivMutFn,
-   div_style_mut: DivStyleMutFn,
-   div_child_div: DivChildDivFn,
+   caller_loc:       *const c_void,
+   div_new:          DivNewFn,
+   div_flex:         DivMutFn,
+   div_flex_col:     DivMutFn,
+   div_style_mut:    DivStyleMutFn,
+   div_child_div:    DivChildDivFn,
    div_child_button: DivChildBtnFn,
-   div_into_any: DivIntoAnyFn,
-   div_push_any: Option<DivPushAnyFn>,
-   str_into_any: Option<StrIntoAnyFn>,
-   text_block: TextBlockFn,
-   switch_new: SwitchNewFn,
-   switch_into_div: SwitchIntoDivFn,
-   button_new: ButtonNewFn,
-   action_row: ActionRowFn,
-   alloc_or_oom: AllocOrOomFn,
-   layout: GpuiLayout,
+   div_into_any:     DivIntoAnyFn,
+   div_push_any:     Option<DivPushAnyFn>,
+   str_into_any:     Option<StrIntoAnyFn>,
+   text_block:       TextBlockFn,
+   switch_new:       SwitchNewFn,
+   switch_into_div:  SwitchIntoDivFn,
+   button_new:       ButtonNewFn,
+   action_row:       ActionRowFn,
+   alloc_or_oom:     AllocOrOomFn,
+   layout:           GpuiLayout,
 }
 
 // SAFETY: function pointers and static `.rdata` `Location` pointer in
@@ -273,25 +291,25 @@ enum PluginFilter {
 }
 
 struct UiState {
-   tab: Tab,
-   filter: PluginFilter,
+   tab:              Tab,
+   filter:           PluginFilter,
    expanded_plugins: HashSet<String>,
-   open_select: Option<(String, String)>,
+   open_select:      Option<(String, String)>,
    cat_desktop_open: bool,
    cat_partial_open: bool,
-   cat_mobile_open: bool,
+   cat_mobile_open:  bool,
 }
 
 impl Default for UiState {
    fn default() -> Self {
       Self {
-         tab: Tab::Plugins,
-         filter: PluginFilter::All,
+         tab:              Tab::Plugins,
+         filter:           PluginFilter::All,
          expanded_plugins: HashSet::new(),
-         open_select: None,
+         open_select:      None,
          cat_desktop_open: true,
          cat_partial_open: false,
-         cat_mobile_open: false,
+         cat_mobile_open:  false,
       }
    }
 }
@@ -305,12 +323,12 @@ enum Action {
    ToggleExpandPlugin(String),
    ToggleSelectDropdown {
       plugin: String,
-      key: String,
+      key:    String,
    },
    PickSelectOption {
       plugin: String,
-      key: String,
-      value: String,
+      key:    String,
+      value:  String,
    },
    ToggleCatalogGroup(u8),
    ToggleStaff,
@@ -328,11 +346,11 @@ enum Action {
    UninstallPlugin(String),
    ToggleSetting {
       plugin: String,
-      key: String,
+      key:    String,
    },
    PressButton {
       plugin: String,
-      key: String,
+      key:    String,
    },
    InstallCatalog(String),
 }
@@ -487,15 +505,17 @@ unsafe extern "C" fn button_callback(
          },
          Action::PressButton { plugin, key } => phoenix_runtime::press(&plugin, &key),
          Action::InstallCatalog(name) => {
-            std::thread::spawn(move || match update::install_listed(&name) {
-               Ok(installed) => {
-                  log::info!("sunbird settings: installed {installed}");
-                  phoenix_ui_desktop::toast(&format!("Installed {installed}"));
-               },
-               Err(err) => {
-                  log::warn!("sunbird settings: install {name}: {err}");
-                  phoenix_ui_desktop::toast(&format!("Install failed: {err}"));
-               },
+            std::thread::spawn(move || {
+               match update::install_listed(&name) {
+                  Ok(installed) => {
+                     log::info!("sunbird settings: installed {installed}");
+                     phoenix_ui_desktop::toast(&format!("Installed {installed}"));
+                  },
+                  Err(err) => {
+                     log::warn!("sunbird settings: install {name}: {err}");
+                     phoenix_ui_desktop::toast(&format!("Install failed: {err}"));
+                  },
+               }
             });
          },
          _ => {},
@@ -551,23 +571,25 @@ pub fn locate(image: &Image<'static>) -> bool {
    // their layouts match `layout`, and they have these Rust-ABI signatures.
    let symbols = unsafe {
       GpuiSymbols {
-         caller_loc: caller_loc as *const c_void,
-         div_new: std::mem::transmute::<usize, DivNewFn>(div_new),
-         div_flex: std::mem::transmute::<usize, DivMutFn>(div_flex),
-         div_flex_col: std::mem::transmute::<usize, DivMutFn>(div_flex_col),
-         div_style_mut: std::mem::transmute::<usize, DivStyleMutFn>(div_style_mut),
-         div_child_div: std::mem::transmute::<usize, DivChildDivFn>(div_child_div),
+         caller_loc:       caller_loc as *const c_void,
+         div_new:          std::mem::transmute::<usize, DivNewFn>(div_new),
+         div_flex:         std::mem::transmute::<usize, DivMutFn>(div_flex),
+         div_flex_col:     std::mem::transmute::<usize, DivMutFn>(div_flex_col),
+         div_style_mut:    std::mem::transmute::<usize, DivStyleMutFn>(div_style_mut),
+         div_child_div:    std::mem::transmute::<usize, DivChildDivFn>(div_child_div),
          div_child_button: std::mem::transmute::<usize, DivChildBtnFn>(div_child_button),
-         div_into_any: std::mem::transmute::<usize, DivIntoAnyFn>(div_into_any),
-         div_push_any: div_push_any.map(|addr| std::mem::transmute::<usize, DivPushAnyFn>(addr)),
-         str_into_any: str_into_any.map(|addr| std::mem::transmute::<usize, StrIntoAnyFn>(addr)),
-         text_block: std::mem::transmute::<usize, TextBlockFn>(text_block),
-         switch_new: std::mem::transmute::<usize, SwitchNewFn>(switch_new),
-         switch_into_div: std::mem::transmute::<usize, SwitchIntoDivFn>(switch_into_div),
-         button_new: std::mem::transmute::<usize, ButtonNewFn>(button_new),
-         action_row: std::mem::transmute::<usize, ActionRowFn>(action_row),
-         alloc_or_oom: std::mem::transmute::<usize, AllocOrOomFn>(alloc_or_oom),
-         layout: found_layout,
+         div_into_any:     std::mem::transmute::<usize, DivIntoAnyFn>(div_into_any),
+         div_push_any:     div_push_any
+            .map(|addr| std::mem::transmute::<usize, DivPushAnyFn>(addr)),
+         str_into_any:     str_into_any
+            .map(|addr| std::mem::transmute::<usize, StrIntoAnyFn>(addr)),
+         text_block:       std::mem::transmute::<usize, TextBlockFn>(text_block),
+         switch_new:       std::mem::transmute::<usize, SwitchNewFn>(switch_new),
+         switch_into_div:  std::mem::transmute::<usize, SwitchIntoDivFn>(switch_into_div),
+         button_new:       std::mem::transmute::<usize, ButtonNewFn>(button_new),
+         action_row:       std::mem::transmute::<usize, ActionRowFn>(action_row),
+         alloc_or_oom:     std::mem::transmute::<usize, AllocOrOomFn>(alloc_or_oom),
+         layout:           found_layout,
       }
    };
    let _ = SYMBOLS.set(symbols);
@@ -633,7 +655,7 @@ pub fn layout() -> Option<&'static GpuiLayout> {
 
 /// A `Div`'s `StyleRefinement`, written through the decoded field offsets.
 pub struct Style {
-   ptr: *mut u8,
+   ptr:    *mut u8,
    pub at: &'static StyleOffsets,
 }
 
@@ -715,8 +737,8 @@ impl Builder {
          let raw = (self.sym.alloc_or_oom)(align_of::<RcInner>(), size_of::<RcInner>());
          let inner = raw.cast::<RcInner>();
          inner.write(RcInner {
-            strong: 1,
-            weak: 1,
+            strong:    1,
+            weak:      1,
             action_id: id,
          });
          inner
@@ -1128,8 +1150,8 @@ pub fn alloc_rc_u64(value: u64) -> Option<*mut RcInner> {
          return None;
       }
       ptr.write(RcInner {
-         strong: 1,
-         weak: 1,
+         strong:    1,
+         weak:      1,
          action_id: value,
       });
       Some(ptr)
@@ -1227,7 +1249,7 @@ const ACCESSORY_MUTED: [f32; 4] = [0.60, 0.08, 0.62, 0.85];
 /// can draw them, else its text.
 #[derive(Clone, Debug)]
 pub struct Piece {
-   pub text: String,
+   pub text:  String,
    pub color: Option<u32>,
    /// Asset paths from [`crate::icons::register`], each with its own color.
    pub icons: Vec<(&'static str, Option<u32>)>,
@@ -1235,9 +1257,9 @@ pub struct Piece {
 
 /// GPUI's `Svg` builders and layout, resolved by [`locate_svg`].
 struct SvgSymbols {
-   new: SvgNewFn,
-   path: SvgPathFn,
-   into_any: SvgIntoAnyFn,
+   new:       SvgNewFn,
+   path:      SvgPathFn,
+   into_any:  SvgIntoAnyFn,
    style_box: usize,
 }
 
@@ -1269,9 +1291,9 @@ pub fn locate_svg(image: &Image<'static>) {
    // with these Rust-ABI signatures.
    let symbols = unsafe {
       SvgSymbols {
-         new: std::mem::transmute::<usize, SvgNewFn>(found.new),
-         path: std::mem::transmute::<usize, SvgPathFn>(found.path),
-         into_any: std::mem::transmute::<usize, SvgIntoAnyFn>(found.into_any),
+         new:       std::mem::transmute::<usize, SvgNewFn>(found.new),
+         path:      std::mem::transmute::<usize, SvgPathFn>(found.path),
+         into_any:  std::mem::transmute::<usize, SvgIntoAnyFn>(found.into_any),
          style_box: found.style_box,
       }
    };
@@ -1321,7 +1343,7 @@ fn svg_icon(
    if !style.is_null() {
       let s = Style {
          ptr: style,
-         at: &b.sym.layout.style,
+         at:  &b.sym.layout.style,
       };
       s.lengths(&s.at.size, gpui_px(px));
       s.float(s.at.flex_shrink, 0.0);
@@ -1648,10 +1670,12 @@ fn render_plugins_tab(
 
    let filtered: Vec<&phoenix_runtime::PluginInfo> = plugins
       .iter()
-      .filter(|p| match filter {
-         PluginFilter::All => true,
-         PluginFilter::Enabled => p.enabled,
-         PluginFilter::Disabled => !p.enabled,
+      .filter(|p| {
+         match filter {
+            PluginFilter::All => true,
+            PluginFilter::Enabled => p.enabled,
+            PluginFilter::Disabled => !p.enabled,
+         }
       })
       .collect();
 
@@ -1817,7 +1841,7 @@ fn render_plugins_tab(
                         *val,
                         Action::ToggleSetting {
                            plugin: plugin.name.clone(),
-                           key: setting.key.clone(),
+                           key:    setting.key.clone(),
                         },
                      ),
                   );
@@ -1849,7 +1873,7 @@ fn render_plugins_tab(
                         BtnSize::Small,
                         Action::ToggleSelectDropdown {
                            plugin: plugin.name.clone(),
-                           key: setting.key.clone(),
+                           key:    setting.key.clone(),
                         },
                      ),
                   );
@@ -1874,8 +1898,8 @@ fn render_plugins_tab(
                            BtnSize::Small,
                            Action::PickSelectOption {
                               plugin: plugin.name.clone(),
-                              key: setting.key.clone(),
-                              value: opt.value.clone(),
+                              key:    setting.key.clone(),
+                              value:  opt.value.clone(),
                            },
                         );
                      }
@@ -1894,7 +1918,7 @@ fn render_plugins_tab(
                         BtnSize::Small,
                         Action::PressButton {
                            plugin: plugin.name.clone(),
-                           key: setting.key.clone(),
+                           key:    setting.key.clone(),
                         },
                      ),
                   );

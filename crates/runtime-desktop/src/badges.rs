@@ -13,8 +13,12 @@
 
 use std::{
    ffi::c_void,
-   panic::{self, AssertUnwindSafe},
-   slice, str,
+   panic::{
+      self,
+      AssertUnwindSafe,
+   },
+   slice,
+   str,
    sync::OnceLock,
 };
 
@@ -28,7 +32,7 @@ const MARKER: &str = "/badge-icons/phx_u_";
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawPinnedFuture {
-   data: *mut c_void,
+   data:   *mut c_void,
    vtable: *const c_void,
 }
 

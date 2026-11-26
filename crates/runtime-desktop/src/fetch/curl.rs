@@ -3,12 +3,25 @@
 //! fetch off. Headers stay in this process, never on a command line.
 
 use std::{
-   ffi::{CStr, CString, c_char, c_int, c_long, c_void},
+   ffi::{
+      CStr,
+      CString,
+      c_char,
+      c_int,
+      c_long,
+      c_void,
+   },
    ptr,
    sync::OnceLock,
 };
 
-use phoenix_runtime::fetch::{FetchError, LIMIT, Request, Response, TIMEOUT_MS};
+use phoenix_runtime::fetch::{
+   FetchError,
+   LIMIT,
+   Request,
+   Response,
+   TIMEOUT_MS,
+};
 
 #[cfg(target_os = "linux")]
 const LIBCURL: &CStr = c"libcurl.so.4";
@@ -47,13 +60,13 @@ type Slist = *mut c_void;
 type WriteFn = extern "C" fn(*const c_char, usize, usize, *mut c_void) -> usize;
 
 struct Curl {
-   easy_init: unsafe extern "C" fn() -> Easy,
-   easy_setopt: unsafe extern "C" fn(Easy, c_int, ...) -> c_int,
-   easy_perform: unsafe extern "C" fn(Easy) -> c_int,
-   easy_getinfo: unsafe extern "C" fn(Easy, c_int, ...) -> c_int,
-   easy_cleanup: unsafe extern "C" fn(Easy),
-   easy_strerror: unsafe extern "C" fn(c_int) -> *const c_char,
-   slist_append: unsafe extern "C" fn(Slist, *const c_char) -> Slist,
+   easy_init:      unsafe extern "C" fn() -> Easy,
+   easy_setopt:    unsafe extern "C" fn(Easy, c_int, ...) -> c_int,
+   easy_perform:   unsafe extern "C" fn(Easy) -> c_int,
+   easy_getinfo:   unsafe extern "C" fn(Easy, c_int, ...) -> c_int,
+   easy_cleanup:   unsafe extern "C" fn(Easy),
+   easy_strerror:  unsafe extern "C" fn(c_int) -> *const c_char,
+   slist_append:   unsafe extern "C" fn(Slist, *const c_char) -> Slist,
    slist_free_all: unsafe extern "C" fn(Slist),
 }
 
@@ -89,13 +102,13 @@ fn curl() -> Option<&'static Curl> {
                return None;
             }
             Curl {
-               easy_init: sym(lib, c"curl_easy_init")?,
-               easy_setopt: sym(lib, c"curl_easy_setopt")?,
-               easy_perform: sym(lib, c"curl_easy_perform")?,
-               easy_getinfo: sym(lib, c"curl_easy_getinfo")?,
-               easy_cleanup: sym(lib, c"curl_easy_cleanup")?,
-               easy_strerror: sym(lib, c"curl_easy_strerror")?,
-               slist_append: sym(lib, c"curl_slist_append")?,
+               easy_init:      sym(lib, c"curl_easy_init")?,
+               easy_setopt:    sym(lib, c"curl_easy_setopt")?,
+               easy_perform:   sym(lib, c"curl_easy_perform")?,
+               easy_getinfo:   sym(lib, c"curl_easy_getinfo")?,
+               easy_cleanup:   sym(lib, c"curl_easy_cleanup")?,
+               easy_strerror:  sym(lib, c"curl_easy_strerror")?,
+               slist_append:   sym(lib, c"curl_slist_append")?,
                slist_free_all: sym(lib, c"curl_slist_free_all")?,
             }
          };
@@ -123,7 +136,7 @@ impl Drop for Headers<'_> {
 }
 
 struct Sink {
-   body: Vec<u8>,
+   body:      Vec<u8>,
    too_large: bool,
 }
 
@@ -152,12 +165,16 @@ extern "C" fn write_body(
 #[expect(clippy::too_many_lines, reason = "one curl request, opened to closed")]
 pub fn send(request: &Request) -> Result<Response, FetchError> {
    let url = request.url.as_str();
-   let fail = |message: String| FetchError::Platform {
-      url: url.to_owned(),
-      message,
+   let fail = |message: String| {
+      FetchError::Platform {
+         url: url.to_owned(),
+         message,
+      }
    };
-   let not_http = || FetchError::NotHttp {
-      url: url.to_owned(),
+   let not_http = || {
+      FetchError::NotHttp {
+         url: url.to_owned(),
+      }
    };
    let curl =
       curl().ok_or_else(|| fail(format!("{} is not available", LIBCURL.to_string_lossy())))?;
@@ -211,7 +228,7 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
    };
 
    let mut sink = Sink {
-      body: Vec::new(),
+      body:      Vec::new(),
       too_large: false,
    };
    let empty: &[u8] = &[];
@@ -219,8 +236,10 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
    let is_head = request.method.eq_ignore_ascii_case("HEAD");
    let is_post = request.method.eq_ignore_ascii_case("POST");
    let body = request.body.as_deref().unwrap_or(empty);
-   let body_len = i64::try_from(body.len()).map_err(|_| FetchError::TooLarge {
-      url: url.to_owned(),
+   let body_len = i64::try_from(body.len()).map_err(|_| {
+      FetchError::TooLarge {
+         url: url.to_owned(),
+      }
    })?;
 
    let mut codes = vec![
@@ -285,6 +304,6 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
    }
    Ok(Response {
       status: i32::try_from(status).unwrap_or(0),
-      body: sink.body,
+      body:   sink.body,
    })
 }

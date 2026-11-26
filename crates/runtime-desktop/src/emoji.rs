@@ -5,10 +5,16 @@
 
 use std::sync::{
    OnceLock,
-   atomic::{AtomicBool, Ordering},
+   atomic::{
+      AtomicBool,
+      Ordering,
+   },
 };
 
-use phoenix_hook::{image::Image, x86::Abi};
+use phoenix_hook::{
+   image::Image,
+   x86::Abi,
+};
 use phoenix_sigs::desktop;
 
 /// `getEmojiUnavailableReason(&Emoji, &EmojiContext) -> u8`.

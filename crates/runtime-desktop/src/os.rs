@@ -34,18 +34,18 @@ pub trait DesktopOs {
    fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>>;
 }
 
-#[cfg(target_os = "linux")]
-pub use linux::Linux as Os;
-#[cfg(target_os = "macos")]
-pub use macos::Macos as Os;
-#[cfg(windows)]
-pub use windows::Windows as Os;
+#[cfg(target_os = "linux")] pub use linux::Linux as Os;
+#[cfg(target_os = "macos")] pub use macos::Macos as Os;
+#[cfg(windows)] pub use windows::Windows as Os;
 
 #[cfg(windows)]
 mod windows {
    use std::ffi::c_void;
 
-   use phoenix_hook::{image::Image, x86};
+   use phoenix_hook::{
+      image::Image,
+      x86,
+   };
 
    use super::DesktopOs;
 
@@ -146,13 +146,22 @@ mod windows {
 mod linux {
    use std::{
       sync::{
-         Mutex, OnceLock, PoisonError,
-         atomic::{AtomicU8, AtomicU64, Ordering},
+         Mutex,
+         OnceLock,
+         PoisonError,
+         atomic::{
+            AtomicU8,
+            AtomicU64,
+            Ordering,
+         },
       },
       time::Instant,
    };
 
-   use phoenix_hook::{image::Image, x86};
+   use phoenix_hook::{
+      image::Image,
+      x86,
+   };
    use phoenix_sigs::desktop;
 
    use super::DesktopOs;
@@ -163,17 +172,17 @@ mod linux {
    type PingFn = unsafe fn(*const usize);
 
    struct Frame {
-      orig: FrameFn,
+      orig:         FrameFn,
       force_render: usize,
-      ping: PingFn,
+      ping:         PingFn,
    }
 
    /// A window's `status`, `ping` and `requested`, each holding one extra
    /// reference so they outlive the window.
    #[derive(Clone, Copy, PartialEq, Eq)]
    struct Window {
-      status: usize,
-      ping: usize,
+      status:    usize,
+      ping:      usize,
       requested: usize,
    }
 
@@ -254,7 +263,7 @@ mod linux {
          return;
       }
       let mut now = libc::timespec {
-         tv_sec: 0,
+         tv_sec:  0,
          tv_nsec: 0,
       };
       // SAFETY: `now` is a valid out pointer; `Instant` reads this clock.
@@ -302,9 +311,9 @@ mod linux {
          // SAFETY: both are functions of these signatures, located by sigs.
          let _ = FRAME.set(unsafe {
             Frame {
-               orig: std::mem::transmute::<usize, FrameFn>(trampoline),
+               orig:         std::mem::transmute::<usize, FrameFn>(trampoline),
                force_render: found.force_render,
-               ping: std::mem::transmute::<usize, PingFn>(found.ping),
+               ping:         std::mem::transmute::<usize, PingFn>(found.ping),
             }
          });
          log::info!("desktop redraw: hooked Wayland frame @ {:#x}", found.frame);
@@ -347,7 +356,10 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod macos {
-   use phoenix_hook::{image::Image, x86};
+   use phoenix_hook::{
+      image::Image,
+      x86,
+   };
 
    use super::DesktopOs;
 

@@ -10,7 +10,10 @@ use std::{
    ptr,
    sync::{
       OnceLock,
-      atomic::{AtomicBool, Ordering},
+      atomic::{
+         AtomicBool,
+         Ordering,
+      },
    },
 };
 
