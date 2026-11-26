@@ -47,10 +47,16 @@ struct Bucket {
 
 /// Locates `to_value` and the drop glue from `prepare`.
 pub fn install(image: &Image<'static>) {
-   match desktop::message_json(image) {
+   let found = if crate::X86_CODE {
+      desktop::message_json(image)
+   } else {
+      arm64_json(image)
+   };
+   match found {
       Ok(found) => {
          // SAFETY: shape-checked by `sigs`; both take their pointers in the
-         // first argument registers, as the C ABI passes them.
+         // first argument registers, as the C ABI passes them (arm64's
+         // `to_value` through its `sret_caller` thunk).
          let _ = FNS.set(unsafe {
             (
                std::mem::transmute::<usize, ToValueFn>(found.to_value),
@@ -61,6 +67,41 @@ pub fn install(image: &Image<'static>) {
       },
       Err(err) => log::warn!("message json: {err}, message actions read the cache"),
    }
+}
+
+/// Where a `Message` keeps its id and channel id, which arm64's menu checks a
+/// pointer against before serializing it.
+static IDS: OnceLock<(usize, usize)> = OnceLock::new();
+
+/// arm64's `to_value` returns through `x8`, so it is called through a thunk.
+fn arm64_json(image: &Image<'_>) -> Result<desktop::MessageJson, String> {
+   let found = phoenix_sigs::macos::message_json(image)?;
+   let to_value =
+      phoenix_hook::image::sret_caller(found.json.to_value).ok_or("no memory for a thunk")?;
+   let _ = IDS.set((found.id, found.channel_id));
+   Ok(desktop::MessageJson {
+      to_value,
+      ..found.json
+   })
+}
+
+/// The `Message` among `words` whose id and channel id are `id` and
+/// `channel`: one of them is `&Message` or `Rc<Message>`. Each candidate is
+/// read with [`peek`], so a word that isn't a pointer is skipped.
+pub fn find_message(words: &[usize], id: u64, channel: u64) -> Option<*const u8> {
+   /// An `Rc`'s value follows its two counts.
+   const RC_VALUE: usize = 16;
+   let &(id_at, channel_at) = IDS.get()?;
+   words
+      .iter()
+      .filter(|&&word| word != 0 && word % 8 == 0)
+      .flat_map(|&word| [word, word.wrapping_add(RC_VALUE)])
+      .find(|&message| {
+         let at = message as *const u8;
+         peek_word(at.wrapping_add(id_at)) == Some(id)
+            && peek_word(at.wrapping_add(channel_at)) == Some(channel)
+      })
+      .map(|message| message as *const u8)
 }
 
 /// The JSON of the `Message` at `message`, whose id is `id`, or `None` when

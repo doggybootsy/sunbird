@@ -52,7 +52,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `crates/runtime-mobile/src/host.rs` | Phoenix's host call, event and field numbers, read at startup from the name table in the installed APK's dex, or the host's Swift name table on iOS. `host::send` and `host::ask` call host modules. |
 | `crates/runtime-mobile/src/picker.rs` | File picker, toasts, clipboard and links through Phoenix's host modules. |
 | `crates/runtime-mobile/src/install.rs`, `loader.rs` | The APK self-update, and Android's installer opened on it through Discord's `FileProvider`. |
-| `crates/runtime-desktop` | phoenix on Desktop Phoenix (`Discord.exe`, Linux `discord-phoenix`, macOS `Discord`): the access gate, the HTTP transport hooks, the Sunbird pages in User Settings, message accessories and the tray. `os.rs` holds what differs per OS. On macOS, which is arm64, the access gate, `phoenix.discord`, plugins, gateway hooks, fetch, storage, the debug shell and the tray run; everything else is x86-located and off (see Host facts). |
+| `crates/runtime-desktop` | phoenix on Desktop Phoenix (`Discord.exe`, Linux `discord-phoenix`, macOS `Discord`): the access gate, the HTTP transport hooks, the Sunbird pages in User Settings, message accessories and the tray. `os.rs` holds what differs per OS. On macOS, which is arm64, everything runs from arm64 locators except the menu separator (see Host facts). |
 | `crates/ui-mobile` | Typed codec for mobile (Android/iOS) Phoenix UI-op batches. `src/props.in` is Phoenix's prop table, `templates.json` holds captured layouts, `motion.rs` drives native springs, `mirror.rs` keeps a live copy of the view tree that host tests can drive. |
 | `crates/ui-desktop` | Desktop UI host primitives (clipboard, URLs, notifications, the tray, GPUI surface hooks), one file per OS. |
 | `crates/wire` | Tagged values and bridge frames (`HostCall`, `DispatchEvent`). |
@@ -276,7 +276,7 @@ byte pattern says nothing about arm32.
   `script ...; threading.Timer(n, process.SendAsyncInterrupt).start()`, then `detach`. A render
   function only runs on a redraw, so wait on input or count hits over a fixed window.
 - `phoenix.discord` works. `macos::http_transport` finds `send` by its anchor string, and the
-  `SendFuture` vtable by an `adrp` pair in `send`. The host allocator isn't located. `send` is hooked
+  `SendFuture` vtable by an `adrp` pair in `send`. `send` is hooked
   with the arm64 `hook_entry`: it overwrites the first 4 instructions with
   `ldr x16,#8; br x16; .quad`, relocates them into a `MAP_JIT` trampoline, and refuses
   literal loads and branches back into those 4 instructions. Outlined prologues
@@ -354,7 +354,11 @@ byte pattern says nothing about arm32.
   the message is at +0x10 in it, and the id at +0x1d8. The render takes `x0` row, `x1`..`x7`,
   `d0` and one stack word, and returns the 0x20-byte `AnyElement` through `x8`; the detour is
   native and passes four stack words through. A tint also gets a faint background now, on every
-  platform. The x86 body-text recolor (`message_body`) has no arm64 locator.
+  platform. `macos::message_body` is the row's one callee loading `\x0fmessage-edited-`; its
+  `x0` is not the `Message` (`+0x1d8` there is a pointer), so the render detour keeps the row's id
+  in a thread-local the body detour reads. Its config's `RowColors` are the `add xR, config, #imm`
+  that sits 4 below a `mov` triple of color offsets (+0x1e0 on this build); the muted slot (+0x34)
+  is only written when it is one of those offsets.
 - Plugin pages and dialogs (`openPage`, `choose`, `showSheet`) are `AppKit` windows on macOS
   (`ui-desktop/src/macos/panel.rs`), routed from `modal::open_page`/`open_choice`/`close_page`: a
   vertical `NSStackView` of headings, button rows, wrapping labels and `scrollableTextView`s. One
@@ -374,13 +378,31 @@ byte pattern says nothing about arm32.
   24-byte return goes through `x8`), and the constructors are called through `sret_caller`.
   `SharedString` keeps x86's tags (0x18 static). Discord's Rust heap may be its own malloc zone, so
   our `Rc` handlers are pinned (`gpui::pinned_rc_u64`) and never freed by Discord. The separator
-  tag isn't verified, so arm64 items follow Discord's without one, and there's no `with_color`.
+  tag isn't verified (this builder pushes none, and a payload variant would crash), so arm64 items
+  follow Discord's without one. `with_color` is the setter between `with_icon` and `push` that is
+  always called with `w1 = 2` (Discord's danger items, through a `mov w1, #2; b` stub).
 - Test a second instance with `open -n -a <copy> --env DYLD_INSERT_LIBRARIES=... --env
   LIBDISCORD_DATA_DIR=...`. Exec'd from a shell it re-execs, and the loader in the last image
   hooks but `start` never logs and the window shows the access gate; through Launch Services it
   starts normally. Under lldb, the debugger's `MallocNanoZone=0` makes the first image claim, so
   the re-exec runs without Sunbird.
-- Still x86-only: badges, message JSON, optimistic delete, the message body recolor and the
-  Nitro emoji unlock (`emoji.rs`). `X86_CODE` in `runtime-desktop` keeps them from
-  running on arm64. Handlers keep the desktop result ABI: 96 bytes, `Ok` is `u64::MAX - 1`,
-  returned through `x8`.
+- Data pointers in the file are `DYLD_CHAINED_PTR_64_OFFSET` rebases (low 36 bits from the
+  header, bind bit 63), plain once dyld has run; `macos::data_pointer` reads both, so a locator
+  that follows data works in `sigscan` and live.
+- Emoji unlock: `macos::emoji_check` is the leaf starting `ldrb wI, [x1, #0x24]; orr wT, wI, #2;
+  cmp wT, #0xe`; its `b.ne` relocates through a veneer. Badges: `macos::media_fetch` follows the
+  `tracing` metadata naming `media_fetch` (name, 11, target, 23, callsite at +0x30) to its one
+  loader; it takes `x0`..`x5` and returns the future in `x0:x1`, as the x86 detour does.
+- Message JSON: `to_value` is found as on x86, takes the message in `x0` and returns through `x8`
+  (called through a thunk); `Err` is `u64::MAX`. The drop glue is the callee of its callers that
+  decodes the niche (`ldr [x0]; eor #0x8000000000000000; cmp #3`). `macos::message_json` also reads
+  `"id"`/`"channel_id"` offsets off its `serialize_field` calls (`w2` key length, `x3` field), and
+  the menu detour takes the word in its input (or that word + 16, an `Rc`) whose message has both
+  ids, read with `read_memory`, before serializing.
+- Optimistic delete: `macos::optimistic_delete` is the x86 rule with stubs resolved (the one other
+  parent of `MESSAGE_DELETE`'s callees sharing at least 4 and taking a lock, LSE `cas` or
+  `ldaxr`). It costs about 0.6 s at startup. Host allocator: `__rust_alloc(size, align)` is
+  `alloc_or_oom`'s first real call, and `__rust_dealloc(ptr, size, align)` the next function,
+  which subtracts the size from Discord's live-byte counter (`neg`, `ldadd`).
+- `X86_CODE` in `runtime-desktop` now only picks the locator. Handlers keep the desktop result
+  ABI: 96 bytes, `Ok` is `u64::MAX - 1`, returned through `x8`.

@@ -80,7 +80,8 @@ struct MenuSymbols {
    props_new:         PropsNewFn,
    with_id:           WithIdFn,
    with_icon:         WithIconFn,
-   /// Not located on arm64, where danger items keep the default color.
+   /// `None` when arm64's ranking isn't clear; danger items then keep the
+   /// default color.
    with_color:        Option<WithColorFn>,
    vec_push:          VecPushFn,
    layout:            MenuLayout,
@@ -583,7 +584,10 @@ mod arm64 {
             props_new:         std::mem::transmute::<usize, super::PropsNewFn>(props_new),
             with_id:           std::mem::transmute::<usize, super::WithIdFn>(with_id),
             with_icon:         std::mem::transmute::<usize, super::WithIconFn>(with_icon),
-            with_color:        None,
+            with_color:        menu
+               .with_color
+               .and_then(sret_caller)
+               .map(|thunk| std::mem::transmute::<usize, super::WithColorFn>(thunk)),
             vec_push:          std::mem::transmute::<usize, super::VecPushFn>(menu.vec_push),
             layout:            menu.layout,
          });
@@ -597,6 +601,27 @@ mod arm64 {
          menu.channel_id_offset,
          menu.layout,
       );
+   }
+
+   /// Serializes the message the input holds, found by its ids, while the
+   /// input still owns it.
+   fn remember_input_message(input: *const c_void, id: u64, channel: u64) {
+      /// How much of the input is searched; its ids sit at +0x80.
+      const INPUT_LEN: usize = 0x100;
+      let Some(bytes) = phoenix_hook::x86::read_memory(input as usize, INPUT_LEN) else {
+         return;
+      };
+      let words: Vec<usize> = bytes
+         .as_chunks::<8>()
+         .0
+         .iter()
+         .map(|word| usize::from_le_bytes(*word))
+         .collect();
+      if let Some(message) = crate::message::find_message(&words, id, channel) {
+         // SAFETY: `message` is the input's live `Message`, whose ids were
+         // just read back; the builder hasn't consumed the input yet.
+         unsafe { super::remember_message(message, id) };
+      }
    }
 
    unsafe extern "C" fn detour(
@@ -636,6 +661,9 @@ mod arm64 {
          },
          _ => None,
       };
+      if let Some((message, channel)) = ids {
+         remember_input_message(input, message, channel);
+      }
       // SAFETY: forwards every register to the original builder.
       let mut out = unsafe { orig(input, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3) };
       if let (Some((message, channel)), Some(syms)) = (ids, MENU_SYMS.get()) {

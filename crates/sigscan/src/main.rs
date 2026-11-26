@@ -422,18 +422,56 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             gpui.clone().map(|gpui| format!("{gpui:x?}")),
          );
          report(
+            "host allocator",
+            gpui
+               .clone()
+               .and_then(|gpui| phoenix_sigs::macos::host_allocator(image, gpui.alloc_or_oom))
+               .map(|(alloc, dealloc)| format!("alloc {}, dealloc {}", at(alloc), at(dealloc))),
+         );
+         report(
             "gpui layouts",
             gpui
                .and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, &gpui))
                .map(|layout| format!("{layout:x?}")),
          );
+         let row = phoenix_sigs::macos::message_row(image);
+         report("message row", row.clone().map(|row| format!("{row:x?}")));
          report(
-            "message row",
-            phoenix_sigs::macos::message_row(image).map(|row| format!("{row:x?}")),
+            "message body",
+            row.and_then(|row| phoenix_sigs::macos::message_body(image, row.func))
+               .map(|body| format!("{} (row colors +{:#x})", at(body.func), body.row_colors)),
          );
-         for name in ["media fetch", "message json"] {
-            report(name, Err("no arm64 Desktop locator yet".to_owned()));
-         }
+         report(
+            "emoji check",
+            phoenix_sigs::macos::emoji_check(image)
+               .map(|check| format!("{} (intention +{:#x})", at(check.func), check.intention)),
+         );
+         report(
+            "media fetch",
+            phoenix_sigs::macos::media_fetch(image).map(at),
+         );
+         report(
+            "message json",
+            phoenix_sigs::macos::message_json(image).map(|found| {
+               format!(
+                  "to_value {}, drop {}, id +{:#x}, channel +{:#x}",
+                  at(found.json.to_value),
+                  at(found.json.drop_value),
+                  found.id,
+                  found.channel_id
+               )
+            }),
+         );
+         report(
+            "optimistic delete",
+            GatewayRegistry::locate(image)
+               .map_err(|err| err.to_string())
+               .and_then(|registry| {
+                  let id = registry.id("MESSAGE_DELETE").ok_or("no MESSAGE_DELETE")?;
+                  phoenix_sigs::macos::optimistic_delete(image, registry.entry(id).handler)
+               })
+               .map(at),
+         );
          report(
             "access gate",
             phoenix_sigs::macos::access_gate(image).map(at),

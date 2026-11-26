@@ -97,8 +97,8 @@ struct DialogAnswer {
 
 /// Whether Discord's code is x86-64, which every locator in
 /// `phoenix_sigs::desktop` and `http` decodes. macOS Phoenix is arm64 only, so
-/// there they are never run, an x86 patch can never land in arm64 code, and
-/// what they locate stays off.
+/// there `phoenix_sigs::macos` locates the same things instead and an x86
+/// patch can never land in arm64 code.
 pub(crate) const X86_CODE: bool = cfg!(all(target_arch = "x86_64", not(target_os = "macos")));
 
 /// The target and its swapped gateway registry, once [`prepare`] hooked them.
@@ -128,17 +128,15 @@ pub fn prepare() -> Result<(), Error> {
    } else {
       context_menu::install(&image);
       accessories::install(&image);
-      log::info!(
-         "arm64 Desktop: plugin pages and dialogs are AppKit windows; badges, message JSON, \
-          optimistic delete and the emoji unlock stay off"
-      );
+      emoji::install(&image);
+      badges::install(&image);
+      message::install(&image);
+      log::info!("arm64 Desktop: plugin pages and dialogs are AppKit windows");
    }
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
       discord::install(&image);
-      if X86_CODE {
-         accessories::install_optimistic_delete(&image);
-      }
+      accessories::install_optimistic_delete(&image);
    }
    // The index is tens of MB and nothing reads it after startup.
    phoenix_sigs::desktop::release_call_index();

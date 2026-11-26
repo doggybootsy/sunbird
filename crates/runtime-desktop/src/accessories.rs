@@ -444,7 +444,17 @@ pub fn install_optimistic_delete(image: &Image<'static>) {
       );
       return;
    };
-   let opt_del = match desktop::optimistic_delete(image, del_fn) {
+   let started = std::time::Instant::now();
+   let found = if crate::X86_CODE {
+      desktop::optimistic_delete(image, del_fn)
+   } else {
+      phoenix_sigs::macos::optimistic_delete(image, del_fn)
+   };
+   log::info!(
+      "desktop accessories: optimistic delete located in {:?}",
+      started.elapsed()
+   );
+   let opt_del = match found {
       Ok(opt_del) => opt_del,
       Err(err) => {
          log::warn!("desktop accessories: {err}, skipping optimistic delete hook");
@@ -562,6 +572,18 @@ mod arm64 {
    static ORIG: OnceLock<RenderFn> = OnceLock::new();
    static ROW: OnceLock<phoenix_sigs::macos::MessageRow> = OnceLock::new();
 
+   /// `build_message_body(message, config, w2, w3, w4, w5) -> x0`.
+   type BodyFn = unsafe extern "C" fn(*const u8, *mut u8, u64, u64, u64, u64) -> usize;
+   /// The original builder, the row colors' offset in its config, and whether
+   /// the muted color sits [`super::ROW_COLORS_MUTED_DELTA`] past them.
+   static BODY: OnceLock<(BodyFn, usize, bool)> = OnceLock::new();
+
+   std::thread_local! {
+      /// The message the render on this thread is drawing. The body builder's
+      /// own argument isn't the message, and the render calls it.
+      static RENDERING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+   }
+
    pub fn install(image: &Image<'static>) {
       let row = match phoenix_sigs::macos::message_row(image) {
          Ok(row) => row,
@@ -587,6 +609,85 @@ mod arm64 {
       let _ = ORIG.set(unsafe { std::mem::transmute::<usize, RenderFn>(trampoline) });
       let _ = ROW.set(row);
       log::info!("desktop accessories: hooked MessageRow render {row:x?}");
+      install_body(image, row.func);
+   }
+
+   /// Recolors a tinted message's text through the body builder's config.
+   fn install_body(image: &Image<'static>, render: usize) {
+      let body = match phoenix_sigs::macos::message_body(image, render) {
+         Ok(body) => body,
+         Err(err) => {
+            log::warn!("desktop accessories: {err}, skipping body tint");
+            return;
+         },
+      };
+      let muted = body.colors[..body.color_count]
+         .contains(&(body.row_colors + super::ROW_COLORS_MUTED_DELTA));
+      let pro = phoenix_sigs::desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
+      // SAFETY: runs from `prepare` before Discord's threads; `body_detour`
+      // has the builder's signature.
+      let trampoline = match unsafe {
+         image.hook_entry(
+            body.func,
+            pro.pattern,
+            pro.len,
+            body_detour as *const () as usize,
+         )
+      } {
+         Ok(trampoline) => trampoline,
+         Err(err) => {
+            log::warn!("desktop accessories: message body hook failed: {err}");
+            return;
+         },
+      };
+      // SAFETY: the trampoline runs the builder's displaced instructions.
+      let orig = unsafe { std::mem::transmute::<usize, BodyFn>(trampoline) };
+      let _ = BODY.set((orig, body.row_colors, muted));
+      log::info!(
+         "desktop accessories: hooked message body @ {:#x} (row colors +{:#x}, muted {muted})",
+         body.func,
+         body.row_colors
+      );
+   }
+
+   unsafe extern "C" fn body_detour(
+      message: *const u8,
+      config: *mut u8,
+      a2: u64,
+      a3: u64,
+      a4: u64,
+      a5: u64,
+   ) -> usize {
+      let &(orig, colors, muted) = BODY.get().expect("the detour only runs once BODY is set");
+      let id = RENDERING.with(std::cell::Cell::get);
+      let tint = (ACTIVE_COUNT.load(Ordering::Relaxed) > 0 && id != 0 && !config.is_null())
+         .then(|| super::lookup_cached_tint(id))
+         .flatten();
+      let Some(argb) = tint else {
+         // SAFETY: forwards every argument to the builder.
+         return unsafe { orig(message, config, a2, a3, a4, a5) };
+      };
+      let rgba = super::argb_to_rgba(argb);
+      let mut slots = vec![colors];
+      if muted {
+         slots.push(colors + super::ROW_COLORS_MUTED_DELTA);
+      }
+      // SAFETY: `config` is the render's stack config; these `u32` RGBA slots
+      // are restored before returning.
+      unsafe {
+         let saved: Vec<u32> = slots
+            .iter()
+            .map(|&at| config.add(at).cast::<u32>().read_unaligned())
+            .collect();
+         for &at in &slots {
+            config.add(at).cast::<u32>().write_unaligned(rgba);
+         }
+         let out = orig(message, config, a2, a3, a4, a5);
+         for (&at, value) in slots.iter().zip(saved) {
+            config.add(at).cast::<u32>().write_unaligned(value);
+         }
+         out
+      }
    }
 
    /// The message id the row renders: `row.rc -> Rc<Message> -> id`.
@@ -630,18 +731,22 @@ mod arm64 {
       s3: usize,
    ) -> RawAnyElement {
       let orig = *ORIG.get().expect("the detour only runs once ORIG is set");
+      let id = if ACTIVE_COUNT.load(Ordering::Relaxed) > 0 && !row.is_null() {
+         // SAFETY: `row` is the render's live row.
+         Some(unsafe { message_id(row) }).filter(|id| (1 << 32..1 << 63).contains(id))
+      } else {
+         None
+      };
+      let outer = RENDERING.replace(id.unwrap_or(0));
       // SAFETY: forwards every register and the stack words to the render.
       let mut out = unsafe {
          orig(
             row, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3, s0, s1, s2, s3,
          )
       };
-      if ACTIVE_COUNT.load(Ordering::Relaxed) > 0 && !row.is_null() {
-         // SAFETY: `row` is the render's live row.
-         let id = unsafe { message_id(row) };
-         if (1 << 32..1 << 63).contains(&id) {
-            decorate(&raw mut out, id);
-         }
+      RENDERING.set(outer);
+      if let Some(id) = id {
+         decorate(&raw mut out, id);
       }
       out
    }

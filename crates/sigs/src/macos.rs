@@ -672,6 +672,9 @@ pub struct MessageMenu {
    pub with_id:           usize,
    /// `with_icon(x8 out, x0 item, w1 icon)`.
    pub with_icon:         usize,
+   /// `with_color(x8 out, x0 item, w1 color)`, which Discord calls with 2
+   /// for its danger items.
+   pub with_color:        Option<usize>,
    /// `Vec<MenuItem>::push(x0 vec, x1 item)`.
    pub vec_push:          usize,
    pub layout:            crate::desktop::MenuLayout,
@@ -878,6 +881,39 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    pushes.retain(|&(target, _)| target == vec_push);
    let size = pushes[0].1;
 
+   // The setter called between `with_icon` and `push`, every time with
+   // `w1 = 2`: Discord's danger color.
+   let mut after_icon: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+   let calls: Vec<(usize, usize)> = body
+      .iter()
+      .enumerate()
+      .filter_map(|(at, insn)| {
+         match insn {
+            Insn::Bl { target } => Some((at, *target)),
+            _ => None,
+         }
+      })
+      .collect();
+   for window in calls.windows(3) {
+      let [(_, icon), (at, setter), (_, push)] = window else {
+         continue;
+      };
+      if *icon != with_icon || *push != vec_push || *setter == with_icon {
+         continue;
+      }
+      let danger = matches!(body.get(at - 1), Some(Insn::MovZ { rd: 1, imm: 2, .. }));
+      *after_icon.entry(*setter).or_insert(true) &= danger;
+   }
+   let with_color = match after_icon
+      .into_iter()
+      .filter_map(|(setter, danger)| danger.then_some(setter))
+      .collect::<Vec<_>>()
+      .as_slice()
+   {
+      &[only] => Some(only),
+      _ => None,
+   };
+
    // Each `MenuItem::new::<F>` reaches its core through
    // `mov x3, x1; mov w1, #0; b core`.
    let mut targets = body
@@ -997,6 +1033,7 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
       props_new,
       with_id,
       with_icon,
+      with_color,
       vec_push,
       layout,
    })
@@ -1757,4 +1794,538 @@ pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
       value,
       message_id,
    })
+}
+
+/// [`crate::desktop::emoji_check`] for arm64.
+///
+/// The leaf answers 3 for profile intentions first, `ldrb wI, [x1,
+/// #intention]; ... orr wT, wI, #2; cmp wT, #0xe`, within a few instructions
+/// of the function's start.
+pub fn emoji_check(image: &Image<'_>) -> Found<crate::desktop::EmojiCheck> {
+   let mut found = Vec::new();
+   for segment in image.segments.iter().filter(|segment| segment.executable) {
+      let words = segment.bytes.as_chunks::<4>().0;
+      for (index, window) in words.windows(6).enumerate() {
+         // `ldrb wT, [x1, #imm]`, checked on the raw word before decoding.
+         if u32::from_le_bytes(window[0]) & 0xFFC0_03E0 != 0x3940_0020 {
+            continue;
+         }
+         let at = segment.addr + index * 4;
+         let Insn::Load {
+            rt,
+            rn: 1,
+            offset,
+            size: 1,
+         } = arm64::decode(u32::from_le_bytes(window[0]), at)
+         else {
+            continue;
+         };
+         // `orr wT, wI, #2`, then `cmp wT, #0xe`.
+         let Some(orr) = window[1..5].iter().position(|word| {
+            let word = u32::from_le_bytes(*word);
+            word & 0xFFFF_FFE0 == 0x321F_0000 | (u32::from(rt) << 5)
+         }) else {
+            continue;
+         };
+         let target = (u32::from_le_bytes(window[1 + orr]) & 0x1F) as u8;
+         let compares = window[2 + orr..].iter().enumerate().any(|(offset, word)| {
+            matches!(
+               arm64::decode(u32::from_le_bytes(*word), at + (2 + orr + offset) * 4),
+               Insn::CmpImm { rn, imm: 0xE, wide: false } if rn == target
+            )
+         });
+         if compares {
+            found.push((at, offset));
+         }
+      }
+   }
+   // The load opens the function, or follows one instruction.
+   let mut entries: Vec<_> = found
+      .iter()
+      .filter_map(|&(load, intention)| {
+         let (start, _) = image.function_bounds(load)?;
+         (load - start <= 4).then_some((start, intention))
+      })
+      .collect();
+   entries.sort_unstable();
+   entries.dedup();
+   match entries.as_slice() {
+      &[(func, intention)] => Ok(crate::desktop::EmojiCheck { func, intention }),
+      _ => {
+         Err(format!(
+            "emoji check matched {} entries among {:x?}",
+            entries.len(),
+            found
+         ))
+      },
+   }
+}
+
+/// What a data word points to: the pointer itself once dyld has run, or, in
+/// a file, a `DYLD_CHAINED_PTR_64_OFFSET` rebase, whose low 36 bits count from
+/// the Mach-O header (`__TEXT`).
+fn data_pointer(image: &Image<'_>, word: usize) -> Option<usize> {
+   if image.read(word, 1).is_some() {
+      return Some(word);
+   }
+   let text = image.function_starts.as_ref()?.text;
+   // Bit 63 marks a bind, which points outside the image.
+   (word >> 63 == 0)
+      .then(|| text + (word & 0xF_FFFF_FFFF))
+      .filter(|&target| image.read(target, 1).is_some())
+}
+
+/// The 8-aligned data slots that point to `target`, fixed up or not.
+fn data_slots_to(image: &Image<'_>, target: usize) -> Vec<usize> {
+   let mut found = Vec::new();
+   for segment in image.segments.iter().filter(|segment| !segment.executable) {
+      for (index, word) in segment.bytes.as_chunks::<8>().0.iter().enumerate() {
+         let Ok(word) = usize::try_from(u64::from_le_bytes(*word)) else {
+            continue;
+         };
+         // Most words are neither; this skips the decode for them.
+         let low = word & 0xF_FFFF_FFFF;
+         if (low == target & 0xF_FFFF_FFFF
+            || low == target.wrapping_sub(0x1_0000_0000) & 0xF_FFFF_FFFF)
+            && data_pointer(image, word) == Some(target)
+         {
+            found.push(segment.addr + index * 8);
+         }
+      }
+   }
+   found
+}
+
+/// [`crate::desktop::media_fetch`] for arm64: the function that loads the
+/// `tracing` callsite whose metadata names `media_fetch` in
+/// `libdiscord_media::fetch`.
+pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
+   let name = one(
+      "media_fetch tracing name",
+      &image.find_bytes(b"media_fetchlibdiscord_media::fetch"),
+   )?;
+   let target = name + 11;
+   let word = |at: usize| image.read_usize(at);
+   let callsites: Vec<usize> = data_slots_to(image, name)
+      .into_iter()
+      .filter(|&slot| {
+         word(slot + 8) == Some(11)
+            && word(slot + 0x10).and_then(|raw| data_pointer(image, raw)) == Some(target)
+            && word(slot + 0x18) == Some(23)
+      })
+      .filter_map(|slot| data_pointer(image, word(slot + 0x30)?))
+      .collect();
+   let callsite = one("media_fetch callsite", &callsites)?;
+   let mut funcs: Vec<usize> = arm64::code_refs(image, callsite..callsite + 1)
+      .into_iter()
+      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+      .collect();
+   funcs.sort_unstable();
+   funcs.dedup();
+   one("libdiscord_media::fetch", &funcs)
+}
+
+/// The addresses a function loads with `adrp` pairs, in order.
+fn loaded_addresses(code: &[(usize, Insn)]) -> Vec<usize> {
+   let mut pages = [None; 32];
+   let mut out = Vec::new();
+   for &(_, insn) in code {
+      match insn {
+         Insn::Adrp { rd, page } => pages[usize::from(rd)] = Some(page),
+         Insn::AddImm { rd, rn, imm } => {
+            if let Some(page) = pages[usize::from(rn)] {
+               out.push(page + imm);
+            }
+            pages[usize::from(rd)] = None;
+         },
+         _ => {},
+      }
+   }
+   out
+}
+
+/// [`crate::desktop::message_json`] for arm64.
+///
+/// `to_value` is found as on x86: the one function loading
+/// `"mention_everyone"` whose first strings are `Message`, `id`, `channel_id`
+/// and `guild_id`, with a `type` key and no `kind`. The drop glue is the one
+/// function `to_value`'s callers pass the same stack slot to right after it,
+/// most often.
+pub fn message_json(image: &Image<'_>) -> Found<MessageJson> {
+   let names = image.find_bytes(b"mention_everyone");
+   let (Some(&first), Some(&last)) = (names.iter().min(), names.iter().max()) else {
+      return Err("no mention_everyone string".to_owned());
+   };
+   // One pass over the code for every copy of the name.
+   let mut funcs: Vec<usize> = arm64::code_refs(image, first..last + 1)
+      .into_iter()
+      .filter(|(_, target)| names.contains(target))
+      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+      .collect();
+   funcs.sort_unstable();
+   funcs.dedup();
+   let starts = |s: &[u8], prefix: &[u8]| s.starts_with(prefix);
+   let found: Vec<usize> = funcs
+      .into_iter()
+      .filter(|&func| {
+         let Some((_, code)) = arm64::function(image, func) else {
+            return false;
+         };
+         let strings: Vec<&[u8]> = loaded_addresses(&code)
+            .into_iter()
+            .filter_map(|at| image.read(at, 16))
+            .collect();
+         let [first, id, channel, guild, ..] = strings.as_slice() else {
+            return false;
+         };
+         starts(first, b"Message")
+            && starts(id, b"id")
+            && starts(channel, b"channel_id")
+            && starts(guild, b"guild_id")
+            && strings.iter().any(|s| starts(s, b"type"))
+            && !strings.iter().any(|s| starts(s, b"kind"))
+      })
+      .collect();
+   let &[to_value] = found.as_slice() else {
+      return Err(format!("Message to_value matched {found:x?}"));
+   };
+   // `ldr xT, [x0]; eor xN, xT, #0x8000000000000000; ... cmp xV, #3`: the
+   // niche decode of `Value`'s tag, then "nothing to drop below 3".
+   let is_value_drop = |func: usize| {
+      let Some(code) = image.read(func, 0x30) else {
+         return false;
+      };
+      let insns: Vec<Insn> = arm64::decode_all(code, func)
+         .map(|(_, insn)| insn)
+         .collect();
+      let loads_tag = insns.iter().position(|insn| {
+         matches!(insn, Insn::Load {
+            rn: 0,
+            offset: 0,
+            size: 8,
+            ..
+         })
+      });
+      loads_tag.is_some_and(|at| {
+         let Insn::Load { rt, .. } = insns[at] else {
+            return false;
+         };
+         insns[at..].iter().any(|insn| {
+            matches!(insn, Insn::Other(word) if word & 0xFFFF_FC00 == 0xD241_0000 && ((word >> 5) & 0x1F) as u8 == rt)
+         }) && insns[at..]
+            .iter()
+            .any(|insn| matches!(insn, Insn::CmpImm { imm: 3, wide: true, .. }))
+      })
+   };
+   let serializers: Vec<usize> = arm64::code_refs(image, to_value..to_value + 1)
+      .into_iter()
+      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+      .collect();
+   let called = serializers.into_iter().flat_map(|caller| {
+      flattened_at(image, caller)
+         .into_iter()
+         .filter_map(|(_, insn)| {
+            match insn {
+               Insn::Bl { target } | Insn::B { target } => Some(target),
+               _ => None,
+            }
+         })
+   });
+   let drop_value = most_common(called.filter(|&callee| is_value_drop(callee)), 2)
+      .ok_or("serde_json::Value drop glue not found")?;
+   let (id, channel_id) =
+      serialized_ids(image, to_value).ok_or("Message to_value's id fields don't decode")?;
+   Ok(MessageJson {
+      json: crate::desktop::MessageJson {
+         to_value,
+         drop_value,
+      },
+      id,
+      channel_id,
+   })
+}
+
+/// [`message_json`]'s functions, and where the `Message` it serializes keeps
+/// its id and channel id.
+#[derive(Clone, Copy, Debug)]
+pub struct MessageJson {
+   pub json:       crate::desktop::MessageJson,
+   pub id:         usize,
+   pub channel_id: usize,
+}
+
+/// The offsets `to_value` serializes `"id"` and `"channel_id"` from: each
+/// field is `serialize_field(state, key, key_len, &message.field)`, so the
+/// call takes `w2` the key's length and `x3` the message plus the offset.
+fn serialized_ids(image: &Image<'_>, to_value: usize) -> Option<(usize, usize)> {
+   let (_, code) = arm64::function(image, to_value)?;
+   // The register holding the message, copied from `x0` on entry.
+   let message = code.iter().take(16).find_map(|&(_, insn)| {
+      match insn {
+         Insn::MovReg {
+            rd,
+            rm: 0,
+            wide: true,
+         } => Some(rd),
+         _ => None,
+      }
+   })?;
+   let (mut key_len, mut field) = (None, None);
+   let (mut id, mut channel_id) = (None, None);
+   for &(_, insn) in &code {
+      match insn {
+         Insn::MovZ { rd: 2, imm, .. } => key_len = Some(imm),
+         Insn::AddImm { rd: 3, rn, imm } if rn == message => field = Some(imm),
+         Insn::MovReg { rd: 3, rm, .. } if rm == message => field = Some(0),
+         Insn::Bl { .. } => {
+            match (key_len.take(), field.take()) {
+               (Some(2), Some(offset)) if id.is_none() => id = Some(offset),
+               (Some(10), Some(offset)) if channel_id.is_none() => channel_id = Some(offset),
+               _ => {},
+            }
+            if id.is_some() && channel_id.is_some() {
+               break;
+            }
+         },
+         _ => {},
+      }
+   }
+   Some((id?, channel_id?))
+}
+
+/// The real functions `func` calls, stubs resolved.
+fn real_callees(image: &Image<'_>, func: usize) -> std::collections::HashSet<usize> {
+   let end = image.function_bounds(func).map_or(func, |(_, end)| end);
+   flattened_at(image, func)
+      .into_iter()
+      .filter_map(|(_, insn)| {
+         match insn {
+            Insn::Bl { target } => Some(target),
+            Insn::B { target } if !(func..end).contains(&target) => Some(target),
+            _ => None,
+         }
+      })
+      .filter(|&target| image.is_function(target))
+      .collect()
+}
+
+/// Whether `code` takes a lock: an exclusive or compare-and-swap load.
+fn takes_lock(code: &[u8]) -> bool {
+   code.as_chunks::<4>().0.iter().any(|word| {
+      let word = u32::from_le_bytes(*word);
+      // `ldaxr`/`ldxr`, and `cas`/`casa`/`casal`/`casl` (32 and 64 bits).
+      word & 0xBFFF_7C00 == 0x885F_7C00 || word & 0xBFA0_7C00 == 0x88A0_7C00
+   })
+}
+
+/// [`crate::desktop::optimistic_delete`] for arm64.
+///
+/// `Store::delete_message`, the client's own delete, shares the map and index
+/// deletes with the `MESSAGE_DELETE` handler and takes the store's lock.
+/// Calls are compared after resolving outlined stubs.
+pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usize> {
+   use std::collections::{
+      HashMap,
+      HashSet,
+   };
+   let (handler, _) = image
+      .function_bounds(message_delete)
+      .ok_or("MESSAGE_DELETE handler has no bounds")?;
+   let shared_with = real_callees(image, handler);
+   // Each of the handler's callees' callers, through stubs too.
+   let mut stubs: HashMap<usize, Option<usize>> = HashMap::new();
+   let mut parents: HashMap<usize, HashSet<usize>> = HashMap::new();
+   for segment in image.segments.iter().filter(|segment| segment.executable) {
+      for (index, word) in segment.bytes.as_chunks::<4>().0.iter().enumerate() {
+         let word = u32::from_le_bytes(*word);
+         if word & 0x7C00_0000 != 0x1400_0000 {
+            continue;
+         }
+         let pc = segment.addr + index * 4;
+         let (Insn::Bl { target } | Insn::B { target }) = arm64::decode(word, pc) else {
+            continue;
+         };
+         let real = if shared_with.contains(&target) {
+            Some(target)
+         } else {
+            *stubs.entry(target).or_insert_with(|| {
+               stub(image, target)
+                  .and_then(|(_, tail)| tail)
+                  .filter(|tail| shared_with.contains(tail))
+            })
+         };
+         if let Some(real) = real
+            && let Some((parent, _)) = image.function_bounds(pc)
+            && parent != real
+         {
+            parents.entry(real).or_default().insert(parent);
+         }
+      }
+   }
+   let mut candidates: Vec<usize> = parents
+      .values()
+      .filter(|parents| parents.len() == 2 && parents.contains(&handler))
+      .filter_map(|parents| parents.iter().copied().find(|&parent| parent != handler))
+      .collect();
+   candidates.sort_unstable();
+   candidates.dedup();
+   let found: Vec<usize> = candidates
+      .iter()
+      .copied()
+      .filter(|&other| {
+         let callees = real_callees(image, other);
+         let shared = callees.intersection(&shared_with).count();
+         let head = |at: usize| image.read(at, 0x80).is_some_and(takes_lock);
+         let locks = head(other) || first_call(image, other).is_some_and(head);
+         shared >= 4 && locks
+      })
+      .collect();
+   match found.as_slice() {
+      &[only] => Ok(only),
+      _ => {
+         Err(format!(
+            "optimistic delete matched {found:x?} among {candidates:x?} ({} callees)",
+            shared_with.len()
+         ))
+      },
+   }
+}
+
+/// `build_message_body`, which `MessageRow::render` calls once per row, and
+/// where its config (`x1`) keeps the row's text colors.
+#[derive(Clone, Copy, Debug)]
+pub struct MessageBody {
+   pub func:        usize,
+   pub row_colors:  usize,
+   /// Every color offset the builder loads, to check another one against.
+   pub colors:      [usize; 16],
+   pub color_count: usize,
+}
+
+/// [`crate::desktop::message_body`] for arm64.
+///
+/// The function `render_row` calls that loads the `message-edited-` template
+/// (refs point at its length byte). It picks a state's colors from three `mov
+/// wN, #a/#a+4/#a+8` offsets into the config, and passes the colors themselves
+/// on as `add xR, config, #row_colors`; the colors sit just before every
+/// triple.
+pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> {
+   let anchor = one(
+      "message-edited template",
+      &image.find_bytes(b"\x0fmessage-edited-\xc0\x00"),
+   )?;
+   let called: std::collections::HashSet<usize> = flattened_at(image, render_row)
+      .into_iter()
+      .filter_map(|(_, insn)| {
+         match insn {
+            Insn::Bl { target } => Some(target),
+            _ => None,
+         }
+      })
+      .collect();
+   let mut found: Vec<usize> = arm64::code_refs(image, anchor..anchor + 1)
+      .into_iter()
+      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+      .filter(|func| called.contains(func))
+      .collect();
+   found.sort_unstable();
+   found.dedup();
+   let func = one("message body builder", &found)?;
+   let code = flattened_at(image, func);
+   let config = code.iter().take(24).find_map(|&(_, insn)| {
+      match insn {
+         Insn::MovReg {
+            rd,
+            rm: 1,
+            wide: true,
+         } => Some(rd),
+         _ => None,
+      }
+   });
+   let config = config.ok_or("message body builder keeps no copy of its config")?;
+   let movs: Vec<usize> = code
+      .iter()
+      .filter_map(|&(_, insn)| {
+         match insn {
+            Insn::MovZ {
+               imm, wide: false, ..
+            } => usize::try_from(imm).ok(),
+            _ => None,
+         }
+      })
+      .collect();
+   let triples: std::collections::HashSet<usize> = movs
+      .windows(3)
+      .filter_map(|w| {
+         let (low, mid, high) = (w[0].min(w[2]), w[1], w[0].max(w[2]));
+         (mid == low + 4 && high == low + 8 && low >= 4).then_some(low - 4)
+      })
+      .collect();
+   let passed: Vec<usize> = code
+      .iter()
+      .filter_map(|&(_, insn)| {
+         match insn {
+            Insn::AddImm { rn, imm, .. } if rn == config && triples.contains(&imm) => Some(imm),
+            _ => None,
+         }
+      })
+      .collect();
+   let row_colors = most_common(passed, 1).ok_or("message body row colors not found")?;
+   let mut colors = [0; 16];
+   let mut color_count = 0;
+   for &start in &triples {
+      for offset in [start + 4, start + 8, start + 12] {
+         if color_count < colors.len() {
+            colors[color_count] = offset;
+            color_count += 1;
+         }
+      }
+   }
+   Ok(MessageBody {
+      func,
+      row_colors,
+      colors,
+      color_count,
+   })
+}
+
+/// `__rust_alloc(size, align)` and `__rust_dealloc(ptr, size, align)`, which
+/// a response body that grows is reallocated with.
+///
+/// `alloc_or_oom(align, size)` swaps its arguments into `__rust_alloc`, its
+/// first real call. Discord's allocator counts live bytes, so the next
+/// function, `__rust_dealloc`, subtracts the size: `neg xN, xS; ldadd xN`.
+pub fn host_allocator(image: &Image<'_>, alloc_or_oom: usize) -> Found<(usize, usize)> {
+   let alloc = flattened_at(image, alloc_or_oom)
+      .into_iter()
+      .find_map(|(_, insn)| {
+         match insn {
+            Insn::Bl { target } if image.is_function(target) => Some(target),
+            _ => None,
+         }
+      })
+      .ok_or("alloc_or_oom calls no allocator")?;
+   let (_, end) = image
+      .function_bounds(alloc)
+      .ok_or("__rust_alloc has no bounds")?;
+   let (dealloc, dealloc_end) = image
+      .function_bounds(end)
+      .ok_or("nothing follows __rust_alloc")?;
+   let code = image
+      .read(dealloc, dealloc_end - dealloc)
+      .ok_or("__rust_dealloc is unmapped")?;
+   let words: Vec<u32> = code
+      .as_chunks::<4>()
+      .0
+      .iter()
+      .map(|word| u32::from_le_bytes(*word))
+      .collect();
+   let negates = words.iter().any(|&word| word & 0xFFE0_FFE0 == 0xCB00_03E0);
+   let counts = words.iter().any(|&word| word & 0xFF20_FC00 == 0xF820_0000);
+   if dealloc != end || !negates || !counts {
+      return Err(format!(
+         "no __rust_dealloc after __rust_alloc {alloc:#x} (next {dealloc:#x})"
+      ));
+   }
+   Ok((alloc, dealloc))
 }

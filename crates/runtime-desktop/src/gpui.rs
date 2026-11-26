@@ -643,6 +643,11 @@ fn chain(f: DivMutFn, mut div: RawDiv) -> RawDiv {
    out
 }
 
+/// Discord's `alloc_or_oom`, once the builders are located.
+pub fn alloc_or_oom_addr() -> Option<usize> {
+   SYMBOLS.get().map(|sym| sym.alloc_or_oom as usize)
+}
+
 /// The `GpuiLayout` decoded from this `Discord.exe`.
 pub fn layout() -> Option<&'static GpuiLayout> {
    SYMBOLS.get().map(|sym| &sym.layout)
