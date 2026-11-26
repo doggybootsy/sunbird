@@ -1,5 +1,5 @@
 // @description Sends custom and animated emojis as links, and renders fake emojis, stickers, and GIFs as real ones
-// @version 0.3.0
+// @version 0.4.0
 // @author mantikafasi
 
 const { gateway } = phoenix;
@@ -53,6 +53,12 @@ const settings = phoenix.settings.define({
     description: "Also render fake emojis, stickers, and GIFs in your own messages",
     default: false,
   },
+  forceFake: {
+    type: "switch",
+    title: "Always spoof emojis",
+    description: "Send external and animated emojis as links even when you have Nitro (useful when external emojis are blocked)",
+    default: false,
+  },
 });
 
 interface Emoji {
@@ -79,8 +85,9 @@ const picked = new Map<string, Emoji>();
 // MESSAGE_UPDATE frames drop their fake embeds too.
 const transformed = new Map<string, Set<string>>();
 const TRANSFORMED_LIMIT = 2048;
-// The real tier and user id, before any spoofing. Unknown until the app's first API request.
-let premiumType = 0;
+// The real tier and user id, before any spoofing, from the app's cache. Null until
+// the account has synced there once.
+let premiumType: number | null = null;
 let currentUserId: string | null = null;
 
 const addEmojis = (guild: string, list: Phoenix.Emoji[] | undefined) => {
@@ -111,17 +118,23 @@ const load = async () => {
     if (e) addEmojis(unpad(g), JSON.parse(e));
     if (s) addStickers(JSON.parse(s));
   }
-  // One row per guild keeps this under the 10000-row limit.
-  const channels = await phoenix.stores.sql<{ g: string; c: string }>(
-    "SELECT substr(k, 1, 20) AS g, group_concat(substr(k, 22)) AS c FROM channel_stubs" +
-      " WHERE k NOT LIKE '00000000000000000000:%' GROUP BY 1",
-  );
-  for (const { g, c } of channels) for (const id of c.split(",")) channelGuild.set(unpad(id), unpad(g));
+  // `guild:channel` keys: Android keeps them in `channel_stubs`, Desktop in
+  // `channels`. One row per guild keeps this under the 10000-row limit.
+  for (const table of ["channel_stubs", "channels"]) {
+    const channels = await phoenix.stores
+      .sql<{ g: string; c: string }>(
+        `SELECT substr(k, 1, 20) AS g, group_concat(substr(k, 22)) AS c FROM ${table}` +
+          " WHERE k NOT LIKE '00000000000000000000:%' GROUP BY 1",
+      )
+      .catch(() => []);
+    for (const { g, c } of channels) for (const id of c.split(",")) channelGuild.set(unpad(id), unpad(g));
+  }
   phoenix.log.info(
     `${emojis.size} emojis, ${stickers.size} stickers in ${guilds.length} servers, ${channelGuild.size} channels`,
   );
 };
-load().catch((err) => phoenix.log.warn(`reading the cache: ${err}`));
+const reload = () => load().catch((err) => phoenix.log.warn(`reading the cache: ${err}`));
+reload();
 
 if (gateway.guildCreate) {
   phoenix.on(gateway.guildCreate, (guild) => {
@@ -144,17 +157,32 @@ const readTier = () =>
   phoenix.discord
     .me()
     .then((user) => {
-      premiumType = user?.premium_type ?? 0;
-      currentUserId = user?.id ?? null;
+      if (!user) return;
+      premiumType = user.premium_type ?? 0;
+      // Desktop switches accounts without reloading plugins.
+      if (currentUserId !== null && currentUserId !== user.id) {
+        for (const map of [emojis, byName, stickers, channelGuild, picked] as Map<string, unknown>[]) map.clear();
+        reload();
+      }
+      currentUserId = user.id;
     })
     .catch((err) => phoenix.log.warn(`reading the account: ${err}`));
 readTier();
-if (gateway.readySupplemental) phoenix.on(gateway.readySupplemental, readTier);
+// A first login fills the cache by now.
+// ponytail: a tier bought or lost mid-session shows on the next sync.
+if (gateway.readySupplemental) {
+  phoenix.on(gateway.readySupplemental, () => {
+    readTier();
+    reload();
+  });
+}
 
 // What Discord lets a non-Nitro user send: the server's own static emojis.
-// With Nitro, anything (external emoji permission is not checked).
+// With Nitro, anything (external emoji permission is not checked). While the
+// tier is unknown, emojis go out untouched rather than as links for Nitro users.
 const usable = (emoji: Emoji, guild: string | undefined) =>
-  emoji.available && (premiumType > 0 || (!emoji.animated && emoji.guild === guild));
+  emoji.available &&
+  ((!settings.forceFake && (premiumType ?? 1) > 0) || (!emoji.animated && emoji.guild === guild));
 
 const link = (emoji: Emoji) => {
   const size = settings.emojiSize;
@@ -164,31 +192,35 @@ const link = (emoji: Emoji) => {
   return `[${settings.hyperLinkText.replaceAll("{{NAME}}", emoji.name)}](${url})`;
 };
 
-// Links need whitespace around them to embed.
-const spaced = (text: string, offset: number, length: number, replacement: string) => {
-  const before = offset > 0 && !/\s/.test(text[offset - 1]) ? " " : "";
-  const after = offset + length < text.length && !/\s/.test(text[offset + length]) ? " " : "";
-  return before + replacement + after;
-};
+const token = (emoji: Emoji) => `<${emoji.animated ? "a" : ""}:${emoji.name}:${emoji.id}>`;
 
-// Rewrites `<a:name:id>` tokens and `:name:` shortcodes the sender can't use.
+// Rewrites `<a:name:id>` tokens the sender can't use into links, and `:name:`
+// shortcodes into the emoji or its link: Desktop posts what the message box
+// holds, and Discord leaves a shortcode as text. Links need whitespace around
+// them to embed, one space between adjacent ones.
 // ponytail: a `:name:` shared by several servers picks the first one we saw
 // when none of them is usable here.
-const rewrite = (text: string, guild: string | undefined) =>
-  text.replace(/(?<!\\)<a?:(\w+):(\d+)>|(?<![\\<]):(\w+):(?!\d)/g, (match, _n, id, name, offset, whole) => {
+const rewrite = (text: string, guild: string | undefined) => {
+  let linked = -1;
+  return text.replace(/(?<!\\)<a?:(\w+):(\d+)>|(?<![\\<]):(\w+):(?!\d)/g, (match, _n, id, name, offset: number, whole: string) => {
     let emoji: Emoji | undefined;
     if (id) {
       emoji = emojis.get(id);
-    } else if (picked.has(name)) {
-      emoji = picked.get(name);
+      if (!emoji || usable(emoji, guild)) return match;
     } else {
-      const found = byName.get(name);
-      if (!found || found.some((e) => usable(e, guild))) return match;
+      const found = picked.has(name) ? [picked.get(name)!] : (byName.get(name) ?? []);
+      const own = found.find((e) => usable(e, guild));
+      if (own) return token(own);
       emoji = found.find((e) => e.available);
+      if (!emoji) return match;
     }
-    if (!emoji || usable(emoji, guild)) return match;
-    return spaced(whole, offset, match.length, link(emoji));
+    const end = offset + match.length;
+    const before = offset > 0 && offset !== linked && !/\s/.test(whole[offset - 1]) ? " " : "";
+    const after = end < whole.length && !/\s/.test(whole[end]) ? " " : "";
+    linked = end;
+    return before + link(emoji) + after;
   });
+};
 
 const guildOf = (ctx: Phoenix.UiContext) => (ctx.channelId ? channelGuild.get(ctx.channelId) : undefined);
 
@@ -202,7 +234,10 @@ phoenix.messages.onEmojiPick((id, ctx) => {
   return `:${emoji.name}: `;
 });
 
+// ponytail: the tier and account are re-read for the next send, so the first
+// send after an account switch still uses the last one's.
 phoenix.messages.onSend((text, ctx) => {
+  readTier();
   if (!text.includes(":")) return;
   const result = rewrite(text, guildOf(ctx));
   return result === text ? undefined : result;
@@ -410,16 +445,21 @@ const worthParsing = (res: Phoenix.InterceptedResponse) =>
   rendering() &&
   (res.body.includes("/emojis/") || res.body.includes("/stickers/") || res.body.includes("]("));
 
-// A message list, the pins' `{ items: [{ message }] }`, or search's `{ messages: [[message]] }`.
-const transformListResponse = (res: Phoenix.InterceptedResponse) => {
+// A single message (POST/PATCH), a message list, the pins' `{ items: [{ message }] }`,
+// or search's `{ messages: [[message]] }`.
+const transformResponse = (res: Phoenix.InterceptedResponse) => {
   if (!worthParsing(res)) return;
   const data = res.json<
-    TransformableMessage[] | { items?: { message?: TransformableMessage }[]; messages?: TransformableMessage[][] }
+    | TransformableMessage
+    | TransformableMessage[]
+    | { items?: { message?: TransformableMessage }[]; messages?: TransformableMessage[][] }
   >();
   if (!data) return;
-  const list = Array.isArray(data)
+  const list: (TransformableMessage | undefined)[] = Array.isArray(data)
     ? data
-    : [...(data.items ?? []).map((entry) => entry?.message), ...(data.messages ?? []).flat()];
+    : "items" in data || "messages" in data
+      ? [...(data.items ?? []).map((entry) => entry?.message), ...(data.messages ?? []).flat()]
+      : [data as TransformableMessage];
   let changed = false;
   for (const message of list) {
     if (transformMessage(message)) changed = true;
@@ -427,11 +467,16 @@ const transformListResponse = (res: Phoenix.InterceptedResponse) => {
   return changed ? { body: data } : undefined;
 };
 
-for (const [pathPrefix, pathSuffix] of [
-  ["/channels/", "/messages"],
-  ["/channels/", "/pins"],
-  ["/channels/", "/messages/search"],
-  ["/guilds/", "/messages/search"],
-]) {
-  phoenix.discord.onResponse({ method: "GET", pathPrefix, pathSuffix }, transformListResponse);
+for (const [method, pathPrefix, pathSuffix] of [
+  ["GET", "/channels/", "/messages"],
+  ["POST", "/channels/", "/messages"],
+  ["GET", "/channels/", "/pins"],
+  ["GET", "/channels/", "/messages/search"],
+  ["GET", "/guilds/", "/messages/search"],
+] as const) {
+  phoenix.discord.onResponse({ method, pathPrefix, pathSuffix }, transformResponse);
 }
+phoenix.discord.onResponse(
+  { method: "PATCH", pathPrefix: "/channels/", pathIncludes: "/messages/" },
+  transformResponse,
+);

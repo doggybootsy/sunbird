@@ -293,6 +293,13 @@ mod windows {
          uninstall(&local, &home);
          return Ok(());
       }
+      let mut no_runtime = false;
+      while args
+         .next_if(|arg| arg == "--no-runtime" || arg == "--gate-only")
+         .is_some()
+      {
+         no_runtime = true;
+      }
       let app = local.join("DiscordPhoenix").join("app");
       let exe = app.join("Discord.exe");
       if !exe.is_file() {
@@ -306,6 +313,12 @@ mod windows {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
       });
+      while args
+         .next_if(|arg| arg == "--no-runtime" || arg == "--gate-only")
+         .is_some()
+      {
+         no_runtime = true;
+      }
       let dll = match explicit {
          Some(path) => PathBuf::from(path),
          None => install(&local, &home)?,
@@ -319,12 +332,18 @@ mod windows {
       if !open.is_empty() {
          let dll_name = dll.file_name().unwrap_or_default();
          let with_sunbird = open.iter().any(|&(_, pid)| has_module(pid, dll_name));
-         let restart = !with_sunbird
-            && ask(
-               "Discord is already running without Sunbird.
-
-Restart it with Sunbird? A call                 you are in will end.",
-            );
+         let restart = if no_runtime {
+            ask(
+               "Discord is already running.\n\nRestart it without the Sunbird plugin runtime? A \
+                call you are in will end.",
+            )
+         } else {
+            !with_sunbird
+               && ask(
+                  "Discord is already running without Sunbird.\n\nRestart it with Sunbird? A call \
+                   you are in will end.",
+               )
+         };
          for &(process, _) in &open {
             if restart {
                // SAFETY: opened with TERMINATE by `running`.
@@ -354,6 +373,11 @@ Restart it with Sunbird? A call                 you are in will end.",
          command.push(arg);
       }
       let mut command = wide(command);
+      if no_runtime {
+         // SAFETY: `phoenix-inject` is single-threaded; `Discord.exe` inherits
+         // the flag and opens only the access gate without starting Sunbird.
+         unsafe { env::set_var("SUNBIRD_GATE_ONLY", "1") };
+      }
 
       // STARTUPINFOW is 104 bytes on x64 and only `cb` must be set.
       let mut startup = [0u64; 13];

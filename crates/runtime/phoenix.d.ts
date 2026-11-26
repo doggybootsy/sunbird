@@ -1126,7 +1126,8 @@ declare namespace Phoenix {
     /// what Phoenix would do (insert it, or show a Nitro ad for a locked one), or nothing to leave
     /// the press to Phoenix. While a handler exists, Phoenix counts emojis that need Nitro as
     /// usable in the message box, so its picker and autocomplete show them without a lock.
-    /// Reactions and the rest keep the lock, and nothing else about Nitro changes.
+    /// Reactions and the rest keep the lock, and nothing else about Nitro changes. Desktop has no
+    /// picker presses to report: the handler is never called there, only the unlock applies.
     onEmojiPick(handler: (emojiId: string, ctx: UiContext) => string | void): Remover;
   }
 

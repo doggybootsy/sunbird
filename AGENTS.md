@@ -329,6 +329,8 @@ byte pattern says nothing about arm32.
 - `Image` gained `function_starts`. Every constructor needs it, Windows' included: cross-check
   with `cargo clippy --target x86_64-pc-windows-gnu -p phoenix-hook -p phoenix-sigs`, which
   needs no C toolchain.
+- Launcher options. `sunbird-macos.sh --no-runtime` (or `--gate-only`, at install or on the
+  launcher) adds `SUNBIRD_GATE_ONLY=1`, as on Linux: only the access gate opens.
 - GPUI builders. `macos::gpui` reads the same two call sites as x86 (the Developer Mode row,
   the `TesterUpdates` button and its `ActionRow`), but by role: in a stub-flattened stream
   (`sigscan <bin> flat <from> <to>` prints one) it keeps only calls that return through a stack
@@ -374,6 +376,7 @@ byte pattern says nothing about arm32.
   hooks but `start` never logs and the window shows the access gate; through Launch Services it
   starts normally. Under lldb, the debugger's `MallocNanoZone=0` makes the first image claim, so
   the re-exec runs without Sunbird.
-- Still x86-only: badges, message JSON, optimistic delete and the message body recolor. `X86_CODE` in `runtime-desktop` keeps them from
+- Still x86-only: badges, message JSON, optimistic delete, the message body recolor and the
+  Nitro emoji unlock (`emoji.rs`). `X86_CODE` in `runtime-desktop` keeps them from
   running on arm64. Handlers keep the desktop result ABI: 96 bytes, `Ok` is `u64::MAX - 1`,
   returned through `x8`.

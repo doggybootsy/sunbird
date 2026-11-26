@@ -332,6 +332,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          );
          report("media fetch", desktop::media_fetch(image).map(at));
          report(
+            "emoji check",
+            desktop::emoji_check(image).and_then(|check| {
+               prologues
+                  .emoji_check
+                  .at(image, check.func)
+                  .then(|| format!("{} (intention +{:#x})", at(check.func), check.intention))
+                  .ok_or_else(|| "prologue changed".to_owned())
+            }),
+         );
+         report(
             "message json",
             desktop::message_json(image).map(|found| {
                format!(

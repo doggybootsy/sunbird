@@ -463,7 +463,7 @@ unsafe extern "C" fn button_callback(
          },
          Action::ReloadAll => phoenix_runtime::reload_all(),
          Action::OpenDevTools => phoenix_ui_desktop::open_devtools(),
-         Action::CheckUpdates => update::check(),
+         Action::CheckUpdates => update::check_now(),
          Action::ApplyUpdates => update::apply(),
          Action::RefreshCatalog => update::fetch_catalog(),
          Action::ReloadPlugin(name) => phoenix_runtime::reload(&name),
@@ -786,11 +786,26 @@ impl Builder {
          s.lengths(&s.at.border_widths, gpui_px(1.0));
          s.lengths(&s.at.corner_radii, gpui_px(radius_px));
          s.lengths(&s.at.padding, gpui_px(pad_px));
-         // Neutral translucent border that adapts across dark, ash, midnight,
-         // and light themes.
          s.hsla(s.at.border_color, [0.62, 0.05, 0.55, border_alpha]);
       });
       d
+   }
+
+   /// Compact tinted tag matching Mana's 6px button geometry for non-confirmed
+   /// desktop plugins, when `str_into_any` and `div_push_any` are available.
+   fn compat_badge(&self, compat: DesktopCompat) -> Option<RawDiv> {
+      let label = compat.tag()?;
+      let (bg, text) = compat.colors()?;
+      let mut badge = self.text_line(label, text, 12.0)?;
+      self.style_div(&mut badge, |s| {
+         s.solid_background(bg);
+         s.lengths(&s.at.corner_radii, gpui_px(6.0));
+         s.length(s.at.padding[0], gpui_px(4.0));
+         s.length(s.at.padding[1], gpui_px(10.0));
+         s.length(s.at.padding[2], gpui_px(4.0));
+         s.length(s.at.padding[3], gpui_px(10.0));
+      });
+      Some(badge)
    }
 
    /// Subtle 1px horizontal divider line between sections or rows.
@@ -1231,7 +1246,9 @@ const DESKTOP_FULL: &[&str] = &[
    "message-latency",
    "message-logger",
    "no-profile-themes",
+   "no-reply-mention",
    "spoiler-mode",
+   "text-replace",
    "view-raw",
    "global-badges",
    "dearrow",
@@ -1241,6 +1258,52 @@ const DESKTOP_FULL: &[&str] = &[
 ];
 
 const DESKTOP_PARTIAL: &[&str] = &["fakenitro"];
+
+const MOBILE_ONLY: &[&str] = &["hide-composer-buttons", "reviewdb", "taptap", "example"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DesktopCompat {
+   Full,
+   Partial,
+   MobileOnly,
+   Unverified,
+}
+
+impl DesktopCompat {
+   fn of(name: &str) -> Self {
+      if DESKTOP_FULL.contains(&name) {
+         Self::Full
+      } else if DESKTOP_PARTIAL.contains(&name) {
+         Self::Partial
+      } else if MOBILE_ONLY.contains(&name) {
+         Self::MobileOnly
+      } else {
+         Self::Unverified
+      }
+   }
+
+   const fn tag(self) -> Option<&'static str> {
+      match self {
+         Self::Full => None,
+         Self::Partial => Some("Partial Desktop"),
+         Self::MobileOnly => Some("Mobile Only"),
+         Self::Unverified => Some("Unverified"),
+      }
+   }
+
+   /// `(background, text)` HSLA colors for non-full compat badges.
+   const fn colors(self) -> Option<([f32; 4], [f32; 4])> {
+      match self {
+         Self::Full => None,
+         // Warm amber
+         Self::Partial => Some(([0.10, 0.85, 0.52, 0.14], [0.11, 0.92, 0.72, 1.0])),
+         // Soft violet/purple — distinct from neutral buttons and red Remove
+         Self::MobileOnly => Some(([0.76, 0.72, 0.62, 0.18], [0.76, 0.86, 0.82, 1.0])),
+         // Soft sky blue
+         Self::Unverified => Some(([0.58, 0.78, 0.60, 0.14], [0.58, 0.88, 0.80, 1.0])),
+      }
+   }
+}
 
 /// Renders the categorized native Sunbird Settings page into `sret`.
 pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
@@ -1448,18 +1511,37 @@ fn render_plugins_tab(
    let mut list = b.v_stack(10.0);
    for plugin in filtered {
       let is_open = expanded.contains(&plugin.name);
+      let compat = DesktopCompat::of(&plugin.name);
+      let badge = b.compat_badge(compat);
       let mut card = b.card(10.0, 14.0, 8.0, if plugin.enabled { 0.22 } else { 0.14 });
 
-      let title = plugin.header.version.as_ref().map_or_else(
+      let mut title = plugin.header.version.as_ref().map_or_else(
          || plugin.name.clone(),
          |ver| format!("{}  v{ver}", plugin.name),
       );
+      if badge.is_none()
+         && let Some(tag) = compat.tag()
+      {
+         title.push_str("  [");
+         title.push_str(tag);
+         title.push(']');
+      }
       let mut desc_parts = Vec::new();
       if let Some(d) = &plugin.header.description {
          desc_parts.push(d.clone());
       }
       if let Some(a) = &plugin.header.author {
          desc_parts.push(format!("by {a}"));
+      }
+      if badge.is_none() {
+         match compat {
+            DesktopCompat::Full => {},
+            DesktopCompat::Partial => desc_parts.push("Partial desktop support".to_owned()),
+            DesktopCompat::MobileOnly => {
+               desc_parts.push("Targets mobile UI; may not work on desktop".to_owned());
+            },
+            DesktopCompat::Unverified => desc_parts.push("Unverified on desktop".to_owned()),
+         }
       }
       if let Some(err) = &plugin.error {
          desc_parts.push(format!("Error: {err}"));
@@ -1478,15 +1560,15 @@ fn render_plugins_tab(
       );
 
       let has_settings = plugin.enabled && !plugin.settings.is_empty();
-      let mut actions = b.h_row(8.0, false);
+      let mut buttons = b.h_row(8.0, false);
       if has_settings {
          let lbl = if is_open {
             format!("▾ Hide Settings ({})", plugin.settings.len())
          } else {
             format!("▸ Settings ({})", plugin.settings.len())
          };
-         actions = b.push_button(
-            actions,
+         buttons = b.push_button(
+            buttons,
             &format!("sunbird-expand-{}", plugin.name),
             &lbl,
             if is_open {
@@ -1498,8 +1580,8 @@ fn render_plugins_tab(
             Action::ToggleExpandPlugin(plugin.name.clone()),
          );
       }
-      actions = b.push_button(
-         actions,
+      buttons = b.push_button(
+         buttons,
          &format!("sunbird-edit-{}", plugin.name),
          "Edit Code",
          BtnVariant::Secondary,
@@ -1507,8 +1589,8 @@ fn render_plugins_tab(
          Action::EditPluginCode(plugin.name.clone()),
       );
       if plugin.enabled && plugin.installed {
-         actions = b.push_button(
-            actions,
+         buttons = b.push_button(
+            buttons,
             &format!("sunbird-reload-{}", plugin.name),
             "Reload",
             BtnVariant::Secondary,
@@ -1517,8 +1599,8 @@ fn render_plugins_tab(
          );
       }
       if !plugin.enabled && plugin.installed {
-         actions = b.push_button(
-            actions,
+         buttons = b.push_button(
+            buttons,
             &format!("sunbird-remove-{}", plugin.name),
             "Remove",
             BtnVariant::Critical,
@@ -1526,7 +1608,14 @@ fn render_plugins_tab(
             Action::UninstallPlugin(plugin.name.clone()),
          );
       }
-      card = b.push_div(card, actions);
+      let footer = if let Some(badge_div) = badge {
+         let mut row = b.h_row(8.0, true);
+         row = b.push_div(row, buttons);
+         b.push_div(row, badge_div)
+      } else {
+         buttons
+      };
+      card = b.push_div(card, footer);
 
       // Collapsible per-plugin settings dropdown drawer
       if has_settings && is_open {
@@ -1716,11 +1805,12 @@ fn render_catalog_group(
       let mut list = b.v_stack(8.0);
       for item in items {
          let is_installed = installed.contains(&item.name);
+         let compat = DesktopCompat::of(&item.name);
          let sub = match &item.warning {
             Some(w) if !w.is_empty() => format!("{} · Note: {w}", item.description),
             _ => item.description.clone(),
          };
-         let mut row_card = b.card(6.0, 12.0, 6.0, 0.14);
+         let mut row_card = b.card(8.0, 12.0, 6.0, 0.14);
          row_card = b.push_div(
             row_card,
             b.action_row(
@@ -1737,6 +1827,10 @@ fn render_catalog_group(
                Action::InstallCatalog(item.name.clone()),
             ),
          );
+         if let Some(badge) = b.compat_badge(compat) {
+            let tag_row = b.push_div(b.h_row(6.0, false), badge);
+            row_card = b.push_div(row_card, tag_row);
+         }
          list = b.push_div(list, row_card);
       }
       section = b.push_div(section, list);
@@ -1814,17 +1908,19 @@ fn render_catalog_tab(
       Catalog::Loaded(items) => {
          let desktop: Vec<&Listed> = items
             .iter()
-            .filter(|i| DESKTOP_FULL.contains(&i.name.as_str()))
+            .filter(|i| DesktopCompat::of(&i.name) == DesktopCompat::Full)
             .collect();
          let partial: Vec<&Listed> = items
             .iter()
-            .filter(|i| DESKTOP_PARTIAL.contains(&i.name.as_str()))
+            .filter(|i| DesktopCompat::of(&i.name) == DesktopCompat::Partial)
             .collect();
-         let mobile: Vec<&Listed> = items
+         let other: Vec<&Listed> = items
             .iter()
             .filter(|i| {
-               !DESKTOP_FULL.contains(&i.name.as_str())
-                  && !DESKTOP_PARTIAL.contains(&i.name.as_str())
+               matches!(
+                  DesktopCompat::of(&i.name),
+                  DesktopCompat::MobileOnly | DesktopCompat::Unverified
+               )
             })
             .collect();
 
@@ -1833,7 +1929,7 @@ fn render_catalog_tab(
             root,
             0,
             "Desktop Ready",
-            "Fully supported on Desktop Phoenix.",
+            "Confirmed working on Desktop Phoenix.",
             &desktop,
             installed,
             desktop_open,
@@ -1843,7 +1939,7 @@ fn render_catalog_tab(
             root,
             1,
             "Partial Desktop Support",
-            "Core hooks work on desktop; some mobile UI badges/accessories are pending.",
+            "Core hooks work on desktop; some features are still pending or unconfirmed.",
             &partial,
             installed,
             partial_open,
@@ -1852,9 +1948,9 @@ fn render_catalog_tab(
             b,
             root,
             2,
-            "Mobile UI Plugins",
-            "Primarily target Android Phoenix's UI tree.",
-            &mobile,
+            "Mobile Only & Unverified",
+            "Targets Android Phoenix's UI tree or has not been confirmed on desktop yet.",
+            &other,
             installed,
             mobile_open,
          );
@@ -1905,32 +2001,7 @@ fn render_general_tab(b: &Builder, mut root: RawDiv) -> RawDiv {
    root = b.push_div(root, dev_card);
 
    // Card 2: Updates
-   let upd_status = update::status();
-   let upd_found = update::found();
-   let (upd_desc, upd_btn, upd_var, upd_act) = if update::busy() {
-      (
-         upd_status.unwrap_or_else(|| "Checking for updates...".to_owned()),
-         "Working...",
-         BtnVariant::Secondary,
-         Action::CheckUpdates,
-      )
-   } else if let Some(found) = upd_found
-      && !found.plugins.is_empty()
-   {
-      (
-         format!("Plugin updates ready: {}", found.plugins.join(", ")),
-         "Apply Updates",
-         BtnVariant::Primary,
-         Action::ApplyUpdates,
-      )
-   } else {
-      (
-         upd_status.unwrap_or_else(|| format!("Sunbird {} is up to date.", update::VERSION)),
-         "Check for Updates",
-         BtnVariant::Secondary,
-         Action::CheckUpdates,
-      )
-   };
+   let (upd_desc, upd_btn, upd_var, upd_act) = updates_card_state();
 
    let mut upd_card = b.card(10.0, 16.0, 8.0, 0.20);
    upd_card = b.push_div(
@@ -1946,4 +2017,49 @@ fn render_general_tab(b: &Builder, mut root: RawDiv) -> RawDiv {
       ),
    );
    b.push_div(root, upd_card)
+}
+
+fn updates_card_state() -> (String, &'static str, BtnVariant, Action) {
+   let status = update::status();
+   if update::busy() {
+      return (
+         status.unwrap_or_else(|| "Checking for updates...".to_owned()),
+         "Working...",
+         BtnVariant::Secondary,
+         Action::CheckUpdates,
+      );
+   }
+   if let Some(found) = update::found() {
+      if !found.plugins.is_empty() {
+         let desc = match &found.loader {
+            Some(version) => {
+               format!(
+                  "Plugin updates ready: {} · Sunbird {version} available (restart to update)",
+                  found.plugins.join(", ")
+               )
+            },
+            None => format!("Plugin updates ready: {}", found.plugins.join(", ")),
+         };
+         return (
+            desc,
+            "Apply Updates",
+            BtnVariant::Primary,
+            Action::ApplyUpdates,
+         );
+      }
+      if let Some(version) = found.loader {
+         return (
+            format!("Sunbird {version} is available — restart Sunbird to update."),
+            "Check for Updates",
+            BtnVariant::Secondary,
+            Action::CheckUpdates,
+         );
+      }
+   }
+   (
+      status.unwrap_or_else(|| format!("Sunbird {} is up to date.", update::VERSION)),
+      "Check for Updates",
+      BtnVariant::Secondary,
+      Action::CheckUpdates,
+   )
 }

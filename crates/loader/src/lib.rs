@@ -213,7 +213,10 @@ fn home() -> PathBuf {
             String::from_utf8(name).ok()
          })
          .map_or_default(|name| name.split(':').next().unwrap_or_default().to_owned());
-      PathBuf::from(format!("/data/data/{package}/files/phoenix"))
+      // SAFETY: `getuid` has no preconditions.
+      let user = unsafe { libc::getuid() } / 100_000;
+      let lib_path = unix::library_path().and_then(|path| path.to_str().ok());
+      android_files_dir(&package, user, lib_path).join("phoenix")
    }
    #[cfg(windows)]
    {
@@ -571,5 +574,86 @@ fn logging() {
 
    if log::set_logger(&Tee(Stderr)).is_ok() {
       log::set_max_level(log::LevelFilter::Info);
+   }
+}
+
+/// Resolves Android's app `files` directory before `Application` exists:
+/// adopted SD card (`/mnt/expand/<uuid>/user/<uid>/<pkg>/files`, taken from
+/// this library's own path because `/mnt/expand` is not listable), then
+/// secondary-user `/data/user/<uid>/<pkg>/files`, falling back to
+/// `/data/data/<pkg>/files`.
+#[cfg(all(
+   unix,
+   not(any(target_os = "ios", target_os = "macos", target_os = "linux"))
+))]
+fn android_files_dir(package: &str, user: u32, lib_path: Option<&str>) -> PathBuf {
+   android_files_dir_with(package, user, lib_path, std::path::Path::is_dir)
+}
+
+#[cfg(any(
+   test,
+   all(
+      unix,
+      not(any(target_os = "ios", target_os = "macos", target_os = "linux"))
+   )
+))]
+fn android_files_dir_with(
+   package: &str,
+   user: u32,
+   lib_path: Option<&str>,
+   is_dir: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+   if let Some(uuid) = lib_path
+      .and_then(|path| path.strip_prefix("/mnt/expand/"))
+      .and_then(|rest| rest.split('/').next())
+      .filter(|uuid| !uuid.is_empty() && *uuid != "." && *uuid != "..")
+   {
+      let data = PathBuf::from(format!("/mnt/expand/{uuid}/user/{user}/{package}"));
+      if is_dir(&data) {
+         return data.join("files");
+      }
+   }
+   if user != 0 {
+      let data = PathBuf::from(format!("/data/user/{user}/{package}"));
+      if is_dir(&data) {
+         return data.join("files");
+      }
+   }
+   PathBuf::from(format!("/data/data/{package}/files"))
+}
+
+#[cfg(test)]
+mod tests {
+   use std::path::{
+      Path,
+      PathBuf,
+   };
+
+   use super::android_files_dir_with;
+
+   #[test]
+   fn resolves_adopted_sd_card_and_work_profile_paths() {
+      let sd_lib = Some("/mnt/expand/abc-123/app/~~hash/com.discord.phoenix-1/lib/arm64/libplm.so");
+      let sd = android_files_dir_with("com.discord.phoenix", 0, sd_lib, |path| {
+         path == Path::new("/mnt/expand/abc-123/user/0/com.discord.phoenix")
+      });
+      assert_eq!(
+         sd,
+         PathBuf::from("/mnt/expand/abc-123/user/0/com.discord.phoenix/files")
+      );
+
+      let work = android_files_dir_with("com.discord.phoenix", 10, None, |path| {
+         path == Path::new("/data/user/10/com.discord.phoenix")
+      });
+      assert_eq!(
+         work,
+         PathBuf::from("/data/user/10/com.discord.phoenix/files")
+      );
+
+      let internal = android_files_dir_with("com.discord.phoenix", 0, None, |_| false);
+      assert_eq!(
+         internal,
+         PathBuf::from("/data/data/com.discord.phoenix/files")
+      );
    }
 }

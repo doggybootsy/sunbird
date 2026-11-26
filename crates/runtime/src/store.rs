@@ -104,9 +104,19 @@ pub enum StoreError {
    Backend(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// The cache of the account Phoenix wrote to last.
+/// The cache of the account Phoenix shows.
+///
+/// Desktop keeps every signed-in account syncing, so the newest write can be
+/// any of them: it names the one in front in `device_prefs.json`. Otherwise,
+/// the account written to last.
 pub fn database(files: &Path) -> Result<PathBuf, StoreError> {
    let dir = files.join("store");
+   if let Some(path) = main_account(files)
+      .map(|id| dir.join(id).join("cache.sqlite"))
+      .filter(|path| path.is_file())
+   {
+      return Ok(path);
+   }
    fs::read_dir(&dir)
       .into_iter()
       .flatten()
@@ -116,6 +126,21 @@ pub fn database(files: &Path) -> Result<PathBuf, StoreError> {
       .max()
       .map(|(_, path)| path)
       .ok_or(StoreError::Missing { dir })
+}
+
+/// Desktop's `desktop.main_account`, the account switched to last.
+fn main_account(files: &Path) -> Option<String> {
+   #[derive(serde::Deserialize)]
+   struct Prefs {
+      #[serde(rename = "desktop.main_account")]
+      main_account: Option<String>,
+   }
+   let prefs: Prefs =
+      serde_json::from_slice(&fs::read(files.join("device_prefs.json")).ok()?).ok()?;
+   // An id, never a path.
+   prefs
+      .main_account
+      .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// The JSON in row `key` of Phoenix's `meta` table, like `me` or `selected`.
@@ -201,5 +226,47 @@ impl From<rusqlite::Error> for StoreError {
       Self::Sql {
          message: err.to_string(),
       }
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use std::time::{
+      Duration,
+      SystemTime,
+   };
+
+   use super::*;
+
+   #[test]
+   fn database_prefers_the_main_account() {
+      let files = std::env::temp_dir().join(format!("phoenix-store-{}", std::process::id()));
+      let _ = fs::remove_dir_all(&files);
+      let cache = |id: &str, age: u64| {
+         let dir = files.join("store").join(id);
+         fs::create_dir_all(&dir).unwrap();
+         let file = fs::File::create(dir.join("cache.sqlite")).unwrap();
+         file
+            .set_modified(SystemTime::now() - Duration::from_secs(age))
+            .unwrap();
+         dir.join("cache.sqlite")
+      };
+      let front = cache("1", 60);
+      let newest = cache("2", 0);
+      assert_eq!(database(&files).unwrap(), newest);
+      let prefs = |main: &str| {
+         fs::write(
+            files.join("device_prefs.json"),
+            format!(r#"{{"desktop.main_account":"{main}","other":1}}"#),
+         )
+         .unwrap();
+      };
+      prefs("1");
+      assert_eq!(database(&files).unwrap(), front);
+      for unusable in ["3", "../2", ""] {
+         prefs(unusable);
+         assert_eq!(database(&files).unwrap(), newest);
+      }
+      fs::remove_dir_all(&files).unwrap();
    }
 }

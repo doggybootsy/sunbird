@@ -5,6 +5,7 @@
 #
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- /path/to/Discord.AppImage
+#   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- --no-runtime
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- --uninstall
 #
 # SUNBIRD_SITE points it at a local server for testing.
@@ -20,6 +21,12 @@ if [ "${1:-}" = --uninstall ]; then
    echo "Sunbird is uninstalled. Discord itself was not changed."
    exit 0
 fi
+
+no_runtime=
+while [ "${1:-}" = --no-runtime ] || [ "${1:-}" = --gate-only ]; do
+   no_runtime=1
+   shift
+done
 
 # What the site serves is loaded into Discord, so only https, or plain http to
 # this machine for testing.
@@ -95,6 +102,10 @@ if [ -n "\$version" ] && [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)"
    fi
 fi
 [ "\${1:-}" = --update ] && exit 0
+while [ "\${1:-}" = --no-runtime ] || [ "\${1:-}" = --gate-only ]; do
+   export SUNBIRD_GATE_ONLY=1
+   shift
+done
 # A second Discord hands off to the running one and exits, so one running
 # without Sunbird is restarted with it.
 discord=$(q "$discord")
@@ -121,12 +132,14 @@ exec "\$discord" "\$@"
 EOF
 chmod +x "$home/sunbird"
 
+exec_args=
+[ -n "$no_runtime" ] && exec_args=" --no-runtime"
 cat >"$entry" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Sunbird
 Comment=Discord with Sunbird
-Exec="$home/sunbird" %U
+Exec="$home/sunbird"$exec_args %U
 Icon=discord
 Terminal=false
 Categories=Network;InstantMessaging;

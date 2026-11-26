@@ -155,7 +155,12 @@ fn run_loader_self_update() {
       fail_self_update("Self-update failed: phoenix has not started");
       return;
    };
-   let path = state.files_dir().join(UPDATE_APK);
+   let files = crate::install::files_dir().unwrap_or_else(|| state.files_dir());
+   if let Err(err) = fs::create_dir_all(&files) {
+      fail_self_update(&format!("Self-update failed: {}: {err}", files.display()));
+      return;
+   }
+   let path = files.join(UPDATE_APK);
    if let Err(err) = write_update(&base, &loader, &path) {
       fail_self_update(&format!("Self-update failed: {err}"));
       return;
@@ -200,6 +205,11 @@ fn write_update(base: &str, loader: &patcher::Library, path: &Path) -> Result<()
 /// big as the app.
 pub fn forget_update(files: &Path) {
    let _ = fs::remove_file(files.join(UPDATE_APK));
+   if let Some(real) = crate::install::files_dir()
+      && real != files
+   {
+      let _ = fs::remove_file(real.join(UPDATE_APK));
+   }
 }
 
 fn fail_self_update(message: &str) {

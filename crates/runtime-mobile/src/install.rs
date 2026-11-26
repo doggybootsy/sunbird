@@ -4,7 +4,10 @@
 
 use std::{
    ffi::CString,
-   path::Path,
+   path::{
+      Path,
+      PathBuf,
+   },
    ptr,
 };
 
@@ -42,6 +45,48 @@ const METHOD: Class = class!(java::lang::reflect::Method);
 
 const FLAG_GRANT_READ_URI_PERMISSION: i32 = 0x0000_0001;
 const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+
+/// The app's real `files` directory from `Application.getFilesDir()`, which
+/// matches Android's `FileProvider` `<files-path>` root on both internal
+/// storage and adopted SD cards (`/mnt/expand/<uuid>/user/<uid>/<pkg>/files`).
+pub fn files_dir() -> Option<PathBuf> {
+   let env = jvm::env()?;
+   // SAFETY: `env` is this thread's, and every local ref is popped below.
+   unsafe {
+      if jni!(env, PushLocalFrame, 16) != 0 {
+         return None;
+      }
+      let result = application(env).and_then(|app| {
+         let app_class = jni!(env, GetObjectClass, app);
+         let get_files = method(env, app_class, c"getFilesDir", signature!(() -> FILE))?;
+         let dir = checked(
+            env,
+            jni!(env, CallObjectMethodA, app, get_files, ptr::null()),
+            "no files dir",
+         )?;
+         let file_class = FILE.find(env)?;
+         let get_path = method(
+            env,
+            file_class,
+            c"getAbsolutePath",
+            signature!(() -> STRING),
+         )?;
+         let path = checked(
+            env,
+            jni!(env, CallObjectMethodA, dir, get_path, ptr::null()),
+            "no files dir path",
+         )?;
+         jvm::read_string(env, path)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "empty files dir path".to_owned())
+      });
+      jni!(env, PopLocalFrame, ptr::null_mut());
+      result
+         .inspect_err(|err| log::warn!("install: getFilesDir failed: {err}"))
+         .ok()
+   }
+}
 
 pub fn open(apk: &Path) -> Result<(), String> {
    let env = jvm::env().ok_or("no JNI env")?;

@@ -27,6 +27,7 @@ param(
    [switch]$NoLaunch,
    [switch]$Test,
    [switch]$Desktop,
+   [switch]$NoRuntime,
    [string]$HotReload,
    [string]$Eval,
    [switch]$Logs,
@@ -210,7 +211,10 @@ if ($Desktop) {
             Stop-Process -Force
          Start-Sleep -Milliseconds 500
          $outDir = Join-Path $TargetDir $profileName
-         & (Join-Path $outDir "phoenix-inject.exe") (Join-Path $outDir "phoenix.dll")
+         $injectArgs = @()
+         if ($NoRuntime) { $injectArgs += "--no-runtime" }
+         $injectArgs += (Join-Path $outDir "phoenix.dll")
+         & (Join-Path $outDir "phoenix-inject.exe") @injectArgs
          exit $LASTEXITCODE
       }
    } finally {

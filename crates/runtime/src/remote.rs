@@ -622,7 +622,7 @@ fn dispatch(req: &Request) -> Reply {
       },
       ("GET", "/update") => update_state(),
       ("POST", "/update/check") => {
-         crate::update::check();
+         crate::update::check_now();
          ok_json(&Done::Started)
       },
       ("POST", "/update/apply") => {

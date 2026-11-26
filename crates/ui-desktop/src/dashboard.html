@@ -73,7 +73,8 @@
   }
   .badge.desktop { background: rgba(35,165,90,0.18); color: #86efac; border: 1px solid rgba(35,165,90,0.4); }
   .badge.partial { background: rgba(245,158,11,0.16); color: #fcd34d; border: 1px solid rgba(245,158,11,0.35); }
-  .badge.mobile { background: rgba(148,155,164,0.16); color: var(--muted); border: 1px solid var(--border); }
+  .badge.unverified { background: rgba(147,197,253,0.14); color: #93c5fd; border: 1px solid rgba(147,197,253,0.32); }
+  .badge.mobile { background: rgba(168,85,247,0.2); color: #d8b4fe; border: 1px solid rgba(192,132,252,0.48); }
   nav button {
     all: unset;
     cursor: pointer;
@@ -398,14 +399,17 @@ let catalogTimer = null;
 
 const DESKTOP_FULL = new Set([
   'silent-typing', 'message-latency', 'message-logger', 'no-profile-themes',
-  'spoiler-mode', 'view-raw', 'dearrow', 'translate', 'clear-urls', 'fix-embeds'
+  'no-reply-mention', 'spoiler-mode', 'text-replace', 'view-raw',
+  'global-badges', 'dearrow', 'translate', 'clear-urls', 'fix-embeds'
 ]);
-const DESKTOP_PARTIAL = new Set(['global-badges', 'fakenitro']);
+const DESKTOP_PARTIAL = new Set(['fakenitro']);
+const MOBILE_ONLY = new Set(['hide-composer-buttons', 'reviewdb', 'taptap', 'example']);
 
 function compatBadge(name) {
   if (DESKTOP_FULL.has(name)) return '<span class="badge desktop">Desktop Ready</span>';
   if (DESKTOP_PARTIAL.has(name)) return '<span class="badge partial">Partial Desktop</span>';
-  return '<span class="badge mobile">Mobile UI</span>';
+  if (MOBILE_ONLY.has(name)) return '<span class="badge mobile">Mobile Only</span>';
+  return '<span class="badge unverified">Unverified</span>';
 }
 
 function notify(msg, isError = false) {
@@ -548,7 +552,7 @@ async function loadPlugins() {
       card.innerHTML = `
         <div class="row">
           <div>
-            <div class="title">${esc(p.name)}</div>
+            <div class="title">${esc(p.name)}${compatBadge(p.name)}</div>
             ${meta ? `<div class="meta">${esc(meta)}</div>` : ''}
             ${p.description ? `<div class="meta" style="margin-top:2px;color:var(--text)">${esc(p.description)}</div>` : ''}
           </div>
@@ -739,7 +743,7 @@ async function loadCatalog() {
     }
     root.innerHTML = '';
     const sorted = [...data.plugins].sort((a, b) => {
-      const rank = (n) => DESKTOP_FULL.has(n) ? 0 : (DESKTOP_PARTIAL.has(n) ? 1 : 2);
+      const rank = (n) => DESKTOP_FULL.has(n) ? 0 : (DESKTOP_PARTIAL.has(n) ? 1 : (MOBILE_ONLY.has(n) ? 3 : 2));
       return rank(a.name) - rank(b.name) || a.name.localeCompare(b.name);
     });
     for (const item of sorted) {
@@ -804,7 +808,7 @@ async function loadUpdates() {
     if (st.busy) lines.push('Status: working…');
     if (st.status) lines.push(`Detail: ${st.status}`);
     if (st.found) {
-      if (st.found.loader) lines.push(`Latest Android/site build: ${st.found.loader}`);
+      if (st.found.loader) lines.push(`Newer Sunbird build: ${st.found.loader} (restart Sunbird to update)`);
       if (st.found.plugins.length) lines.push(`Plugin updates: ${st.found.plugins.join(', ')}`);
     } else {
       lines.push('Up to date.');

@@ -51,6 +51,7 @@ use crate::{
       self,
       ActionMeta,
    },
+   emoji,
    js::Desktop,
    modal::{
       self,
@@ -600,11 +601,13 @@ pub fn desktop_patch_api<'js>(
          move |ctx: Ctx<'js>, function: Function<'js>| on_send(&ctx, &name, function),
       )?,
    )?;
+   let name = plugin.to_owned();
    messages.set(
       "onEmojiPick",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, _function: Opt<Value<'js>>| {
-         noop_handle(&ctx)
-      })?,
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>, _function: Opt<Value<'js>>| on_emoji_pick(&ctx, &name),
+      )?,
    )?;
    let commands = Object::new(ctx.clone())?;
    commands.set(
@@ -854,6 +857,30 @@ pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> Re
          obj.insert("content".to_owned(), serde_json::Value::String(value));
       }
       serde_json::to_vec(&payload).map_or(RequestAction::Pass, RequestAction::Replace)
+   })
+}
+
+/// Counts the handler toward the emoji unlock. Desktop has no picker presses
+/// to give it: the unlocked picker inserts the emoji itself.
+fn on_emoji_pick<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .emoji_pickers
+      .borrow_mut()
+      .push((id, plugin.to_owned()));
+   emoji::unlock(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut pickers = registry.emoji_pickers.borrow_mut();
+         pickers.retain(|(existing, _)| *existing != id);
+         emoji::unlock(!pickers.is_empty());
+      }
    })
 }
 

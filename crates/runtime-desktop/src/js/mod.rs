@@ -18,6 +18,7 @@ use rquickjs::{
 use crate::{
    accessories,
    context_menu,
+   emoji,
    js::ui::{
       DesktopAccessory,
       DesktopAction,
@@ -29,11 +30,14 @@ use crate::{
 #[derive(Default)]
 pub struct Desktop<'js> {
    /// `phoenix.ui.addMessageAccessory` callbacks.
-   pub accessories:  RefCell<Vec<DesktopAccessory<'js>>>,
+   pub accessories:   RefCell<Vec<DesktopAccessory<'js>>>,
    /// `phoenix.ui.addMessageAction` callbacks.
-   pub actions:      RefCell<Vec<DesktopAction<'js>>>,
+   pub actions:       RefCell<Vec<DesktopAction<'js>>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
-   pub page_buttons: RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   pub page_buttons:  RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
+   /// no picker presses to give them, only the unlock they turn on.
+   pub emoji_pickers: RefCell<Vec<(u64, String)>>,
 }
 
 // SAFETY: every field is bound to 'js, and Changed swaps exactly that lifetime.
@@ -41,8 +45,8 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
    type Changed<'to> = Desktop<'to>;
 }
 
-/// Drops the accessories, context menu actions, and open page callbacks `name`
-/// registered and redraws Discord without them.
+/// Drops the accessories, context menu actions, open page callbacks, and emoji
+/// pick handlers `name` registered and redraws Discord without them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -70,4 +74,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       .page_buttons
       .borrow_mut()
       .retain(|_, (_, plugin, _)| plugin != name);
+
+   let mut pickers = registry.emoji_pickers.borrow_mut();
+   pickers.retain(|(_, plugin)| plugin != name);
+   emoji::unlock(!pickers.is_empty());
 }

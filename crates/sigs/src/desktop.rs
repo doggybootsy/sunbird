@@ -78,6 +78,9 @@ pub struct Prologues {
    /// and `ReqwestTransport::send`.
    pub frame:       Prologue,
    pub media_fetch: Prologue,
+   /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
+   /// Win64, five on System V, up to the `jne`.
+   pub emoji_check: Prologue,
 }
 
 impl Prologues {
@@ -104,6 +107,10 @@ impl Prologues {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
+               emoji_check: Prologue {
+                  pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
+                  len:     14,
+               },
             }
          },
          Abi::SysV => {
@@ -111,6 +118,10 @@ impl Prologues {
                row:         SYSV_FRAME,
                frame:       SYSV_FRAME,
                media_fetch: SYSV_FRAME,
+               emoji_check: Prologue {
+                  pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
+                  len:     14,
+               },
             }
          },
       }
@@ -711,6 +722,50 @@ pub fn access_gate(image: &Image<'_>) -> Found<usize> {
          "access gate call at {:#x} leaves the code",
          caller + call
       ))
+   }
+}
+
+/// Phoenix's `getEmojiUnavailableReason`, `u8 f(&Emoji, &EmojiContext)`,
+/// where 0xFF is usable and 2 premium locked.
+#[derive(Clone, Copy, Debug)]
+pub struct EmojiCheck {
+   pub func:      usize,
+   /// `EmojiContext.intention`, 3 (`CHAT`) for the message box.
+   pub intention: usize,
+}
+
+/// The same leaf Android has, answering 3 for profiles first.
+///
+/// `movzx r, byte [ctx + intention]; mov al, 3; mov r2, r; or r2, 2;
+/// cmp r2, 14; jne; ret`. The intention's offset is read back from the
+/// `movzx`, which must address the context argument.
+pub fn emoji_check(image: &Image<'_>) -> Found<EmojiCheck> {
+   let abi = Abi::of(image);
+   // And where the `movzx`'s ModRM sits.
+   let (check, modrm) = match abi {
+      Abi::Win64 => {
+         (
+            Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02 41 83 ?? 0E 75 01 C3"),
+            3,
+         )
+      },
+      Abi::SysV => {
+         (
+            Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E 75 01 C3"),
+            2,
+         )
+      },
+   };
+   let func = one("emoji check", &image.scan(check))?;
+   let (context, _) = reg(abi.arg(1));
+   match image.read(func + modrm, 2) {
+      Some(&[modrm, disp]) if modrm & 0xC7 == 0x40 | context => {
+         Ok(EmojiCheck {
+            func,
+            intention: usize::from(disp),
+         })
+      },
+      _ => Err(format!("emoji check at {func:#x} reads no context byte")),
    }
 }
 

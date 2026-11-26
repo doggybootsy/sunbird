@@ -127,9 +127,11 @@ pub fn fetch_catalog() {
 }
 
 /// Installs a plugin the site lists. Site plugins can call API an older loader
-/// lacks, so they wait until the loader is current.
+/// lacks, so platforms with an in-app loader updater wait until the loader is
+/// current.
 pub fn install_listed(name: &str) -> Result<String, crate::Error> {
-   if let Some(version) = found().and_then(|update| update.loader) {
+   let updates_loader = crate::platform().is_some_and(<dyn crate::Platform>::updates_loader);
+   if updates_loader && let Some(version) = found().and_then(|update| update.loader) {
       return Err(crate::Error::LoaderOutdated { version });
    }
    crate::install(&format!("{ASSETS}plugins/{name}.js"))
@@ -141,8 +143,7 @@ fn query() -> Result<Option<Update>, String> {
    let body = crate::fetch::get(&format!("{ASSETS}version.json")).map_err(|err| err.to_string())?;
    let site =
       serde_json::from_slice::<Site>(&body).map_err(|err| format!("version.json: {err}"))?;
-   let updates_loader = crate::platform().is_some_and(<dyn crate::Platform>::updates_loader);
-   let loader = (updates_loader && site.loader.as_str() > VERSION).then_some(site.loader);
+   let loader = (site.loader.as_str() > VERSION).then_some(site.loader);
    // Plugins come along with a loader update, so one tap brings both.
    let mut plugins = Vec::new();
    let mut plugin_crcs = BTreeMap::new();
@@ -193,6 +194,43 @@ pub fn check() {
    });
 }
 
+/// Checks the site on demand for a user click, updating status and showing a
+/// toast on completion.
+pub fn check_now() {
+   if !begin() {
+      log::info!("update check: already running");
+      crate::toast("Update check already in progress...");
+      return;
+   }
+   set_status(Some("Checking for updates...".to_owned()));
+   thread::spawn(|| {
+      match query() {
+         Ok(Some(update)) => {
+            log::info!(
+               "update available: loader {:?}, plugins {:?}",
+               update.loader,
+               update.plugins
+            );
+            finish(None);
+            if let Some(platform) = crate::platform() {
+               platform.notify(Notice::UpdateAvailable(&update));
+            }
+         },
+         Ok(None) => {
+            log::info!("up to date ({VERSION})");
+            finish(Some(format!("Sunbird {VERSION} is up to date.")));
+            crate::toast("Sunbird is up to date");
+         },
+         Err(err) => {
+            log::info!("update check: {err}");
+            let msg = format!("Update check failed: {err}");
+            finish(Some(msg.clone()));
+            crate::toast(&msg);
+         },
+      }
+   });
+}
+
 /// Checks the site again and applies what this install lacks.
 ///
 /// Updates changed plugins over-the-air first (hot-reloading them live), then
@@ -213,7 +251,7 @@ pub fn apply() {
       let Some(update) = update else {
          log::info!("update apply: up to date ({VERSION})");
          BUSY.store(false, Ordering::Release);
-         crate::toast("Phoenix Unlock is up to date");
+         crate::toast("Sunbird is up to date");
          return;
       };
       // The site's plugins are built against its loader and can call API this
@@ -221,8 +259,16 @@ pub fn apply() {
       if let Some(version) = &update.loader
          && let Some(platform) = crate::platform()
       {
-         platform.update_loader(version, &update);
-         return;
+         if platform.updates_loader() {
+            platform.update_loader(version, &update);
+            return;
+         }
+         if update.plugins.is_empty() {
+            let msg = format!("Sunbird {version} is available — restart Sunbird to update.");
+            finish(Some(msg.clone()));
+            crate::toast(&msg);
+            return;
+         }
       }
       let mut updated_plugins = Vec::new();
       if !update.plugins.is_empty() {

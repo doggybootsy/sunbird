@@ -6,6 +6,7 @@
 #
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-macos.sh | sh
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-macos.sh | sh -s -- "/path/to/Discord Phoenix.app"
+#   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-macos.sh | sh -s -- --no-runtime
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-macos.sh | sh -s -- --uninstall
 #
 # SUNBIRD_SITE points it at a local server for testing.
@@ -31,6 +32,13 @@ if [ "${1:-}" = --uninstall ]; then
    echo "Sunbird is uninstalled. Discord itself was not changed."
    exit 0
 fi
+
+# Opens the access gate only, without plugins.
+no_runtime=
+while [ "${1:-}" = --no-runtime ] || [ "${1:-}" = --gate-only ]; do
+   no_runtime=1
+   shift
+done
 
 if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
    echo "Discord Phoenix for macOS runs on Apple silicon only." >&2
@@ -120,6 +128,7 @@ home=$(q "$home")
 site=$(q "$site")
 discord=$(q "$discord")
 copy="\$home/Sunbird.app"
+gate_only=$no_runtime
 # Bumped when the copy's branding changes, so existing copies are rebuilt.
 brand=1
 fetch() { /usr/bin/curl -fsSL --proto $proto --proto-redir =https "\$@" 2>/dev/null; }
@@ -142,6 +151,10 @@ if [ -n "\$version" ] && [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)"
    fi
 fi
 [ "\${1:-}" = --update ] && exit 0
+while [ "\${1:-}" = --no-runtime ] || [ "\${1:-}" = --gate-only ]; do
+   gate_only=1
+   shift
+done
 [ -d "\$discord" ] || fail "Discord Phoenix is gone from \$discord. Run the Sunbird installer again."
 
 # Rebuilt when Discord's executable changed, or when the copy lost its ad hoc
@@ -203,7 +216,9 @@ if [ -n "\$pids" ] && [ -z "\$sunbird" ]; then
       sleep 0.5
    done
 fi
-exec /usr/bin/open -a "\$copy" --env "DYLD_INSERT_LIBRARIES=\$home/libphoenix.dylib" --args "\$@"
+set -- --env "DYLD_INSERT_LIBRARIES=\$home/libphoenix.dylib" --args "\$@"
+[ -n "\$gate_only" ] && set -- --env SUNBIRD_GATE_ONLY=1 "\$@"
+exec /usr/bin/open -a "\$copy" "\$@"
 EOF
 chmod +x "$app/Contents/MacOS/sunbird"
 
