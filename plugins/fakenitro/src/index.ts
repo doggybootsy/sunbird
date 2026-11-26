@@ -1,5 +1,5 @@
 // @description Sends custom and animated emojis as links, and renders fake emojis, stickers, and GIFs as real ones
-// @version 0.4.0
+// @version 0.4.1
 // @author mantikafasi
 
 const { gateway } = phoenix;
@@ -192,12 +192,11 @@ const link = (emoji: Emoji) => {
   return `[${settings.hyperLinkText.replaceAll("{{NAME}}", emoji.name)}](${url})`;
 };
 
-const token = (emoji: Emoji) => `<${emoji.animated ? "a" : ""}:${emoji.name}:${emoji.id}>`;
-
-// Rewrites `<a:name:id>` tokens the sender can't use into links, and `:name:`
-// shortcodes into the emoji or its link: Desktop posts what the message box
-// holds, and Discord leaves a shortcode as text. Links need whitespace around
-// them to embed, one space between adjacent ones.
+// Rewrites `<a:name:id>` tokens and `:name:` shortcodes the sender can't use
+// into links. A shortcode with a usable emoji stays: Phoenix turns a picked
+// emoji's `:name:` into its token itself after onSend, by name, and would land
+// inside a token put there. Links need whitespace around them to embed, one
+// space between adjacent ones.
 // ponytail: a `:name:` shared by several servers picks the first one we saw
 // when none of them is usable here.
 const rewrite = (text: string, guild: string | undefined) => {
@@ -209,8 +208,7 @@ const rewrite = (text: string, guild: string | undefined) => {
       if (!emoji || usable(emoji, guild)) return match;
     } else {
       const found = picked.has(name) ? [picked.get(name)!] : (byName.get(name) ?? []);
-      const own = found.find((e) => usable(e, guild));
-      if (own) return token(own);
+      if (found.some((e) => usable(e, guild))) return match;
       emoji = found.find((e) => e.available);
       if (!emoji) return match;
     }

@@ -182,6 +182,8 @@ pub struct Setting {
    pub title:       String,
    pub description: Option<String>,
    pub control:     Control,
+   /// A text setting edited over several lines.
+   pub multiline:   bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

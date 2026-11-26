@@ -76,6 +76,19 @@ pub struct RenderedAccessory {
    pub text:     String,
    pub color:    Option<u32>,
    pub tint:     Option<u32>,
+   /// Discord's own SVG icons with their colors, drawn in place of `text`
+   /// where icons can be drawn.
+   pub icons:    Vec<(&'static str, Option<u32>)>,
+}
+
+impl RenderedAccessory {
+   pub fn piece(&self) -> gpui::Piece {
+      gpui::Piece {
+         text:  self.text.clone(),
+         color: self.color,
+         icons: self.icons.clone(),
+      }
+   }
 }
 
 enum CacheEntry {
@@ -207,7 +220,7 @@ fn lookup_cached_tint(message_id: u64) -> Option<u32> {
 
 /// Converts plugin ARGB (`0xAARRGGBB`, with `0x00RRGGBB` treated as opaque)
 /// into Discord GPUI's packed `0xRRGGBBAA` `u32` token format.
-const fn argb_to_rgba(argb: u32) -> u32 {
+pub const fn argb_to_rgba(argb: u32) -> u32 {
    let raw_a = (argb >> 24) & 0xFF;
    let a = if raw_a == 0 && argb != 0 { 0xFF } else { raw_a };
    ((argb & 0x00FF_FFFF) << 8) | a

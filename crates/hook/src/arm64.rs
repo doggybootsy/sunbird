@@ -284,6 +284,97 @@ pub fn decode_all(code: &[u8], pc: usize) -> impl Iterator<Item = (usize, Insn)>
       })
 }
 
+/// Decodes up to `count` arm64 instructions starting at `pc` into `(addr, text)`.
+#[must_use]
+pub fn disasm(code: &[u8], pc: usize, count: usize) -> Vec<(usize, String)> {
+   code
+      .as_chunks::<4>()
+      .0
+      .iter()
+      .take(count)
+      .enumerate()
+      .map(|(i, &bytes)| {
+         let addr = pc + i * 4;
+         let word = u32::from_le_bytes(bytes);
+         (addr, format_insn(word, addr))
+      })
+      .collect()
+}
+
+fn format_insn(word: u32, pc: usize) -> String {
+   let x = |r: Reg, wide: bool| match (r, wide) {
+      (31, true) => "xzr".to_owned(),
+      (31, false) => "wzr".to_owned(),
+      (_, true) => format!("x{r}"),
+      (_, false) => format!("w{r}"),
+   };
+   let sp = |r: Reg| if r == 31 { "sp".to_owned() } else { format!("x{r}") };
+   let cond_name = |c: u8| match c {
+      0 => "eq",
+      1 => "ne",
+      2 => "hs",
+      3 => "lo",
+      4 => "mi",
+      5 => "pl",
+      6 => "vs",
+      7 => "vc",
+      8 => "hi",
+      9 => "ls",
+      10 => "ge",
+      11 => "lt",
+      12 => "gt",
+      13 => "le",
+      14 => "al",
+      _ => "nv",
+   };
+   match decode(word, pc) {
+      Insn::Adrp { rd, page } => format!("adrp {}, {page:#x}", x(rd, true)),
+      Insn::AddImm { rd, rn, imm } => format!("add {}, {}, #{imm:#x}", sp(rd), sp(rn)),
+      Insn::CmpImm { rn, imm, wide } => format!("cmp {}, #{imm:#x}", x(rn, wide)),
+      Insn::Load { rt, rn, offset, size } => {
+         let (op, wide) = match size {
+            1 => ("ldrb", false),
+            2 => ("ldrh", false),
+            4 => ("ldr", false),
+            _ => ("ldr", true),
+         };
+         format!("{op} {}, [{}, #{offset:#x}]", x(rt, wide), sp(rn))
+      },
+      Insn::Store { rt, rn, offset, size } => {
+         let (op, wide) = match size {
+            1 => ("strb", false),
+            2 => ("strh", false),
+            4 => ("str", false),
+            _ => ("str", true),
+         };
+         format!("{op} {}, [{}, #{offset:#x}]", x(rt, wide), sp(rn))
+      },
+      Insn::MovZ { rd, imm, wide } => format!("mov {}, #{imm:#x}", x(rd, wide)),
+      Insn::MovN { rd, imm, wide } => format!("movn {}, #{imm:#x}", x(rd, wide)),
+      Insn::MovReg { rd, rm, wide } => format!("mov {}, {}", x(rd, wide), x(rm, wide)),
+      Insn::Cset { rd, cond } => format!("cset {}, {}", x(rd, false), cond_name(cond)),
+      Insn::Bl { target } => format!("bl {target:#x}"),
+      Insn::B { target } => format!("b {target:#x}"),
+      Insn::BCond { cond, target } => format!("b.{} {target:#x}", cond_name(cond)),
+      Insn::Cbz { rt, nonzero, target } => {
+         let op = if nonzero { "cbnz" } else { "cbz" };
+         format!("{op} x{rt}, {target:#x}")
+      },
+      Insn::Tbz { rt, bit, nonzero, target } => {
+         let op = if nonzero { "tbnz" } else { "tbz" };
+         format!("{op} x{rt}, #{bit}, {target:#x}")
+      },
+      Insn::Writeback { rt, rn, imm, load } => {
+         let op = if load { "ldr" } else { "str" };
+         format!("{op} x{rt}, [{}, #{imm:#x}]!", sp(rn))
+      },
+      Insn::Ret => "ret".to_owned(),
+      Insn::Br { rn } => format!("br {}", x(rn, true)),
+      Insn::Blr { rn } => format!("blr {}", x(rn, true)),
+      Insn::Other(w) => format!(".word {w:#010x}"),
+   }
+}
+
 /// The decoded body of the function holding `addr`, from its start.
 #[must_use]
 pub fn function(image: &Image<'_>, addr: usize) -> Option<(usize, Vec<(usize, Insn)>)> {
@@ -301,6 +392,12 @@ const PAIR_REACH: usize = 12;
 /// instruction.
 #[must_use]
 pub fn code_refs(image: &Image<'_>, targets: Range<usize>) -> Vec<(usize, usize)> {
+   if targets.is_empty() {
+      return Vec::new();
+   }
+   if let Some(found) = indexed_range(image, targets.start..=targets.end - 1) {
+      return found;
+   }
    refs_where(image, |target| targets.contains(&target))
 }
 
@@ -313,9 +410,183 @@ pub fn code_refs_to(image: &Image<'_>, targets: &[usize]) -> Vec<(usize, usize)>
    let (Some(&first), Some(&last)) = (sorted.first(), sorted.last()) else {
       return Vec::new();
    };
+   if let Some(found) = indexed_points(image, &sorted) {
+      return found;
+   }
    refs_where(image, |target| {
       (first..=last).contains(&target) && sorted.binary_search(&target).is_ok()
    })
+}
+
+/// Frees the cached arm64 reference index once startup locators have finished.
+pub fn release_ref_index() {
+   *REF_INDEX
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+struct RefIndex {
+   base:       usize,
+   exec_bytes: usize,
+   // packed `((target - base) << 32) | (site - base)`, sorted for binary search
+   refs:       Vec<u64>,
+}
+
+static REF_INDEX: std::sync::Mutex<Option<RefIndex>> = std::sync::Mutex::new(None);
+
+fn exec_summary(image: &Image<'_>) -> Option<(usize, usize, usize)> {
+   let base = image.segments.iter().map(|seg| seg.addr).min()?;
+   let mut exec_bytes = 0usize;
+   let mut max_end = base;
+   for seg in &image.segments {
+      if seg.executable {
+         exec_bytes = exec_bytes.saturating_add(seg.bytes.len());
+      }
+      max_end = max_end.max(seg.addr.saturating_add(seg.bytes.len()));
+   }
+   // only cache real binaries; small test images scan directly
+   if exec_bytes < (1 << 20) || max_end.saturating_sub(base) > u32::MAX as usize {
+      return None;
+   }
+   Some((base, exec_bytes, max_end))
+}
+
+fn with_index<T>(image: &Image<'_>, f: impl FnOnce(&RefIndex) -> T) -> Option<T> {
+   let (base, exec_bytes, max_end) = exec_summary(image)?;
+   let mut guard = REF_INDEX
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+   let matches = guard
+      .as_ref()
+      .is_some_and(|idx| idx.base == base && idx.exec_bytes == exec_bytes);
+   if !matches {
+      let mut refs = build_ref_index(image, base, max_end);
+      refs.sort_unstable();
+      *guard = Some(RefIndex {
+         base,
+         exec_bytes,
+         refs,
+      });
+   }
+   Some(f(guard.as_ref()?))
+}
+
+fn indexed_range(
+   image: &Image<'_>,
+   targets: std::ops::RangeInclusive<usize>,
+) -> Option<Vec<(usize, usize)>> {
+   with_index(image, |idx| {
+      if *targets.end() < idx.base {
+         return Vec::new();
+      }
+      let low = u64::try_from(targets.start().saturating_sub(idx.base))
+         .unwrap_or(u64::MAX)
+         .min(u64::from(u32::MAX));
+      let high = u64::try_from(targets.end().saturating_sub(idx.base))
+         .unwrap_or(u64::MAX)
+         .min(u64::from(u32::MAX));
+      let start = idx.refs.partition_point(|&r| (r >> 32) < low);
+      let end = idx.refs.partition_point(|&r| (r >> 32) <= high);
+      idx.refs[start..end]
+         .iter()
+         .map(|&r| {
+            (
+               idx.base + (r & 0xFFFF_FFFF) as usize,
+               idx.base + (r >> 32) as usize,
+            )
+         })
+         .collect()
+   })
+}
+
+fn indexed_points(image: &Image<'_>, targets: &[usize]) -> Option<Vec<(usize, usize)>> {
+   with_index(image, |idx| {
+      let mut out = Vec::new();
+      for &target in targets {
+         if target < idx.base {
+            continue;
+         }
+         let Ok(rva) = u32::try_from(target - idx.base) else {
+            continue;
+         };
+         let key = u64::from(rva);
+         let start = idx.refs.partition_point(|&r| (r >> 32) < key);
+         for &r in &idx.refs[start..] {
+            if (r >> 32) != key {
+               break;
+            }
+            out.push((idx.base + (r & 0xFFFF_FFFF) as usize, target));
+         }
+      }
+      out
+   })
+}
+
+fn build_ref_index(image: &Image<'_>, base: usize, max_end: usize) -> Vec<u64> {
+   let mut all = Vec::new();
+   for segment in image.segments.iter().filter(|segment| segment.executable) {
+      let words = segment.bytes.as_chunks::<4>().0;
+      let chunks = words.len().div_ceil(CHUNK_WORDS);
+      let parts: Vec<Vec<u64>> = std::thread::scope(|scope| {
+         #[expect(
+            clippy::needless_collect,
+            reason = "spawn every chunk worker before joining"
+         )]
+         let handles: Vec<_> = (0..chunks)
+            .map(|chunk| {
+               scope.spawn(move || {
+                  let start = chunk * CHUNK_WORDS;
+                  let end = (start + CHUNK_WORDS).min(words.len());
+                  let warm = start.saturating_sub(PAIR_REACH);
+                  let mut found = Vec::new();
+                  let mut pages = [(usize::MAX, 0usize); 32];
+                  for (index, &word) in words.iter().enumerate().take(end).skip(warm) {
+                     let pc = segment.addr + index * 4;
+                     let word = u32::from_le_bytes(word);
+                     let paired = |rn: Reg, imm: usize| {
+                        let (at, page) = pages[usize::from(rn)];
+                        (at != usize::MAX && index - at <= PAIR_REACH)
+                           .then(|| page.wrapping_add(imm))
+                     };
+                     let target = match decode(word, pc) {
+                        Insn::Adrp { rd, page } => {
+                           pages[usize::from(rd)] = (index, page);
+                           None
+                        },
+                        Insn::AddImm { rn, imm, .. } => paired(rn, imm),
+                        Insn::Load { rn, offset, .. } | Insn::Store { rn, offset, .. } => {
+                           paired(rn, offset)
+                        },
+                        Insn::Bl { target } | Insn::B { target } => Some(target),
+                        _ => None,
+                     };
+                     if index >= start
+                        && let Some(target) = target
+                        && target >= base
+                        && target < max_end
+                        && pc >= base
+                        && let (Ok(t_rva), Ok(s_rva)) =
+                           (u32::try_from(target - base), u32::try_from(pc - base))
+                     {
+                        found.push((u64::from(t_rva) << 32) | u64::from(s_rva));
+                     }
+                  }
+                  found
+               })
+            })
+            .collect();
+         handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect()
+      });
+      let total: usize = parts.iter().map(Vec::len).sum();
+      all.reserve(total);
+      for part in parts {
+         all.extend(part);
+      }
+   }
+   all
 }
 
 /// Words each thread of [`refs_where`] scans; the code is a few hundred MB.

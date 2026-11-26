@@ -18,36 +18,20 @@
 //! Addresses are hex at the file's preferred base. One below the base is an
 //! RVA. Every address printed carries its RVA too, for a live process's base.
 
-use std::{
-   collections::HashMap,
-   env,
-   fs,
-};
+use std::{collections::HashMap, env, fs};
 
-use misstep::{
-   OptionExt,
-   ResultExt,
-};
-use phoenix_hook::{
-   arm64,
-   image::Image,
-   pattern::Pattern,
-   x86,
-};
+use misstep::{OptionExt, ResultExt};
+use phoenix_hook::{arm64, image::Image, pattern::Pattern, x86};
 use phoenix_sigs::{
-   Found,
-   desktop,
-   file::{
-      BinaryFile,
-      Machine,
-   },
+   Found, desktop,
+   file::{BinaryFile, Machine},
    http::DesktopHttpTransport,
-   ios,
-   mobile,
+   ios, mobile,
    registry::GatewayRegistry,
 };
 
-const USAGE: &str = "usage: sigscan <library.so | Discord.exe | PhoenixFatClient | main.jsbundle> \
+const USAGE: &str = "usage: sigscan <library.so | Discord.exe | Discord | PhoenixFatClient | \
+                     main.jsbundle> \
                      [check | strings <text> | refs <addr> | dis <addr> [count]]";
 
 fn main() -> misstep::Result<()> {
@@ -79,13 +63,11 @@ fn main() -> misstep::Result<()> {
    };
    match args.get(1).map(String::as_str) {
       None => dump(image),
-      Some("check") => {
-         check(
-            image,
-            parsed.machine(),
-            matches!(parsed, BinaryFile::MachO(_)),
-         )
-      },
+      Some("check") => check(
+         image,
+         parsed.machine(),
+         matches!(parsed, BinaryFile::MachO(_)),
+      ),
       Some("strings") => tools.strings(args.get(2).context(USAGE)?),
       Some("scan") => tools.scan(&args[2..].join(" ")),
       Some("refs") => {
@@ -118,14 +100,12 @@ const MACOS_DESKTOP: &[u8] = b"DESKTOP_ACCESS_GATE_TITLE";
 #[expect(clippy::too_many_lines, reason = "one report per locator")]
 fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()> {
    let mut missed = 0;
-   let mut report = |name: &str, found: Found<String>| {
-      match found {
-         Ok(detail) => println!("ok    {name:<20} {detail}"),
-         Err(why) => {
-            missed += 1;
-            println!("MISS  {name:<20} {why}");
-         },
-      }
+   let mut report = |name: &str, found: Found<String>| match found {
+      Ok(detail) => println!("ok    {name:<20} {detail}"),
+      Err(why) => {
+         missed += 1;
+         println!("MISS  {name:<20} {why}");
+      },
    };
    let at = |addr: usize| format!("{addr:#x}");
    let registry = GatewayRegistry::locate(image).map_err(|err| err.to_string());
@@ -147,8 +127,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                prologues
                   .frame
                   .at(image, http.send_fn)
-                  .then(|| at(http.send_fn))
+                  .then(|| format!("{} request {:x?}", at(http.send_fn), http.request))
                   .ok_or_else(|| "send prologue changed".to_owned())
+            }),
+         );
+         report(
+            "http responses",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               (http.poll_result <= phoenix_sigs::http::POLL_RESULT_SIZE)
+                  .then(|| at(http.poll_fn))
+                  .ok_or_else(|| format!("poll writes {:#x} bytes of its result", http.poll_result))
             }),
          );
          report(
@@ -161,13 +149,11 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                Some((Some(alloc), Some(dealloc))) => {
                   Ok(format!("alloc {}, dealloc {}", at(alloc), at(dealloc)))
                },
-               Some((alloc, dealloc)) => {
-                  Err(format!(
-                     "alloc {}, dealloc {}",
-                     alloc.map_or_else(|| "missing".to_owned(), at),
-                     dealloc.map_or_else(|| "missing".to_owned(), at)
-                  ))
-               },
+               Some((alloc, dealloc)) => Err(format!(
+                  "alloc {}, dealloc {}",
+                  alloc.map_or_else(|| "missing".to_owned(), at),
+                  dealloc.map_or_else(|| "missing".to_owned(), at)
+               )),
                None => Err("no http transport".to_owned()),
             },
          );
@@ -211,14 +197,12 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "gpui builders",
             gpui.as_ref().map_err(Clone::clone).and_then(|gpui| {
                match (gpui.div_push_any, gpui.str_into_any) {
-                  (Some(push), Some(text)) => {
-                     Ok(format!(
-                        "{} (push_any {}, str_into_any {})",
-                        at(gpui.div_new),
-                        at(push),
-                        at(text)
-                     ))
-                  },
+                  (Some(push), Some(text)) => Ok(format!(
+                     "{} (push_any {}, str_into_any {})",
+                     at(gpui.div_new),
+                     at(push),
+                     at(text)
+                  )),
                   (push, text) => Err(format!("push_any {push:x?}, str_into_any {text:x?}")),
                }
             }),
@@ -241,6 +225,39 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(|l| format!("{:x?}", l.style))
                .map_err(|_| "needs the layouts".to_owned()),
          );
+         report(
+            "member row",
+            desktop::member_row(image).map(|row| {
+               let closure = match row.name.closure_slot {
+                  Some(slot) => format!("frame +{slot:#x}"),
+                  None => format!("closure in {}", row.name.frame),
+               };
+               format!(
+                  "{} (name calls {:x?}, {closure}, env +{:#x})",
+                  at(row.func),
+                  row.name.sites,
+                  row.name.env
+               )
+            }),
+         );
+         report(
+            "dm row",
+            desktop::dm_row(image).map(|row| {
+               format!(
+                  "{} (name call {}, recipient [{frame}+{:#x}] if [{frame}+{:#x}])",
+                  at(row.func),
+                  at(row.site),
+                  row.user,
+                  row.some,
+                  frame = row.frame
+               )
+            }),
+         );
+         report(
+            "svg builders",
+            desktop::svg_builders(image).map(|svg| format!("{svg:x?}")),
+         );
+         report("asset loader", desktop::asset_load(image).map(at));
          let row = desktop::message_row(image);
          report(
             "message row",
@@ -341,15 +358,43 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                   .ok_or_else(|| "prologue changed".to_owned())
             }),
          );
+         let json = desktop::message_json(image);
          report(
             "message json",
-            desktop::message_json(image).map(|found| {
-               format!(
-                  "to_value {}, drop {}",
-                  at(found.to_value),
-                  at(found.drop_value)
-               )
-            }),
+            json
+               .as_ref()
+               .map(|found| {
+                  format!(
+                     "to_value {}, drop {}",
+                     at(found.to_value),
+                     at(found.drop_value)
+                  )
+               })
+               .map_err(Clone::clone),
+         );
+         report(
+            "message header",
+            row.as_ref()
+               .map_err(|_| "needs the message row".to_owned())
+               .and_then(|row| desktop::message_body(image, row.func))
+               .and_then(|body| desktop::message_header(image, body.func))
+               .map(|header| {
+                  let sites = header
+                     .sites
+                     .iter()
+                     .map(|site| format!("{} [{}+{:#x}]", at(site.site), header.frame, site.slot))
+                     .collect::<Vec<_>>()
+                     .join(", ");
+                  format!(
+                     "name calls {sites}; child_node {}, svg_new {}, push_svg {}, leaf {:#x} \
+                      (color +{:#x})",
+                     at(header.child_node),
+                     at(header.svg.new),
+                     at(header.svg.push),
+                     header.svg.size,
+                     header.svg.color
+                  )
+               }),
          );
       },
       // macOS Phoenix, the desktop client built for arm64.
@@ -370,16 +415,31 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(|&found| at(found))
                .ok_or_else(|| "the loader can't tell a launch that never re-execs".to_owned()),
          );
+         let http = phoenix_sigs::macos::http_transport(image);
          report(
             "http transport",
-            phoenix_sigs::macos::http_transport(image).map(|http| {
+            http.as_ref().map_err(Clone::clone).map(|http| {
                format!(
-                  "send {} ({} slots), poll {} ({} slots)",
+                  "send {} ({} slots) request {:x?}",
                   at(http.send_fn),
                   http.send_slots.len(),
-                  at(http.poll_fn),
-                  http.poll_slots.len()
+                  http.request,
                )
+            }),
+         );
+         report(
+            "http responses",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               http
+                  .response
+                  .map(|layout| {
+                     format!(
+                        "{} ({} slots) {layout:x?}",
+                        at(http.poll_fn),
+                        http.poll_slots.len()
+                     )
+                  })
+                  .ok_or_else(|| format!("poll writes {:#x} bytes of its result", http.poll_result))
             }),
          );
          report(
@@ -488,6 +548,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "access gate",
             phoenix_sigs::macos::access_gate(image).map(at),
          );
+         report(
+            "pages under frame",
+            phoenix_sigs::macos::pages_under_frame(image).map(at),
+         );
       },
       Machine::Aarch64 if macho => {
          report(
@@ -500,14 +564,15 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             }),
          );
          let names = ["Networking.request", "@http", "headers"];
-         report("host names", match ios::host_names(image, &names)[..] {
-            [Some(request), Some(http), Some(headers)] => {
-               Ok(format!(
+         report(
+            "host names",
+            match ios::host_names(image, &names)[..] {
+               [Some(request), Some(http), Some(headers)] => Ok(format!(
                   "request {request}, @http {http}, headers {headers}"
-               ))
+               )),
+               ref numbers => Err(format!("{names:?} read as {numbers:?}")),
             },
-            ref numbers => Err(format!("{names:?} read as {numbers:?}")),
-         });
+         );
          report(
             "access gate",
             ios::access_gate(image).map(|[a, b]| format!("{a:#x}, {b:#x}")),
@@ -564,7 +629,12 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
       println!("   {:<40} {:#010x}{note}", entry.name, entry.handler);
    }
-   if let Ok(http) = DesktopHttpTransport::locate(image) {
+   let http = if image.function_starts.is_some() {
+      phoenix_sigs::macos::http_transport(image)
+   } else {
+      DesktopHttpTransport::locate(image)
+   };
+   if let Ok(http) = http {
       let fmt_opt = |addr: Option<usize>| {
          addr.map_or_else(|| "none".to_owned(), |addr| format!("{addr:#010x}"))
       };
@@ -583,7 +653,7 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
 struct Tools<'a> {
    image: &'a Image<'a>,
-   base:  usize,
+   base: usize,
    /// Mach-O files are arm64, everything else sigscan reads as x86-64 here.
    arm64: bool,
 }
@@ -608,17 +678,15 @@ impl Tools<'_> {
          }
          let text = match insn {
             Insn::Bl { target } => format!("call {target:#x}"),
-            Insn::AddImm { rd, rn, imm } => {
-               match pages[usize::from(rn)] {
-                  Some(page) if rn != 31 => {
-                     let addr = page + imm;
-                     let preview = self.image.read(addr, 24).map_or_else(String::new, |bytes| {
-                        String::from_utf8_lossy(bytes).replace(|c: char| c.is_control(), ".")
-                     });
-                     format!("x{rd} = {addr:#x} \"{preview}\"")
-                  },
-                  _ => format!("{insn:x?}"),
-               }
+            Insn::AddImm { rd, rn, imm } => match pages[usize::from(rn)] {
+               Some(page) if rn != 31 => {
+                  let addr = page + imm;
+                  let preview = self.image.read(addr, 24).map_or_else(String::new, |bytes| {
+                     String::from_utf8_lossy(bytes).replace(|c: char| c.is_control(), ".")
+                  });
+                  format!("x{rd} = {addr:#x} \"{preview}\"")
+               },
+               _ => format!("{insn:x?}"),
             },
             Insn::Adrp { .. } => continue,
             other => format!("{other:x?}"),
@@ -750,12 +818,33 @@ impl Tools<'_> {
          },
          None => usize::MAX,
       };
+      if self.arm64 {
+         for (line_addr, text) in phoenix_hook::arm64::disasm(code, addr, count) {
+            if line_addr >= end {
+               println!("   -- end of function --");
+               break;
+            }
+            println!("   {}  {text}", self.at(line_addr));
+         }
+         return;
+      }
       for line in x86::disasm(code, addr, count) {
          if line.addr >= end {
             println!("   -- end of function --");
             break;
          }
-         println!("   {}  {}", self.at(line.addr), line.text);
+         // Calls and jumps through a pointer slot, as ELF builds make them,
+         // print where the slot points.
+         let bytes = &code[line.addr - addr..];
+         let through = match bytes {
+            [0xFF, 0x15, ..] => x86::call_target(self.image, bytes, line.addr).map(|(_, to)| to),
+            [0xFF, 0x25, ..] => x86::jump_target(self.image, bytes, line.addr),
+            _ => None,
+         };
+         match through {
+            Some(to) => println!("   {}  {}   -> {to:#x}", self.at(line.addr), line.text),
+            None => println!("   {}  {}", self.at(line.addr), line.text),
+         }
       }
    }
 }

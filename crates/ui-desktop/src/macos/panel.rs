@@ -290,6 +290,14 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
       }
       send_bool(window, sel(c"setReleasedWhenClosed:"), false);
       send_id(window, sel(c"setTitle:"), ns_string(title));
+      let dark = send_id(
+         class(c"NSAppearance"),
+         sel(c"appearanceNamed:"),
+         ns_string("NSAppearanceNameDarkAqua"),
+      );
+      if !dark.is_null() {
+         send_id(window, sel(c"setAppearance:"), dark);
+      }
       send_size(window, sel(c"setContentMinSize:"), 360.0, 240.0);
 
       let stack = send(send(class(c"NSStackView"), sel(c"alloc")), sel(c"init"));
@@ -318,6 +326,9 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
          send_bool(wide, sel(c"setActive:"), true);
       };
       let mut fixed_height = true;
+      let mut default_btn: Option<Id> = None;
+      let mut save_btn: Option<Id> = None;
+      let mut cancel_btn: Option<Id> = None;
       let heading = |text: &str| {
          let label = send_id(
             class(c"NSTextField"),
@@ -362,6 +373,15 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
                         sel(c"setContentTintColor:"),
                         send(class(c"NSColor"), sel(c"systemRedColor")),
                      );
+                  } else if button.label.eq_ignore_ascii_case("Cancel")
+                     || button.label.eq_ignore_ascii_case("Close")
+                  {
+                     cancel_btn.get_or_insert(view);
+                  } else {
+                     default_btn.get_or_insert(view);
+                     if button.label.starts_with("Save") {
+                        save_btn.get_or_insert(view);
+                     }
                   }
                   BUTTONS
                      .lock()
@@ -484,8 +504,13 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
       }
 
       send_id(window, sel(c"setContentView:"), stack);
-      // Without a text view to grow, the window fits what it holds.
+      if let Some(cancel) = cancel_btn {
+         send_id(cancel, sel(c"setKeyEquivalent:"), ns_string("\u{1b}"));
+      }
       if fixed_height {
+         if let Some(primary) = default_btn {
+            send_id(primary, sel(c"setKeyEquivalent:"), ns_string("\r"));
+         }
          let fits = send_fitting(stack, sel(c"fittingSize"));
          send_size(
             window,
@@ -493,7 +518,11 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
             420.0,
             fits.height.max(120.0),
          );
+      } else if let Some(save) = save_btn {
+         // cmd+s in code editors (command is the default modifier for key equivalents)
+         send_id(save, sel(c"setKeyEquivalent:"), ns_string("s"));
       }
+      let first_editable = editable.first().map(|&(view, _)| view as Id);
       send_id(window, sel(c"setDelegate:"), target);
       OPEN
          .lock()
@@ -507,6 +536,9 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
          });
       send(window, sel(c"center"));
       send_id(window, sel(c"makeKeyAndOrderFront:"), ptr::null_mut());
+      if let Some(focus) = first_editable {
+         send_id(window, sel(c"makeFirstResponder:"), focus);
+      }
    }
 }
 

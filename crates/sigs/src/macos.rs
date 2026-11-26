@@ -1,17 +1,11 @@
 //! Locators for macOS Phoenix, the arm64 desktop client.
 
 use phoenix_hook::{
-   arm64::{
-      self,
-      Insn,
-   },
+   arm64::{self, Insn},
    image::Image,
 };
 
-use crate::{
-   Found,
-   one,
-};
+use crate::{Found, one};
 
 /// The function `ClientAccessGate` reads through (1 blocked, 2 no gate).
 ///
@@ -88,7 +82,7 @@ pub fn access_gate(image: &Image<'_>) -> Found<usize> {
             };
             if checked
                == Some(Insn::Cset {
-                  rd:   0,
+                  rd: 0,
                   cond: arm64::cond::NE,
                })
                && image.is_function(access)
@@ -106,6 +100,72 @@ pub fn access_gate(image: &Image<'_>) -> Found<usize> {
 /// `mov w0, #2; ret`: the access function's "no gate".
 pub const NO_GATE: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
 
+/// `mov w0, #0; ret`: disables `pages_under_frame`, keeping embedded webviews
+/// above `GPUIView` so mouse clicks reach them on macOS.
+pub const PAGES_OVER_FRAME: [u8; 8] = [0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
+
+/// `discord_desktop_platform::webview::pages_under_frame` on macOS.
+///
+/// Release builds ignore `LIBDISCORD_MAC_PAGES_OVER_FRAME`, so callers of the
+/// helper that logs `"webview: ordered under the window's frame"` gate it with
+/// `bl pages_under_frame; tbz w0, #0, ...`.
+pub fn pages_under_frame(image: &Image<'_>) -> Found<usize> {
+   const ANCHOR: &[u8] = b"webview: ordered under the window's frame";
+   const LOOKBACK: usize = 8;
+
+   let anchor = one("webview under-frame anchor", &image.find_bytes(ANCHOR))?;
+   let mut helpers = arm64::code_refs(image, anchor..anchor + 1)
+      .into_iter()
+      .filter_map(|(site, _)| image.function_containing(site))
+      .collect::<Vec<_>>();
+   helpers.sort_unstable();
+   helpers.dedup();
+   let helper = one("webview under-frame helper", &helpers)?;
+
+   let mut found = Vec::new();
+   for segment in image.segments.iter().filter(|segment| segment.executable) {
+      let words = segment.bytes.as_chunks::<4>().0;
+      for (index, &word) in words.iter().enumerate() {
+         let raw = u32::from_le_bytes(word);
+         if (raw & 0xFC00_0000) != 0x9400_0000 {
+            continue;
+         }
+         let pc = segment.addr + index * 4;
+         if arm64::decode(raw, pc) != (Insn::Bl { target: helper }) {
+            continue;
+         }
+         let start = index.saturating_sub(LOOKBACK);
+         for at in (start..index).rev() {
+            let call_pc = segment.addr + at * 4;
+            let Insn::Bl { target } = arm64::decode(u32::from_le_bytes(words[at]), call_pc) else {
+               continue;
+            };
+            let next = arm64::decode(u32::from_le_bytes(words[at + 1]), call_pc + 4);
+            let branches_on_false = matches!(
+               next,
+               Insn::Tbz {
+                  rt: 0,
+                  bit: 0,
+                  nonzero: false,
+                  ..
+               } | Insn::Cbz {
+                  rt: 0,
+                  nonzero: false,
+                  ..
+               }
+            );
+            if branches_on_false && image.is_function(target) {
+               if !found.contains(&target) {
+                  found.push(target);
+               }
+               break;
+            }
+         }
+      }
+   }
+   one("pages_under_frame", &found)
+}
+
 /// [`crate::http::DesktopHttpTransport::locate`] for arm64.
 ///
 /// It finds `send` by the anchor string it loads, its `dyn Transport` slots by
@@ -122,6 +182,7 @@ pub fn http_transport(image: &Image<'_>) -> Found<crate::http::DesktopHttpTransp
       .filter_map(|(site, _)| image.function_containing(site))
       .collect::<Vec<_>>();
    let send_fn = one("transport anchor load", &sites)?;
+   let request = request_layout(image, send_fn)?;
    let send_slots = crate::http::find_vtable_method_slots(image, send_fn, 1..=0x2000);
    if send_slots.is_empty() {
       return Err("no Transport vtable holds ReqwestTransport::send".to_owned());
@@ -129,15 +190,11 @@ pub fn http_transport(image: &Image<'_>) -> Found<crate::http::DesktopHttpTransp
    let (_, body) = arm64::function(image, send_fn).ok_or("send has no bounds")?;
    let boxers = body
       .iter()
-      .filter_map(|&(_, insn)| {
-         match insn {
-            Insn::Bl { target } => {
-               image
-                  .function_bounds(target)
-                  .filter(|&(start, end)| start == target && end - start <= 0x80)
-            },
-            _ => None,
-         }
+      .filter_map(|&(_, insn)| match insn {
+         Insn::Bl { target } => image
+            .function_bounds(target)
+            .filter(|&(start, end)| start == target && end - start <= 0x80),
+         _ => None,
       })
       .collect::<Vec<_>>();
    let send_bounds = image.function_bounds(send_fn).ok_or("send has no bounds")?;
@@ -156,11 +213,15 @@ pub fn http_transport(image: &Image<'_>) -> Found<crate::http::DesktopHttpTransp
             if !poll_slots.contains(&(vtable + 24)) {
                poll_slots.push(vtable + 24);
             }
+            let (poll_result, response) = poll_response_layout(image, poll_fn);
             return Ok(crate::http::DesktopHttpTransport {
                send_slots,
                send_fn,
+               request,
                poll_slots,
                poll_fn,
+               poll_result,
+               response,
                host_alloc: None,
                host_dealloc: None,
             });
@@ -169,6 +230,572 @@ pub fn http_transport(image: &Image<'_>) -> Found<crate::http::DesktopHttpTransp
       }
    }
    Err("SendFuture vtable not found".to_owned())
+}
+
+/// 128-bit SIMD `ldr`/`str`/`ldur`/`stur` on `q` registers: `(load, rt, rn, offset)`.
+const fn simd_q(insn: Insn) -> Option<(bool, u8, u8, isize)> {
+   let Insn::Other(word) = insn else {
+      return None;
+   };
+   let rt = (word & 31) as u8;
+   let rn = ((word >> 5) & 31) as u8;
+   match word {
+      _ if word & 0xFFC0_0000 == 0x3D80_0000 => Some((
+         false,
+         rt,
+         rn,
+         (((word >> 10) & 0xFFF).cast_signed() as isize) * 16,
+      )),
+      _ if word & 0xFFC0_0000 == 0x3DC0_0000 => Some((
+         true,
+         rt,
+         rn,
+         (((word >> 10) & 0xFFF).cast_signed() as isize) * 16,
+      )),
+      _ if word & 0xFFE0_0C00 == 0x3C80_0000 => {
+         let imm = (((word >> 12) & 0x1FF) << 23).cast_signed() >> 23;
+         Some((false, rt, rn, imm as isize))
+      },
+      _ if word & 0xFFE0_0C00 == 0x3CC0_0000 => {
+         let imm = (((word >> 12) & 0x1FF) << 23).cast_signed() >> 23;
+         Some((true, rt, rn, imm as isize))
+      },
+      _ => None,
+   }
+}
+
+/// `stp q, q, [rn, #offset]` -> `(rn, offset)`.
+const fn simd_q_pair_store(insn: Insn) -> Option<(u8, isize)> {
+   let Insn::Other(word) = insn else {
+      return None;
+   };
+   if word & 0xFFC0_0000 != 0xAD00_0000 {
+      return None;
+   }
+   let rn = ((word >> 5) & 31) as u8;
+   let imm = (((word >> 15) & 0x7F) << 25).cast_signed() >> 25;
+   Some((rn, imm as isize * 16))
+}
+
+/// Register-offset integer load (`ldr`/`ldrb`/`ldrh`/`ldrsw [rn, rm, ...]`) -> `(rt, rn, rm)`.
+const fn indexed_load(insn: Insn) -> Option<(u8, u8, u8)> {
+   let Insn::Other(word) = insn else {
+      return None;
+   };
+   if word & 0x3B20_0C00 != 0x3820_0800 || word & 0x00C0_0000 == 0 {
+      return None;
+   }
+   Some((
+      (word & 31) as u8,
+      ((word >> 5) & 31) as u8,
+      ((word >> 16) & 31) as u8,
+   ))
+}
+
+/// Shifted or extended `add rd, rn, rm, ...` -> `(rd, rn, rm)`.
+const fn add_reg(insn: Insn) -> Option<(u8, u8, u8)> {
+   let Insn::Other(word) = insn else {
+      return None;
+   };
+   if word & 0x7F20_0000 != 0x0B00_0000 && word & 0x7FE0_0000 != 0x0B20_0000 {
+      return None;
+   }
+   Some((
+      (word & 31) as u8,
+      ((word >> 5) & 31) as u8,
+      ((word >> 16) & 31) as u8,
+   ))
+}
+
+fn request_layout(image: &Image<'_>, send_fn: usize) -> Found<crate::http::RequestLayout> {
+   request_layout_in(&flattened(image, send_fn))
+}
+
+#[expect(
+   clippy::too_many_lines,
+   reason = "tracks request registers, stack copies and jump-table dispatch in one pass"
+)]
+fn request_layout_in(code: &[Insn]) -> Found<crate::http::RequestLayout> {
+   use crate::http::{BODY_SIZE, HEADER_MAP_SIZE, RequestLayout, STRING_SIZE};
+
+   #[derive(Clone, Copy)]
+   enum Val {
+      Req(usize),
+      Stack(usize),
+      Field(usize),
+      Table(usize),
+      Imm(usize),
+   }
+
+   let mut regs = [None::<Val>; 32];
+   let mut qregs = [None::<usize>; 32];
+   let mut stack_copies = std::collections::HashMap::<usize, usize>::new();
+   regs[1] = Some(Val::Req(0));
+
+   let resolve_arg = |val: Option<Val>, copies: &std::collections::HashMap<usize, usize>| match val
+   {
+      Some(Val::Req(off)) => Some(off),
+      Some(Val::Stack(slot)) => copies.get(&slot).copied(),
+      _ => None,
+   };
+
+   let mut prev_call: Option<(Option<usize>, Option<usize>)> = None;
+   let mut method_url: Option<(Option<usize>, Option<usize>)> = None;
+   let mut dispatches = Vec::new();
+
+   for &insn in code {
+      if let Some((load, rt, rn, off)) = simd_q(insn) {
+         if load {
+            qregs[usize::from(rt)] = match regs[usize::from(rn)] {
+               Some(Val::Req(base)) => base.checked_add_signed(off),
+               _ => None,
+            };
+         } else if let Some(field) = qregs[usize::from(rt)] {
+            let slot = if rn == 31 {
+               usize::try_from(off).ok()
+            } else if let Some(Val::Stack(base)) = regs[usize::from(rn)] {
+               base.checked_add_signed(off)
+            } else {
+               None
+            };
+            if let Some(slot) = slot {
+               stack_copies.insert(slot, field);
+            }
+         }
+         continue;
+      }
+      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
+         if load {
+            let base = match regs[usize::from(rn)] {
+               Some(Val::Req(base)) => Some(base),
+               _ => None,
+            };
+            regs[usize::from(rt)] = base.and_then(|b| b.checked_add_signed(off)).map(Val::Field);
+            regs[usize::from(rt2)] = base
+               .and_then(|b| b.checked_add_signed(off + 8))
+               .map(Val::Field);
+         }
+         continue;
+      }
+      if let Some((rt, rn, rm)) = indexed_load(insn) {
+         regs[usize::from(rt)] = match (regs[usize::from(rn)], regs[usize::from(rm)]) {
+            (_, Some(Val::Field(off))) | (Some(Val::Field(off)), _) => Some(Val::Table(off)),
+            _ => None,
+         };
+         continue;
+      }
+      if let Some((rd, rn, rm)) = add_reg(insn) {
+         regs[usize::from(rd)] = match (regs[usize::from(rn)], regs[usize::from(rm)]) {
+            (_, Some(Val::Table(off) | Val::Field(off)))
+            | (Some(Val::Table(off) | Val::Field(off)), _) => Some(Val::Table(off)),
+            _ => None,
+         };
+         continue;
+      }
+
+      match insn {
+         Insn::MovReg { rd, rm, .. } => regs[usize::from(rd)] = regs[usize::from(rm)],
+         Insn::MovZ { rd, imm, .. } => {
+            regs[usize::from(rd)] = usize::try_from(imm).ok().map(Val::Imm);
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            if rd != 31 {
+               regs[usize::from(rd)] = if rn == 31 {
+                  Some(Val::Stack(imm))
+               } else {
+                  match regs[usize::from(rn)] {
+                     Some(Val::Req(base)) => Some(Val::Req(base + imm)),
+                     Some(Val::Stack(base)) => Some(Val::Stack(base + imm)),
+                     _ => None,
+                  }
+               };
+            }
+         },
+         Insn::Load { rt, rn, offset, .. } => {
+            regs[usize::from(rt)] = match regs[usize::from(rn)] {
+               Some(Val::Req(base)) => Some(Val::Field(base + offset)),
+               _ => None,
+            };
+         },
+         Insn::Writeback {
+            rt,
+            rn,
+            imm,
+            load: true,
+         } => {
+            let next = match regs[usize::from(rn)] {
+               Some(Val::Req(base)) => base.checked_add_signed(imm),
+               _ => None,
+            };
+            regs[usize::from(rn)] = next.map(Val::Req);
+            regs[usize::from(rt)] = next.map(Val::Field);
+         },
+         Insn::Store { rt, rn, offset, .. } => {
+            if let Some(Val::Field(field)) = regs[usize::from(rt)] {
+               let slot = if rn == 31 {
+                  Some(offset)
+               } else if let Some(Val::Stack(base)) = regs[usize::from(rn)] {
+                  Some(base + offset)
+               } else {
+                  None
+               };
+               if let Some(slot) = slot {
+                  stack_copies.insert(slot, field);
+               }
+            }
+         },
+         Insn::Br { rn } => {
+            if let Some(Val::Table(off)) = regs[usize::from(rn)] {
+               dispatches.push(off);
+            }
+         },
+         Insn::Bl { .. } => {
+            if method_url.is_none()
+               && matches!(regs[1], Some(Val::Req(0)))
+               && matches!(regs[2], Some(Val::Imm(HEADER_MAP_SIZE)))
+            {
+               method_url = prev_call;
+            }
+            prev_call = Some((
+               resolve_arg(regs[1], &stack_copies),
+               resolve_arg(regs[2], &stack_copies),
+            ));
+            for slot in &mut regs[..=18] {
+               *slot = None;
+            }
+            qregs = [None; 32];
+         },
+         Insn::Adrp { rd, .. } | Insn::MovN { rd, .. } | Insn::Cset { rd, .. } => {
+            regs[usize::from(rd)] = None;
+         },
+         _ => {},
+      }
+   }
+
+   let Some((Some(method), Some(url))) = method_url else {
+      return Err(format!(
+         "the request call takes {method_url:x?}, not a method and URL"
+      ));
+   };
+   dispatches.sort_unstable();
+   dispatches.dedup();
+   let [body] = dispatches[..] else {
+      return Err(format!("{dispatches:#x?} could each be the body's tag"));
+   };
+   let mut fields = [
+      (0, HEADER_MAP_SIZE),
+      (body, BODY_SIZE),
+      (url, STRING_SIZE),
+      (method, STRING_SIZE),
+   ];
+   fields.sort_unstable();
+   if fields
+      .windows(2)
+      .any(|pair| pair[0].0 + pair[0].1 > pair[1].0)
+      || fields.iter().any(|&(offset, _)| offset % 8 != 0)
+   {
+      return Err(format!(
+         "body {body:#x}, url {url:#x} and method {method:#x} overlap"
+      ));
+   }
+   Ok(RequestLayout { body, url, method })
+}
+
+/// Measures `SendFuture::poll`'s return size and decodes its `ResponseLayout`.
+fn poll_response_layout(
+   image: &Image<'_>,
+   poll_fn: usize,
+) -> (usize, Option<crate::http::ResponseLayout>) {
+   let code = flattened(image, poll_fn);
+   let size = poll_result_size_in(&code);
+   if size <= crate::http::POLL_RESULT_SIZE {
+      return (size, Some(crate::http::ResponseLayout::Legacy));
+   }
+   let layout = stream_response_layout_in(&code, size, |vtable| is_stream_vtable(image, vtable));
+   (size, layout)
+}
+
+fn is_stream_vtable(image: &Image<'_>, vtable: usize) -> bool {
+   let read = |at: usize| image.read_usize(vtable + at);
+   let (Some(drop_fn), Some(size), Some(align), Some(poll_next), Some(size_hint)) =
+      (read(0), read(8), read(16), read(24), read(32))
+   else {
+      return false;
+   };
+   image.is_function(drop_fn)
+      && image.is_function(poll_next)
+      && image.is_function(size_hint)
+      && (1..=0x1000).contains(&size)
+      && align.is_power_of_two()
+      && align <= 64
+}
+
+#[expect(
+   clippy::too_many_lines,
+   reason = "tracks sret, immediates, and adrp pairs in one pass over poll"
+)]
+fn stream_response_layout_in(
+   code: &[Insn],
+   size: usize,
+   valid_vtable: impl Fn(usize) -> bool,
+) -> Option<crate::http::ResponseLayout> {
+   let mut sret = [None::<usize>; 32];
+   let mut pages = [None::<usize>; 32];
+   let mut addrs = [None::<usize>; 32];
+   let mut imms = [None::<u64>; 32];
+   sret[8] = Some(0);
+
+   let mut body = None::<usize>;
+   let mut status = None::<usize>;
+   let mut err_tag = None::<u64>;
+   let mut pending_tag = None::<u64>;
+   // stores of `(tag_val == 1)` via `stp xTag, xData, [sret, #off]` before the vtable store
+   let mut stream_tag_off = None::<usize>;
+
+   for &insn in code {
+      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
+         if load {
+            for r in [rt, rt2] {
+               sret[usize::from(r)] = None;
+               pages[usize::from(r)] = None;
+               addrs[usize::from(r)] = None;
+               imms[usize::from(r)] = None;
+            }
+         } else if let Some(base) = sret[usize::from(rn)]
+            && let Some(at) = base.checked_add_signed(off)
+         {
+            if at == 0
+               && let Some(tag) = imms[usize::from(rt)]
+               && tag < 16
+            {
+               err_tag = Some(tag);
+            } else if imms[usize::from(rt)] == Some(1) {
+               stream_tag_off = Some(at);
+            }
+         }
+         continue;
+      }
+
+      match insn {
+         Insn::Adrp { rd, page } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = Some(page);
+            addrs[r] = None;
+            imms[r] = None;
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            if rd != 31 {
+               let dst = usize::from(rd);
+               let src = usize::from(rn);
+               sret[dst] = sret[src].map(|base| base + imm);
+               addrs[dst] = pages[src].map(|page| page + imm);
+               pages[dst] = None;
+               imms[dst] = None;
+            }
+         },
+         Insn::MovReg { rd, rm, .. } => {
+            let dst = usize::from(rd);
+            let src = usize::from(rm);
+            sret[dst] = sret[src];
+            pages[dst] = pages[src];
+            addrs[dst] = addrs[src];
+            imms[dst] = imms[src];
+         },
+         Insn::MovZ { rd, imm, .. } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = Some(imm);
+         },
+         Insn::MovN { rd, imm, wide } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = Some(if wide {
+               !imm
+            } else {
+               !imm & u64::from(u32::MAX)
+            });
+         },
+         Insn::Store {
+            rt,
+            rn,
+            offset,
+            size: store_size,
+         } => {
+            if let Some(base) = sret[usize::from(rn)] {
+               let at = base + offset;
+               if store_size == 8
+                  && at == 0
+                  && let Some(tag) = imms[usize::from(rt)]
+               {
+                  if tag == u64::MAX {
+                     pending_tag = Some(tag);
+                  } else if tag < 16 {
+                     err_tag = Some(tag);
+                  }
+               } else if store_size == 8
+                  && let Some(vtable) = addrs[usize::from(rt)]
+                  && let Some(tag_off) = stream_tag_off
+                  && at == tag_off + 0x10
+                  && valid_vtable(vtable)
+               {
+                  body = Some(tag_off);
+               } else if store_size == 2
+                  && let Some(body_off) = body
+                  && at >= body_off + 0x28
+                  && status.is_none()
+               {
+                  status = Some(at);
+               }
+            }
+         },
+         Insn::Bl { .. } => {
+            for r in 0..=18 {
+               sret[r] = None;
+               pages[r] = None;
+               addrs[r] = None;
+               imms[r] = None;
+            }
+         },
+         Insn::Load { rt: rd, .. } | Insn::Cset { rd, .. } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = None;
+         },
+         Insn::Writeback { rt, rn, load, .. } => {
+            for r in [rn, if load { rt } else { rn }] {
+               let idx = usize::from(r);
+               sret[idx] = None;
+               pages[idx] = None;
+               addrs[idx] = None;
+               imms[idx] = None;
+            }
+         },
+         _ => {},
+      }
+   }
+
+   let (Some(body), Some(status), Some(err_tag), Some(pending_tag)) =
+      (body, status, err_tag, pending_tag)
+   else {
+      return None;
+   };
+   if body < 0x28
+      || body + 0x28 > size
+      || status + 2 > size
+      || !body.is_multiple_of(8)
+      || !status.is_multiple_of(2)
+   {
+      return None;
+   }
+   Some(crate::http::ResponseLayout::Stream {
+      size,
+      err_tag,
+      pending_tag,
+      body,
+      status,
+   })
+}
+
+fn poll_result_size_in(code: &[Insn]) -> usize {
+   let mut sret = [None::<usize>; 32];
+   let mut w2_imm = None::<usize>;
+   sret[8] = Some(0);
+   let mut max = 0usize;
+
+   for &insn in code {
+      if let Some((false, _, rn, off)) = simd_q(insn) {
+         if let Some(base) = sret[usize::from(rn)]
+            && let Some(end) = base.checked_add_signed(off + 16)
+         {
+            max = max.max(end);
+         }
+         continue;
+      }
+      if let Some((rn, off)) = simd_q_pair_store(insn) {
+         if let Some(base) = sret[usize::from(rn)]
+            && let Some(end) = base.checked_add_signed(off + 32)
+         {
+            max = max.max(end);
+         }
+         continue;
+      }
+      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
+         if load {
+            sret[usize::from(rt)] = None;
+            sret[usize::from(rt2)] = None;
+         } else if let Some(base) = sret[usize::from(rn)]
+            && let Some(end) = base.checked_add_signed(off + 16)
+         {
+            max = max.max(end);
+         }
+         continue;
+      }
+      match insn {
+         Insn::MovReg { rd, rm, .. } => {
+            sret[usize::from(rd)] = sret[usize::from(rm)];
+            if rd == 2 {
+               w2_imm = None;
+            }
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            if rd != 31 {
+               sret[usize::from(rd)] = sret[usize::from(rn)].map(|base| base + imm);
+            }
+            if rd == 2 {
+               w2_imm = None;
+            }
+         },
+         Insn::MovZ { rd, imm, .. } => {
+            sret[usize::from(rd)] = None;
+            if rd == 2 {
+               w2_imm = usize::try_from(imm).ok();
+            }
+         },
+         Insn::Store {
+            rn, offset, size, ..
+         } => {
+            if let Some(base) = sret[usize::from(rn)] {
+               max = max.max(base + offset + size);
+            }
+         },
+         Insn::Bl { .. } => {
+            if let (Some(base), Some(len)) = (sret[0], w2_imm) {
+               max = max.max(base + len);
+            }
+            for slot in &mut sret[..=18] {
+               *slot = None;
+            }
+            w2_imm = None;
+         },
+         Insn::Load { rt: rd, .. }
+         | Insn::Adrp { rd, .. }
+         | Insn::MovN { rd, .. }
+         | Insn::Cset { rd, .. } => {
+            sret[usize::from(rd)] = None;
+            if rd == 2 {
+               w2_imm = None;
+            }
+         },
+         Insn::Writeback { rt, rn, load, .. } => {
+            if load {
+               sret[usize::from(rt)] = None;
+            }
+            sret[usize::from(rn)] = None;
+            if rn == 2 || (load && rt == 2) {
+               w2_imm = None;
+            }
+         },
+         _ => {},
+      }
+   }
+   (max + 7) & !7
 }
 
 /// `(vtable, poll_fn)` for each address `[start, end)` builds that reads as a
@@ -309,24 +936,22 @@ pub fn settings_section(image: &Image<'_>) -> Found<crate::desktop::Section> {
    let page_offset = body
       .iter()
       .take(0x60)
-      .find_map(|&(_, insn)| {
-         match insn {
-            Insn::MovReg {
-               rd,
-               rm: 0,
-               wide: true,
-            } => {
-               state.push(rd);
-               None
-            },
-            Insn::Load {
-               rn,
-               offset,
-               size: 1,
-               ..
-            } if state.contains(&rn) && (0x100..0x2000).contains(&offset) => Some(offset),
-            _ => None,
-         }
+      .find_map(|&(_, insn)| match insn {
+         Insn::MovReg {
+            rd,
+            rm: 0,
+            wide: true,
+         } => {
+            state.push(rd);
+            None
+         },
+         Insn::Load {
+            rn,
+            offset,
+            size: 1,
+            ..
+         } if state.contains(&rn) && (0x100..0x2000).contains(&offset) => Some(offset),
+         _ => None,
       })
       .ok_or("settings section active page load not found")?;
    Ok(crate::desktop::Section { func, page_offset })
@@ -577,16 +1202,14 @@ fn option_u64_reads(image: &Image<'_>) -> Vec<(usize, usize)> {
          if !matches!(insn(index + 1), Some(Insn::Tbz { rt: tested, bit: 0, .. }) if tested == rt) {
             continue;
          }
-         let value = (index.saturating_sub(6)..index + 6).find_map(|at| {
-            match insn(at) {
-               Some(Insn::Load {
-                  rt: value,
-                  rn: base,
-                  offset,
-                  size: 8,
-               }) if base == rn && offset == tag + 8 => Some((at, value)),
-               _ => None,
-            }
+         let value = (index.saturating_sub(6)..index + 6).find_map(|at| match insn(at) {
+            Some(Insn::Load {
+               rt: value,
+               rn: base,
+               offset,
+               size: 8,
+            }) if base == rn && offset == tag + 8 => Some((at, value)),
+            _ => None,
          });
          let Some((value_at, value)) = value else {
             continue;
@@ -617,16 +1240,16 @@ fn option_u64_reads(image: &Image<'_>) -> Vec<(usize, usize)> {
          }
          // The state is huge, so the base is often `add xB, xS, #page, lsl #12`
          // just before; the offset counts from `xS`.
-         let base = (index.saturating_sub(8)..index).rev().find_map(|at| {
-            match insn(at) {
+         let base = (index.saturating_sub(8)..index)
+            .rev()
+            .find_map(|at| match insn(at) {
                Some(Insn::AddImm {
                   rd,
                   rn: source,
                   imm,
                }) if rd == rn && source != 31 => Some(imm),
                _ => None,
-            }
-         });
+            });
          found.push((base.unwrap_or(0) + tag, segment.addr + index * 4));
       }
    }
@@ -647,12 +1270,10 @@ pub fn staff(image: &Image<'_>) -> Found<crate::StaffField> {
    tags.sort_unstable();
    tags.dedup();
    match tags[..] {
-      [tag] => {
-         Ok(crate::StaffField {
-            tag,
-            value: tag + 8,
-         })
-      },
+      [tag] => Ok(crate::StaffField {
+         tag,
+         value: tag + 8,
+      }),
       _ => Err(format!("staff flag reads disagree: {tags:#x?}")),
    }
 }
@@ -663,25 +1284,25 @@ pub fn staff(image: &Image<'_>) -> Found<crate::StaffField> {
 #[derive(Debug, Clone, Copy)]
 pub struct MessageMenu {
    /// `fn(x0 input, x1 cx, x2..x5, d0) -> Vec<MenuItem>` through `x8`.
-   pub build_fn:          usize,
+   pub build_fn: usize,
    /// The message and channel ids, one `ldp` pair. Which is which isn't
    /// decoded; the runtime takes the newer snowflake as the message.
    pub message_id_offset: usize,
    pub channel_id_offset: usize,
    /// `props_new(x8 out, x0 &SharedString, w1, w2)`.
-   pub props_new:         usize,
+   pub props_new: usize,
    /// `with_id(x8 out, x0 item, x1 ptr, x2 len)`.
-   pub with_id:           usize,
+   pub with_id: usize,
    /// `with_icon(x8 out, x0 item, w1 icon)`.
-   pub with_icon:         usize,
+   pub with_icon: usize,
    /// `with_color(x8 out, x0 item, w1 color)`, which Discord calls with 2
    /// for its danger items.
-   pub with_color:        Option<usize>,
+   pub with_color: Option<usize>,
    /// `Vec<MenuItem>::push(x0 vec, x1 item)`.
-   pub vec_push:          usize,
+   pub vec_push: usize,
    /// `MenuItem::Separator`'s tag, from a push of an item that is only a tag.
-   pub separator_tag:     Option<u64>,
-   pub layout:            crate::desktop::MenuLayout,
+   pub separator_tag: Option<u64>,
+   pub layout: crate::desktop::MenuLayout,
 }
 
 /// `fn`'s instructions with each outlined stub inlined: a `bl` to a short
@@ -796,37 +1417,31 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    let head = &body[..body.len().min(48)];
    let input = head
       .iter()
-      .find_map(|insn| {
-         match *insn {
-            Insn::MovReg {
-               rd,
-               rm: 0,
-               wide: true,
-            } if rd >= 19 => Some(rd),
-            _ => None,
-         }
+      .find_map(|insn| match *insn {
+         Insn::MovReg {
+            rd,
+            rm: 0,
+            wide: true,
+         } if rd >= 19 => Some(rd),
+         _ => None,
       })
       .ok_or("MessageContextMenu input register not found")?;
    let message_id_offset = head
       .iter()
-      .find_map(|&insn| {
-         match pair(insn) {
-            Some((true, _, _, rn, offset)) if rn == input && (0x20..=0x400).contains(&offset) => {
-               usize::try_from(offset).ok()
-            },
-            _ => None,
-         }
+      .find_map(|&insn| match pair(insn) {
+         Some((true, _, _, rn, offset)) if rn == input && (0x20..=0x400).contains(&offset) => {
+            usize::try_from(offset).ok()
+         },
+         _ => None,
       })
       .ok_or("MessageContextMenu message id load not found")?;
 
    let calls_after = |want: fn(&Insn) -> bool| {
       body
          .windows(2)
-         .filter_map(|pair| {
-            match pair {
-               [before, Insn::Bl { target }] if want(before) => Some(*target),
-               _ => None,
-            }
+         .filter_map(|pair| match pair {
+            [before, Insn::Bl { target }] if want(before) => Some(*target),
+            _ => None,
          })
          .collect::<Vec<_>>()
    };
@@ -858,24 +1473,20 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    // `push` strides by the item size: `mov w9, #size; madd x0, len, x9, ptr`.
    let push_stride = |func: usize| {
       let code = flattened(image, func);
-      code.windows(2).find_map(|pair| {
-         match pair {
-            [Insn::MovZ { rd: 9, imm, .. }, Insn::Other(word)]
-               if word & 0xFFE0_8000 == 0x9B00_0000 && (word >> 16) & 31 == 9 =>
-            {
-               usize::try_from(*imm).ok()
-            },
-            _ => None,
-         }
+      code.windows(2).find_map(|pair| match pair {
+         [Insn::MovZ { rd: 9, imm, .. }, Insn::Other(word)]
+            if word & 0xFFE0_8000 == 0x9B00_0000 && (word >> 16) & 31 == 9 =>
+         {
+            usize::try_from(*imm).ok()
+         },
+         _ => None,
       })
    };
    let mut pushes = body
       .iter()
-      .filter_map(|insn| {
-         match *insn {
-            Insn::Bl { target } => push_stride(target).map(|size| (target, size)),
-            _ => None,
-         }
+      .filter_map(|insn| match *insn {
+         Insn::Bl { target } => push_stride(target).map(|size| (target, size)),
+         _ => None,
       })
       .collect::<Vec<_>>();
    let vec_push = most_common(pushes.iter().map(|&(target, _)| target), 3)
@@ -889,11 +1500,9 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    let calls: Vec<(usize, usize)> = body
       .iter()
       .enumerate()
-      .filter_map(|(at, insn)| {
-         match insn {
-            Insn::Bl { target } => Some((at, *target)),
-            _ => None,
-         }
+      .filter_map(|(at, insn)| match insn {
+         Insn::Bl { target } => Some((at, *target)),
+         _ => None,
       })
       .collect();
    for window in calls.windows(3) {
@@ -920,11 +1529,9 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    // `mov x3, x1; mov w1, #0; b core`.
    let mut targets = body
       .iter()
-      .filter_map(|insn| {
-         match *insn {
-            Insn::Bl { target } => Some(target),
-            _ => None,
-         }
+      .filter_map(|insn| match *insn {
+         Insn::Bl { target } => Some(target),
+         _ => None,
       })
       .collect::<Vec<_>>();
    targets.sort_unstable();
@@ -934,15 +1541,13 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
       .flat_map(|ctor| {
          flattened(image, ctor)
             .windows(3)
-            .filter_map(|window| {
-               match window {
-                  [
-                     Insn::MovReg { rd: 3, rm: 1, .. },
-                     Insn::MovZ { rd: 1, imm: 0, .. },
-                     Insn::Bl { target },
-                  ] => Some(*target),
-                  _ => None,
-               }
+            .filter_map(|window| match window {
+               [
+                  Insn::MovReg { rd: 3, rm: 1, .. },
+                  Insn::MovZ { rd: 1, imm: 0, .. },
+                  Insn::Bl { target },
+               ] => Some(*target),
+               _ => None,
             })
             .collect::<Vec<_>>()
       })
@@ -951,30 +1556,26 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    cores.dedup();
    let read_core = |core: usize| -> Option<(usize, crate::desktop::MenuLayout)> {
       let code = flattened(image, core);
-      let props_new = code.windows(2).find_map(|pair| {
-         match pair {
-            [Insn::AddImm { rd: 8, rn: 31, .. }, Insn::Bl { target }] => Some(*target),
-            _ => None,
-         }
+      let props_new = code.windows(2).find_map(|pair| match pair {
+         [Insn::AddImm { rd: 8, rn: 31, .. }, Insn::Bl { target }] => Some(*target),
+         _ => None,
       })?;
-      let (props, props_size) = code.windows(4).find_map(|window| {
-         match window {
-            [
-               Insn::AddImm {
-                  rd: 0,
-                  rn,
-                  imm: props,
-               },
-               Insn::AddImm { rd: 1, rn: 31, .. },
-               Insn::MovZ {
-                  rd: 2,
-                  imm: props_size,
-                  ..
-               },
-               Insn::Bl { .. },
-            ] if *rn != 31 => Some((*props, usize::try_from(*props_size).ok()?)),
-            _ => None,
-         }
+      let (props, props_size) = code.windows(4).find_map(|window| match window {
+         [
+            Insn::AddImm {
+               rd: 0,
+               rn,
+               imm: props,
+            },
+            Insn::AddImm { rd: 1, rn: 31, .. },
+            Insn::MovZ {
+               rd: 2,
+               imm: props_size,
+               ..
+            },
+            Insn::Bl { .. },
+         ] if *rn != 31 => Some((*props, usize::try_from(*props_size).ok()?)),
+         _ => None,
       })?;
       let (on_click, action_tag) = code.windows(3).find_map(|window| {
          let [
@@ -995,14 +1596,17 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
          };
          (base == base2).then_some((usize::try_from(on_click).ok()?, *tag))
       })?;
-      Some((props_new, crate::desktop::MenuLayout {
-         size,
-         props,
-         props_size,
-         action_tag,
-         on_click,
-         on_click_tag: on_click.checked_sub(8)?,
-      }))
+      Some((
+         props_new,
+         crate::desktop::MenuLayout {
+            size,
+            props,
+            props_size,
+            action_tag,
+            on_click,
+            on_click_tag: on_click.checked_sub(8)?,
+         },
+      ))
    };
    let decoded = cores.into_iter().filter_map(read_core).collect::<Vec<_>>();
    let Some(&(props_new, layout)) = decoded.first() else {
@@ -1054,23 +1658,19 @@ fn separator_tag(image: &Image<'_>, vec_push: usize, action_tag: u64) -> Option<
       let insns: Vec<Insn> = arm64::decode_all(code, site - 8 * 4)
          .map(|(_, insn)| insn)
          .collect();
-      let Some(slot) = insns.iter().rev().find_map(|insn| {
-         match *insn {
-            Insn::AddImm { rd: 1, rn: 31, imm } => Some(imm),
-            _ => None,
-         }
+      let Some(slot) = insns.iter().rev().find_map(|insn| match *insn {
+         Insn::AddImm { rd: 1, rn: 31, imm } => Some(imm),
+         _ => None,
       }) else {
          continue;
       };
       let stores: Vec<(u8, usize)> = insns
          .iter()
-         .filter_map(|insn| {
-            match *insn {
-               Insn::Store {
-                  rt, rn: 31, offset, ..
-               } if offset >= slot && offset < slot + 0x200 => Some((rt, offset)),
-               _ => None,
-            }
+         .filter_map(|insn| match *insn {
+            Insn::Store {
+               rt, rn: 31, offset, ..
+            } if offset >= slot && offset < slot + 0x200 => Some((rt, offset)),
+            _ => None,
          })
          .collect();
       let [(rt, offset)] = stores.as_slice() else {
@@ -1079,11 +1679,9 @@ fn separator_tag(image: &Image<'_>, vec_push: usize, action_tag: u64) -> Option<
       if *offset != slot {
          continue;
       }
-      let tag = insns.iter().rev().find_map(|insn| {
-         match *insn {
-            Insn::MovZ { rd, imm, .. } if rd == *rt => Some(imm),
-            _ => None,
-         }
+      let tag = insns.iter().rev().find_map(|insn| match *insn {
+         Insn::MovZ { rd, imm, .. } if rd == *rt => Some(imm),
+         _ => None,
       });
       if let Some(tag) = tag.filter(|&tag| tag < 0x10 && tag != action_tag) {
          tags.push(tag);
@@ -1103,17 +1701,15 @@ fn loaded(insns: &[(usize, Insn)]) -> Vec<Option<(u8, usize)>> {
    let mut pages = [None::<usize>; 32];
    insns
       .iter()
-      .map(|&(_, insn)| {
-         match insn {
-            Insn::Adrp { rd, page } => {
-               pages[usize::from(rd)] = Some(page);
-               None
-            },
-            Insn::AddImm { rd, rn, imm } if rn != 31 => {
-               pages[usize::from(rn)].map(|page| (rd, page + imm))
-            },
-            _ => None,
-         }
+      .map(|&(_, insn)| match insn {
+         Insn::Adrp { rd, page } => {
+            pages[usize::from(rd)] = Some(page);
+            None
+         },
+         Insn::AddImm { rd, rn, imm } if rn != 31 => {
+            pages[usize::from(rn)].map(|page| (rd, page + imm))
+         },
+         _ => None,
       })
       .collect()
 }
@@ -1122,7 +1718,7 @@ fn loaded(insns: &[(usize, Insn)]) -> Vec<Option<(u8, usize)>> {
 /// stack since the call before.
 #[derive(Clone, Copy, Debug)]
 struct Built {
-   at:     usize,
+   at: usize,
    target: usize,
 }
 
@@ -1172,12 +1768,12 @@ fn anchored(image: &Image<'_>, name: &[u8], what: &str) -> Found<(Vec<(usize, In
 
 /// The first call `func` makes, through its stubs.
 fn first_call(image: &Image<'_>, func: usize) -> Option<usize> {
-   flattened(image, func).into_iter().find_map(|insn| {
-      match insn {
+   flattened(image, func)
+      .into_iter()
+      .find_map(|insn| match insn {
          Insn::Bl { target } => Some(target),
          _ => None,
-      }
-   })
+      })
 }
 
 /// [`crate::desktop::Gpui`] for arm64, from the same two call sites as x86.
@@ -1224,15 +1820,13 @@ pub fn gpui(image: &Image<'_>) -> Found<crate::desktop::Gpui> {
    };
    let alloc_or_oom = flattened(image, switch_on_change.target)
       .windows(3)
-      .find_map(|window| {
-         match window {
-            [
-               Insn::MovZ { rd: 0, .. },
-               Insn::MovZ { rd: 1, .. },
-               Insn::Bl { target },
-            ] => Some(*target),
-            _ => None,
-         }
+      .find_map(|window| match window {
+         [
+            Insn::MovZ { rd: 0, .. },
+            Insn::MovZ { rd: 1, .. },
+            Insn::Bl { target },
+         ] => Some(*target),
+         _ => None,
       })
       .ok_or("alloc_or_oom not found in Switch::on_change")?;
 
@@ -1281,17 +1875,15 @@ pub fn gpui(image: &Image<'_>) -> Found<crate::desktop::Gpui> {
       .map(|&(_, insn)| insn)
       .collect::<Vec<_>>()
       .windows(2)
-      .filter_map(|pair| {
-         match pair {
-            [
-               Insn::MovZ {
-                  rd: 2, wide: false, ..
-               },
-               Insn::Bl { .. },
-            ] => None,
-            [_, Insn::Bl { target }] => Some(*target),
-            _ => None,
-         }
+      .filter_map(|pair| match pair {
+         [
+            Insn::MovZ {
+               rd: 2, wide: false, ..
+            },
+            Insn::Bl { .. },
+         ] => None,
+         [_, Insn::Bl { target }] => Some(*target),
+         _ => None,
       })
       .collect::<Vec<_>>();
    let last_child = row_calls
@@ -1341,10 +1933,14 @@ pub fn gpui(image: &Image<'_>) -> Found<crate::desktop::Gpui> {
 fn shared_string_into_any(image: &Image<'_>, div_child_div: usize) -> Option<usize> {
    let drops_string = |func: usize| {
       flattened(image, func).windows(3).any(|window| {
-         matches!(window, [Insn::CmpImm { imm: 0xFF, .. }, _, Insn::CmpImm {
-            imm: 0x19,
-            ..
-         }])
+         matches!(
+            window,
+            [
+               Insn::CmpImm { imm: 0xFF, .. },
+               _,
+               Insn::CmpImm { imm: 0x19, .. }
+            ]
+         )
       })
    };
    let mut at = image.function_bounds(div_child_div)?.1;
@@ -1352,11 +1948,9 @@ fn shared_string_into_any(image: &Image<'_>, div_child_div: usize) -> Option<usi
       let (start, end) = image.function_bounds(at)?;
       let found = flattened(image, start)
          .into_iter()
-         .filter_map(|insn| {
-            match insn {
-               Insn::Bl { target } => Some(target),
-               _ => None,
-            }
+         .filter_map(|insn| match insn {
+            Insn::Bl { target } => Some(target),
+            _ => None,
          })
          .find(|&target| drops_string(target));
       if found.is_some() {
@@ -1370,16 +1964,14 @@ fn shared_string_into_any(image: &Image<'_>, div_child_div: usize) -> Option<usi
 /// `div_child_div`'s push of the child onto `self.children`: `add x0, xS,
 /// #children`, the element into `x1`, then the call. The offset and `push`.
 fn children_push(code: &[Insn]) -> Option<(usize, usize)> {
-   code.windows(3).find_map(|window| {
-      match window {
-         [Insn::AddImm { rd: 0, rn, imm }, Insn::Bl { target }, ..]
-         | [Insn::AddImm { rd: 0, rn, imm }, _, Insn::Bl { target }]
-            if *rn != 31 =>
-         {
-            Some((*imm, *target))
-         },
-         _ => None,
-      }
+   code.windows(3).find_map(|window| match window {
+      [Insn::AddImm { rd: 0, rn, imm }, Insn::Bl { target }, ..]
+      | [Insn::AddImm { rd: 0, rn, imm }, _, Insn::Bl { target }]
+         if *rn != 31 =>
+      {
+         Some((*imm, *target))
+      },
+      _ => None,
    })
 }
 
@@ -1389,51 +1981,49 @@ fn children_push(code: &[Insn]) -> Option<(usize, usize)> {
 fn handler_store(image: &Image<'_>, setter: usize) -> Option<(usize, usize)> {
    let code = flattened(image, setter);
    let alloc = code.windows(3).position(|window| {
-      matches!(window, [
-         Insn::MovZ { rd: 0, imm: 8, .. },
-         Insn::MovZ { rd: 1, .. },
-         Insn::Bl { .. }
-      ])
+      matches!(
+         window,
+         [
+            Insn::MovZ { rd: 0, imm: 8, .. },
+            Insn::MovZ { rd: 1, .. },
+            Insn::Bl { .. }
+         ]
+      )
    })? + 3;
-   let boxed = code[alloc..].iter().find_map(|insn| {
-      match *insn {
-         Insn::MovReg { rd, rm: 0, .. } => Some(rd),
-         _ => None,
-      }
+   let boxed = code[alloc..].iter().find_map(|insn| match *insn {
+      Insn::MovReg { rd, rm: 0, .. } => Some(rd),
+      _ => None,
    })?;
-   let offset = code[alloc..].iter().find_map(|insn| {
-      match *insn {
-         Insn::Store {
-            rt,
-            offset,
-            size: 8,
-            ..
-         } if rt == boxed => Some(offset),
-         _ => None,
-      }
+   let offset = code[alloc..].iter().find_map(|insn| match *insn {
+      Insn::Store {
+         rt,
+         offset,
+         size: 8,
+         ..
+      } if rt == boxed => Some(offset),
+      _ => None,
    })?;
    // An epilogue `ldp` may sit between the size and the tail call.
-   let size = code[alloc..].windows(3).find_map(|window| {
-      match window {
-         [
-            Insn::MovZ { rd: 2, imm, .. },
-            Insn::B { .. } | Insn::Bl { .. },
-            _,
-         ]
-         | [
-            Insn::MovZ { rd: 2, imm, .. },
-            _,
-            Insn::B { .. } | Insn::Bl { .. },
-         ] => usize::try_from(*imm).ok(),
-         _ => None,
-      }
+   let size = code[alloc..].windows(3).find_map(|window| match window {
+      [
+         Insn::MovZ { rd: 2, imm, .. },
+         Insn::B { .. } | Insn::Bl { .. },
+         _,
+      ]
+      | [
+         Insn::MovZ { rd: 2, imm, .. },
+         _,
+         Insn::B { .. } | Insn::Bl { .. },
+      ] => usize::try_from(*imm).ok(),
+      _ => None,
    })?;
    Some((offset, size))
 }
 
 /// Where a `Switch` setter keeps its `Option<SharedString>`: it reads the tag
 /// with a writeback load off `self` (`ldrb w8, [x23, #off]!`) and checks it for
-/// `None` (`cmp w8, #0xff`).
+/// `None` (`cmp w8, #0xff`). On build 2233 `Switch::label` wraps an inner
+/// setter, so one level of direct `bl` callees is checked if needed.
 fn option_string_field(image: &Image<'_>, setter: usize) -> Option<usize> {
    option_string_store(image, setter).or_else(|| {
       // Some builds wrap the setter: it copies the `Switch` and calls the real
@@ -1449,6 +2039,16 @@ fn option_string_field(image: &Image<'_>, setter: usize) -> Option<usize> {
 
 fn option_string_store(image: &Image<'_>, setter: usize) -> Option<usize> {
    let code = flattened(image, setter);
+   if let Some(offset) = option_string_field_in(&code) {
+      return Some(offset);
+   }
+   code.iter().find_map(|&insn| match insn {
+      Insn::Bl { target } => option_string_field_in(&flattened(image, target)),
+      _ => None,
+   })
+}
+
+fn option_string_field_in(code: &[Insn]) -> Option<usize> {
    let mut selves = vec![0u8];
    for (index, &insn) in code.iter().enumerate() {
       match insn {
@@ -1497,11 +2097,9 @@ pub fn post_ctor_byte_stores(image: &Image<'_>, ctor: usize, size: usize) -> Vec
          let Some(base) = code[at.saturating_sub(12)..at]
             .iter()
             .rev()
-            .find_map(|&(_, insn)| {
-               match insn {
-                  Insn::AddImm { rd: 8, rn: 31, imm } => Some(imm),
-                  _ => None,
-               }
+            .find_map(|&(_, insn)| match insn {
+               Insn::AddImm { rd: 8, rn: 31, imm } => Some(imm),
+               _ => None,
             })
          else {
             continue;
@@ -1555,13 +2153,7 @@ pub fn gpui_layouts(
    image: &Image<'_>,
    gpui: &crate::desktop::Gpui,
 ) -> Found<crate::desktop::GpuiLayout> {
-   use crate::desktop::{
-      ButtonLayout,
-      DivLayout,
-      GpuiLayout,
-      SwitchLayout,
-      layout,
-   };
+   use crate::desktop::{ButtonLayout, DivLayout, GpuiLayout, SwitchLayout, layout};
 
    // `div_child_div` pushes the child at `self + children`, then copies `self`
    // out through its `x8` copy field by field; the last store is the end.
@@ -1569,28 +2161,24 @@ pub fn gpui_layouts(
    let (children, _) = children_push(&child).ok_or("Div children SmallVec offset not found")?;
    let out = child
       .iter()
-      .find_map(|insn| {
-         match *insn {
-            Insn::MovReg { rd, rm: 8, .. } => Some(rd),
-            _ => None,
-         }
+      .find_map(|insn| match *insn {
+         Insn::MovReg { rd, rm: 8, .. } => Some(rd),
+         _ => None,
       })
       .ok_or("div_child_div result register not found")?;
    let div_size = child
       .iter()
-      .filter_map(|&insn| {
-         match insn {
-            Insn::Store {
-               rn, offset, size, ..
-            } if rn == out => Some(offset + size),
-            Insn::Other(word)
-               if word & 0xFFC0_0000 == 0xAD00_0000 && (word >> 5) & 31 == u32::from(out) =>
-            {
-               let imm = (((word >> 15) & 0x7F) << 25).cast_signed() >> 25;
-               usize::try_from(imm * 16 + 32).ok()
-            },
-            _ => None,
-         }
+      .filter_map(|&insn| match insn {
+         Insn::Store {
+            rn, offset, size, ..
+         } if rn == out => Some(offset + size),
+         Insn::Other(word)
+            if word & 0xFFC0_0000 == 0xAD00_0000 && (word >> 5) & 31 == u32::from(out) =>
+         {
+            let imm = (((word >> 15) & 0x7F) << 25).cast_signed() >> 25;
+            usize::try_from(imm * 16 + 32).ok()
+         },
+         _ => None,
       })
       .max()
       .ok_or("Div size not found")?;
@@ -1601,34 +2189,28 @@ pub fn gpui_layouts(
    let (interactivity_size, boxed_at) = new
       .windows(3)
       .enumerate()
-      .find_map(|(at, window)| {
-         match window {
-            [
-               Insn::MovZ { rd: 0, imm, .. },
-               Insn::MovZ { rd: 1, imm: 8, .. },
-               Insn::Bl { .. },
-            ] if (0x100..0x2000).contains(imm) => Some((usize::try_from(*imm).ok()?, at + 3)),
-            _ => None,
-         }
+      .find_map(|(at, window)| match window {
+         [
+            Insn::MovZ { rd: 0, imm, .. },
+            Insn::MovZ { rd: 1, imm: 8, .. },
+            Insn::Bl { .. },
+         ] if (0x100..0x2000).contains(imm) => Some((usize::try_from(*imm).ok()?, at + 3)),
+         _ => None,
       })
       .ok_or("Div::new Interactivity allocation not found")?;
    let boxed = new[boxed_at..]
       .iter()
-      .find_map(|insn| {
-         match *insn {
-            Insn::MovReg { rd, rm: 0, .. } => Some(rd),
-            _ => None,
-         }
+      .find_map(|insn| match *insn {
+         Insn::MovReg { rd, rm: 0, .. } => Some(rd),
+         _ => None,
       })
       .ok_or("Div::new Interactivity register not found")?;
    let interactivity = new[boxed_at..]
       .iter()
-      .find_map(|&insn| {
-         match pair(insn) {
-            Some((false, rt, _, _, offset)) if rt == boxed => usize::try_from(offset).ok(),
-            Some((false, _, rt2, _, offset)) if rt2 == boxed => usize::try_from(offset + 8).ok(),
-            _ => None,
-         }
+      .find_map(|&insn| match pair(insn) {
+         Some((false, rt, _, _, offset)) if rt == boxed => usize::try_from(offset).ok(),
+         Some((false, _, rt2, _, offset)) if rt2 == boxed => usize::try_from(offset + 8).ok(),
+         _ => None,
       })
       .ok_or("Div::new Interactivity store not found")?;
    if children + 0x48 > div_size || interactivity + 8 > div_size || div_size > layout::DIV_CAP {
@@ -1640,11 +2222,9 @@ pub fn gpui_layouts(
    // `Interactivity::default` boxes the `StyleRefinement`.
    let style_bytes = new
       .iter()
-      .filter_map(|insn| {
-         match *insn {
-            Insn::Bl { target } => Some(target),
-            _ => None,
-         }
+      .filter_map(|insn| match *insn {
+         Insn::Bl { target } => Some(target),
+         _ => None,
       })
       .find_map(|callee| {
          flattened(image, callee)
@@ -1652,15 +2232,13 @@ pub fn gpui_layouts(
             .take(40)
             .collect::<Vec<_>>()
             .windows(3)
-            .find_map(|window| {
-               match window {
-                  [
-                     Insn::MovZ { rd: 0, imm, .. },
-                     Insn::MovZ { rd: 1, imm: 8, .. },
-                     Insn::Bl { .. },
-                  ] if (0x200..=0x400).contains(imm) => usize::try_from(*imm).ok(),
-                  _ => None,
-               }
+            .find_map(|window| match window {
+               [
+                  Insn::MovZ { rd: 0, imm, .. },
+                  Insn::MovZ { rd: 1, imm: 8, .. },
+                  Insn::Bl { .. },
+               ] if (0x200..=0x400).contains(imm) => usize::try_from(*imm).ok(),
+               _ => None,
             })
       })
       .ok_or("Interactivity::default StyleRefinement allocation not found")?;
@@ -1722,11 +2300,11 @@ pub fn gpui_layouts(
 #[derive(Debug, Clone, Copy)]
 pub struct MessageRow {
    /// `fn(x0 row, x1..x7, d0, one stack word) -> AnyElement` through `x8`.
-   pub func:       usize,
+   pub func: usize,
    /// `row + rc` holds the message's `Rc`.
-   pub rc:         usize,
+   pub rc: usize,
    /// The message inside the `Rc` allocation.
-   pub value:      usize,
+   pub value: usize,
    /// The id inside the message.
    pub message_id: usize,
 }
@@ -1775,12 +2353,10 @@ pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
       parents.dedup();
       common = Some(match common {
          None => parents,
-         Some(common) => {
-            common
-               .into_iter()
-               .filter(|func| parents.contains(func))
-               .collect()
-         },
+         Some(common) => common
+            .into_iter()
+            .filter(|func| parents.contains(func))
+            .collect(),
       });
    }
    let func = one("MessageRow::render", &common.unwrap_or_default())?;
@@ -1793,69 +2369,64 @@ pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
       .find_map(|&(helper, site, _)| {
          let insns = flattened_at(image, helper);
          let at = insns.iter().position(|&(pc, _)| pc >= site)?;
-         let id = insns[at.saturating_sub(40)..at]
-            .iter()
-            .rev()
-            .find_map(|&(_, insn)| {
-               match insn {
+         let id =
+            insns[at.saturating_sub(40)..at]
+               .iter()
+               .rev()
+               .find_map(|&(_, insn)| match insn {
                   Insn::AddImm { rd: 8, rn, imm } if rn != 31 && (0x100..=0x800).contains(&imm) => {
                      Some(imm)
                   },
                   _ => None,
-               }
-            })?;
+               })?;
          let call = render
             .iter()
             .position(|&(_, insn)| insn == Insn::Bl { target: helper })?;
          let (slot, value) = render[call.saturating_sub(24)..call]
             .windows(2)
             .rev()
-            .find_map(|pair| {
-               match *pair {
-                  [
-                     (
-                        _,
-                        Insn::Load {
-                           rt,
-                           rn: 31,
-                           offset: slot,
-                           size: 8,
-                        },
-                     ),
-                     (_, Insn::AddImm { rd: 0, rn, imm }),
-                  ] if rn == rt && imm < 0x40 => Some((slot, imm)),
-                  _ => None,
-               }
+            .find_map(|pair| match *pair {
+               [
+                  (
+                     _,
+                     Insn::Load {
+                        rt,
+                        rn: 31,
+                        offset: slot,
+                        size: 8,
+                     },
+                  ),
+                  (_, Insn::AddImm { rd: 0, rn, imm }),
+               ] if rn == rt && imm < 0x40 => Some((slot, imm)),
+               _ => None,
             })?;
          Some((id, slot, value))
       })
       .ok_or("no message-content helper's message argument decodes")?;
    let rc = render
       .windows(2)
-      .find_map(|pair| {
-         match *pair {
-            [
-               (
-                  _,
-                  Insn::Load {
-                     rt,
-                     offset: rc,
-                     size: 8,
-                     rn,
-                  },
-               ),
-               (
-                  _,
-                  Insn::Store {
-                     rt: stored,
-                     rn: 31,
-                     offset,
-                     size: 8,
-                  },
-               ),
-            ] if stored == rt && offset == slot && rn != 31 => Some(rc),
-            _ => None,
-         }
+      .find_map(|pair| match *pair {
+         [
+            (
+               _,
+               Insn::Load {
+                  rt,
+                  offset: rc,
+                  size: 8,
+                  rn,
+               },
+            ),
+            (
+               _,
+               Insn::Store {
+                  rt: stored,
+                  rn: 31,
+                  offset,
+                  size: 8,
+               },
+            ),
+         ] if stored == rt && offset == slot && rn != 31 => Some(rc),
+         _ => None,
       })
       .ok_or("the row's message Rc not found")?;
    Ok(MessageRow {
@@ -1921,13 +2492,11 @@ pub fn emoji_check(image: &Image<'_>) -> Found<crate::desktop::EmojiCheck> {
    entries.dedup();
    match entries.as_slice() {
       &[(func, intention)] => Ok(crate::desktop::EmojiCheck { func, intention }),
-      _ => {
-         Err(format!(
-            "emoji check matched {} entries among {:x?}",
-            entries.len(),
-            found
-         ))
-      },
+      _ => Err(format!(
+         "emoji check matched {} entries among {:x?}",
+         entries.len(),
+         found
+      )),
    }
 }
 
@@ -2064,12 +2633,15 @@ pub fn message_json(image: &Image<'_>) -> Found<MessageJson> {
          .map(|(_, insn)| insn)
          .collect();
       let loads_tag = insns.iter().position(|insn| {
-         matches!(insn, Insn::Load {
-            rn: 0,
-            offset: 0,
-            size: 8,
-            ..
-         })
+         matches!(
+            insn,
+            Insn::Load {
+               rn: 0,
+               offset: 0,
+               size: 8,
+               ..
+            }
+         )
       });
       loads_tag.is_some_and(|at| {
          let Insn::Load { rt, .. } = insns[at] else {
@@ -2089,11 +2661,9 @@ pub fn message_json(image: &Image<'_>) -> Found<MessageJson> {
    let called = serializers.into_iter().flat_map(|caller| {
       flattened_at(image, caller)
          .into_iter()
-         .filter_map(|(_, insn)| {
-            match insn {
-               Insn::Bl { target } | Insn::B { target } => Some(target),
-               _ => None,
-            }
+         .filter_map(|(_, insn)| match insn {
+            Insn::Bl { target } | Insn::B { target } => Some(target),
+            _ => None,
          })
    });
    let drop_value = most_common(called.filter(|&callee| is_value_drop(callee)), 2)
@@ -2114,8 +2684,8 @@ pub fn message_json(image: &Image<'_>) -> Found<MessageJson> {
 /// its id and channel id.
 #[derive(Clone, Copy, Debug)]
 pub struct MessageJson {
-   pub json:       crate::desktop::MessageJson,
-   pub id:         usize,
+   pub json: crate::desktop::MessageJson,
+   pub id: usize,
    pub channel_id: usize,
 }
 
@@ -2125,15 +2695,13 @@ pub struct MessageJson {
 fn serialized_ids(image: &Image<'_>, to_value: usize) -> Option<(usize, usize)> {
    let (_, code) = arm64::function(image, to_value)?;
    // The register holding the message, copied from `x0` on entry.
-   let message = code.iter().take(16).find_map(|&(_, insn)| {
-      match insn {
-         Insn::MovReg {
-            rd,
-            rm: 0,
-            wide: true,
-         } => Some(rd),
-         _ => None,
-      }
+   let message = code.iter().take(16).find_map(|&(_, insn)| match insn {
+      Insn::MovReg {
+         rd,
+         rm: 0,
+         wide: true,
+      } => Some(rd),
+      _ => None,
    })?;
    let (mut key_len, mut field) = (None, None);
    let (mut id, mut channel_id) = (None, None);
@@ -2163,12 +2731,10 @@ fn real_callees(image: &Image<'_>, func: usize) -> std::collections::HashSet<usi
    let end = image.function_bounds(func).map_or(func, |(_, end)| end);
    flattened_at(image, func)
       .into_iter()
-      .filter_map(|(_, insn)| {
-         match insn {
-            Insn::Bl { target } => Some(target),
-            Insn::B { target } if !(func..end).contains(&target) => Some(target),
-            _ => None,
-         }
+      .filter_map(|(_, insn)| match insn {
+         Insn::Bl { target } => Some(target),
+         Insn::B { target } if !(func..end).contains(&target) => Some(target),
+         _ => None,
       })
       .filter(|&target| image.is_function(target))
       .collect()
@@ -2223,15 +2789,13 @@ pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<Vec<
 fn deletes_one_message(image: &Image<'_>, func: usize) -> bool {
    let code = flattened(image, func);
    let head = &code[..code.len().min(40)];
-   let Some(args) = head.iter().find_map(|insn| {
-      match *insn {
-         Insn::MovReg {
-            rd,
-            rm: 1,
-            wide: true,
-         } if rd >= 19 => Some(rd),
-         _ => None,
-      }
+   let Some(args) = head.iter().find_map(|insn| match *insn {
+      Insn::MovReg {
+         rd,
+         rm: 1,
+         wide: true,
+      } if rd >= 19 => Some(rd),
+      _ => None,
    }) else {
       return false;
    };
@@ -2239,11 +2803,14 @@ fn deletes_one_message(image: &Image<'_>, func: usize) -> bool {
       return false;
    };
    if !head[..lock].iter().any(|insn| {
-      matches!(insn, Insn::MovReg {
-         rd:   1,
-         rm:   2,
-         wide: true,
-      })
+      matches!(
+         insn,
+         Insn::MovReg {
+            rd: 1,
+            rm: 2,
+            wide: true,
+         }
+      )
    }) {
       return false;
    }
@@ -2266,11 +2833,11 @@ fn deletes_one_message(image: &Image<'_>, func: usize) -> bool {
 /// where its config (`x1`) keeps the row's text colors.
 #[derive(Clone, Debug)]
 pub struct MessageBody {
-   pub func:       usize,
+   pub func: usize,
    pub row_colors: usize,
    /// Every color offset the builder loads, sorted, to check another one
    /// against.
-   pub colors:     Vec<usize>,
+   pub colors: Vec<usize>,
 }
 
 /// [`crate::desktop::message_body`] for arm64.
@@ -2287,11 +2854,9 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
    )?;
    let called: std::collections::HashSet<usize> = flattened_at(image, render_row)
       .into_iter()
-      .filter_map(|(_, insn)| {
-         match insn {
-            Insn::Bl { target } => Some(target),
-            _ => None,
-         }
+      .filter_map(|(_, insn)| match insn {
+         Insn::Bl { target } => Some(target),
+         _ => None,
       })
       .collect();
    let mut found: Vec<usize> = arm64::code_refs(image, anchor..anchor + 1)
@@ -2303,26 +2868,22 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
    found.dedup();
    let func = one("message body builder", &found)?;
    let code = flattened_at(image, func);
-   let config = code.iter().take(24).find_map(|&(_, insn)| {
-      match insn {
-         Insn::MovReg {
-            rd,
-            rm: 1,
-            wide: true,
-         } => Some(rd),
-         _ => None,
-      }
+   let config = code.iter().take(24).find_map(|&(_, insn)| match insn {
+      Insn::MovReg {
+         rd,
+         rm: 1,
+         wide: true,
+      } => Some(rd),
+      _ => None,
    });
    let config = config.ok_or("message body builder keeps no copy of its config")?;
    let movs: Vec<usize> = code
       .iter()
-      .filter_map(|&(_, insn)| {
-         match insn {
-            Insn::MovZ {
-               imm, wide: false, ..
-            } => usize::try_from(imm).ok(),
-            _ => None,
-         }
+      .filter_map(|&(_, insn)| match insn {
+         Insn::MovZ {
+            imm, wide: false, ..
+         } => usize::try_from(imm).ok(),
+         _ => None,
       })
       .collect();
    let triples: std::collections::HashSet<usize> = movs
@@ -2334,11 +2895,9 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
       .collect();
    let passed: Vec<usize> = code
       .iter()
-      .filter_map(|&(_, insn)| {
-         match insn {
-            Insn::AddImm { rn, imm, .. } if rn == config && triples.contains(&imm) => Some(imm),
-            _ => None,
-         }
+      .filter_map(|&(_, insn)| match insn {
+         Insn::AddImm { rn, imm, .. } if rn == config && triples.contains(&imm) => Some(imm),
+         _ => None,
       })
       .collect();
    let row_colors = most_common(passed, 1).ok_or("message body row colors not found")?;
@@ -2364,11 +2923,9 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
 pub fn host_allocator(image: &Image<'_>, alloc_or_oom: usize) -> Found<(usize, usize)> {
    let alloc = flattened_at(image, alloc_or_oom)
       .into_iter()
-      .find_map(|(_, insn)| {
-         match insn {
-            Insn::Bl { target } if image.is_function(target) => Some(target),
-            _ => None,
-         }
+      .find_map(|(_, insn)| match insn {
+         Insn::Bl { target } if image.is_function(target) => Some(target),
+         _ => None,
       })
       .ok_or("alloc_or_oom calls no allocator")?;
    let (_, end) = image
@@ -2394,4 +2951,95 @@ pub fn host_allocator(image: &Image<'_>, alloc_or_oom: usize) -> Found<(usize, u
       ));
    }
    Ok((alloc, dealloc))
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use crate::http::RequestLayout;
+
+   fn decode_words(words: &[u32]) -> Vec<Insn> {
+      words
+         .iter()
+         .enumerate()
+         .map(|(i, &w)| arm64::decode(w, 0x1000 + i * 4))
+         .collect()
+   }
+
+   // build 2233 ReqwestTransport::send request call, header copy, and body tag dispatch
+   const SEND_2233: &[u32] = &[
+      0xAA01_03F3, // mov x19, x1
+      0x9123_C3FC, // add x28, sp, #0x8f0
+      0x3CCF_8260, // ldur q0, [x19, #0xf8]
+      0xF940_8668, // ldr x8, [x19, #0x108]
+      0xF904_83E8, // str x8, [sp, #0x900]
+      0x3D80_0380, // str q0, [x28]
+      0x9123_C3E1, // add x1, sp, #0x8f0
+      0x9102_C262, // add x2, x19, #0xb0
+      0x9400_0010, // bl Client::request
+      0x9123_C3E0, // add x0, sp, #0x8f0
+      0xAA13_03E1, // mov x1, x19
+      0x5280_0C02, // mov w2, #0x60
+      0x9400_0020, // bl memcpy
+      0xAA13_03F6, // mov x22, x19
+      0xF847_8EC8, // ldr x8, [x22, #0x78]!
+      0x3868_692B, // ldrb w11, [x9, x8]
+      0x8B0B_094A, // add x10, x10, x11, lsl #2
+      0xD61F_0140, // br x10
+   ];
+
+   #[test]
+   fn reads_arm64_request_layout() {
+      assert_eq!(
+         request_layout_in(&decode_words(SEND_2233)),
+         Ok(RequestLayout {
+            body: 0x78,
+            url: 0xB0,
+            method: 0xF8,
+         })
+      );
+   }
+
+   #[test]
+   fn rejects_overlapping_arm64_request_fields() {
+      let mut words = SEND_2233.to_vec();
+      // point body tag inside the header map (0x58 instead of 0x78)
+      words[14] = 0xF845_8EC8;
+      assert!(request_layout_in(&decode_words(&words)).is_err());
+   }
+
+   #[test]
+   fn measures_arm64_poll_result_size() {
+      let poll_2233 = decode_words(&[
+         0xAA08_03F5, // mov x21, x8
+         0x5280_0056, // mov w22, #2
+         0xA900_5EB6, // stp x22, x23, [x21]
+         0x9100_A2A0, // add x0, x21, #0x28
+         0x5280_2A02, // mov w2, #0x150
+         0x9400_0010, // bl memcpy
+         0x5280_0028, // mov w8, #1
+         0xA917_D2A8, // stp x8, x20, [x21, #0x178]
+         0xB000_0009, // adrp x9, 0x2000
+         0x9108_0129, // add x9, x9, #0x200
+         0xF900_C6A9, // str x9, [x21, #0x188]
+         0xAD0C_86A0, // stp q0, q1, [x21, #0x190]
+         0x7903_82B9, // strh w25, [x21, #0x1c0]
+         0x3907_0ABA, // strb w26, [x21, #0x1c2]
+         0x9280_0008, // mov x8, #-1
+         0xF900_02A8, // str x8, [x21]
+         0xAA00_03F5, // mov x21, x0 (clobbered in unwind pad)
+         0xF90F_FEA8, // str x8, [x21, #0x1ff8] (must be ignored)
+      ]);
+      assert_eq!(poll_result_size_in(&poll_2233), 0x1C8);
+      assert_eq!(
+         stream_response_layout_in(&poll_2233, 0x1C8, |vt| vt == 0x2200),
+         Some(crate::http::ResponseLayout::Stream {
+            size: 0x1C8,
+            err_tag: 2,
+            pending_tag: u64::MAX,
+            body: 0x178,
+            status: 0x1C0,
+         })
+      );
+   }
 }

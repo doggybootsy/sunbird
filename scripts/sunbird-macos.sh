@@ -21,14 +21,18 @@ site=${SUNBIRD_SITE:-https://assets.sunbird.tools}
 home="$HOME/Library/Application Support/Sunbird"
 # /Applications is writable by admin accounts only.
 if [ -w /Applications ]; then
-   app=/Applications/Sunbird.app
+   apps=/Applications
 else
-   app="$HOME/Applications/Sunbird.app"
+   apps="$HOME/Applications"
 fi
+app="$apps/Sunbird.app"
+gate_app="$apps/Sunbird (access gate only).app"
 bundle_id=com.discord.DesktopGpui
 
 if [ "${1:-}" = --uninstall ]; then
-   rm -rf "$home" /Applications/Sunbird.app "$HOME/Applications/Sunbird.app"
+   rm -rf "$home" \
+      /Applications/Sunbird.app "$HOME/Applications/Sunbird.app" \
+      "/Applications/Sunbird (access gate only).app" "$HOME/Applications/Sunbird (access gate only).app"
    echo "Sunbird is uninstalled. Discord itself was not changed."
    exit 0
 fi
@@ -113,10 +117,11 @@ echo "Using Discord Phoenix at $discord"
 q() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
 
 # An earlier install may have used the other folder.
-for other in /Applications/Sunbird.app "$HOME/Applications/Sunbird.app"; do
-   [ "$other" = "$app" ] || rm -rf "$other"
+for other_dir in /Applications "$HOME/Applications"; do
+   [ "$other_dir" = "$apps" ] || rm -rf "$other_dir/Sunbird.app" "$other_dir/Sunbird (access gate only).app"
 done
-mkdir -p "$home" "$app/Contents/MacOS" "$app/Contents/Resources"
+mkdir -p "$home" "$app/Contents/MacOS" "$app/Contents/Resources" \
+   "$gate_app/Contents/MacOS" "$gate_app/Contents/Resources"
 
 # The launcher brings the loader up to the site's version and the copy up to
 # Discord's before each start, and keeps what it has when offline. Each run
@@ -145,7 +150,10 @@ version=
    sed -n 's/.*"loader": *"\([^"]*\)".*/\1/p')
 if [ -n "\$version" ] && [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)" ]; then
    tmp=\$(mktemp "\$home/libphoenix.dylib.XXXXXX")
-   if fetch --max-time 60 -o "\$tmp" "\$site/plugins/libphoenix-macos-arm64.dylib"; then
+   if fetch --max-time 60 -o "\$tmp" "\$site/plugins/libphoenix-macos-arm64.dylib" &&
+      /usr/bin/file -b "\$tmp" 2>/dev/null | grep -q 'Mach-O 64-bit dynamically linked shared library arm64' &&
+      LC_ALL=C /usr/bin/grep -q 'phoenix-version:' "\$tmp" &&
+      (/usr/bin/codesign -v "\$tmp" >/dev/null 2>&1 || /usr/bin/codesign --force --sign - "\$tmp" >/dev/null 2>&1); then
       mv "\$tmp" "\$home/libphoenix.dylib"
       echo "\$version" >"\$home/version"
    else
@@ -159,11 +167,61 @@ while [ "\${1:-}" = --no-runtime ] || [ "\${1:-}" = --gate-only ]; do
 done
 [ -d "\$discord" ] || fail "Discord Phoenix is gone from \$discord. Run the Sunbird installer again."
 
-# Rebuilt when Discord's executable changed, or when the copy lost its ad hoc
-# signature, which Discord's updater would put back.
 stamp="\$(/usr/bin/stat -f '%m %z' "\$discord/Contents/MacOS/Discord") brand \$brand"
+needs_rebuild=
 if [ "\$stamp" != "\$(cat "\$home/stamp" 2>/dev/null)" ] ||
    ! /usr/bin/codesign -dv "\$copy" 2>&1 | grep -q 'Signature=adhoc'; then
+   needs_rebuild=1
+fi
+
+ask() {
+   /usr/bin/osascript -e 'on run argv' \\
+      -e 'display dialog (item 1 of argv) with title "Sunbird" buttons {"Cancel", "Restart"} default button "Restart"' \\
+      -e 'end run' -- "\$1" >/dev/null 2>&1
+}
+
+# check running instances before rebuilding so we don't swap the bundle under a live process
+pids= sunbird= running_gate=
+for pid in \$(/bin/ps -axo pid=,comm= | /usr/bin/awk \\
+   -v phoenix="\$discord/Contents/MacOS/Discord" -v copy="\$copy/Contents/MacOS/Discord" \\
+   '{ pid = \$1; sub(/^ *[0-9]+ /, ""); if (\$0 == phoenix || \$0 == copy) print pid }'); do
+   pids="\$pids \$pid"
+   /usr/sbin/lsof -p "\$pid" 2>/dev/null | grep -q libphoenix && sunbird=1
+   /bin/ps eww -p "\$pid" 2>/dev/null | grep -q 'SUNBIRD_GATE_ONLY=1' && running_gate=1
+done
+
+if [ -n "\$pids" ]; then
+   prompt=
+   if [ -z "\$sunbird" ]; then
+      if [ -n "\$gate_only" ]; then
+         prompt="Discord is already running without Sunbird. Restart it with the access gate only? A call you are in will end."
+      else
+         prompt="Discord is already running without Sunbird. Restart it with Sunbird? A call you are in will end."
+      fi
+   elif [ -n "\$gate_only" ] && [ -z "\$running_gate" ]; then
+      prompt="Discord is already running with plugins. Restart it without the Sunbird plugin runtime? A call you are in will end."
+   elif [ -z "\$gate_only" ] && [ -n "\$running_gate" ]; then
+      prompt="Discord is running in access gate only mode. Restart it with the full Sunbird runtime? A call you are in will end."
+   elif [ -n "\$needs_rebuild" ]; then
+      prompt="Discord Phoenix was updated. Restart Sunbird to apply the update? A call you are in will end."
+   fi
+   if [ -n "\$prompt" ]; then
+      ask "\$prompt" || exit 0
+      kill \$pids 2>/dev/null
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+         alive=
+         for pid in \$pids; do kill -0 "\$pid" 2>/dev/null && alive=1; done
+         [ -z "\$alive" ] && break
+         sleep 0.5
+      done
+   else
+      exec /usr/bin/open -a "\$copy" --args "\$@"
+   fi
+fi
+
+# Rebuilt when Discord's executable changed, or when the copy lost its ad hoc
+# signature, which Discord's updater would put back.
+if [ -n "\$needs_rebuild" ]; then
    tmp=\$(mktemp -d "\$home/Sunbird.XXXXXX")
    new="\$tmp/Sunbird.app"
    # A clone on APFS, so the copy takes no space until Discord updates.
@@ -204,25 +262,6 @@ fi
 [ -f "\$home/libphoenix.dylib" ] ||
    fail "Sunbird hasn't been downloaded yet. Check your connection and open Sunbird again."
 
-# A second Discord hands off to the running one and exits, so one running
-# without Sunbird, Discord Phoenix itself or the copy, is quit first. One that
-# has Sunbird is brought forward by open.
-pids= sunbird=
-for pid in \$(/bin/ps -axo pid=,comm= | /usr/bin/awk \
-   -v phoenix="\$discord/Contents/MacOS/Discord" -v copy="\$copy/Contents/MacOS/Discord" \
-   '{ pid = \$1; sub(/^ *[0-9]+ /, ""); if (\$0 == phoenix || \$0 == copy) print pid }'); do
-   pids="\$pids \$pid"
-   /usr/sbin/lsof -p "\$pid" 2>/dev/null | grep -q libphoenix && sunbird=1
-done
-if [ -n "\$pids" ] && [ -z "\$sunbird" ]; then
-   kill \$pids 2>/dev/null
-   for _ in 1 2 3 4 5 6 7 8 9 10; do
-      alive=
-      for pid in \$pids; do kill -0 "\$pid" 2>/dev/null && alive=1; done
-      [ -z "\$alive" ] && break
-      sleep 0.5
-   done
-fi
 set -- --env "DYLD_INSERT_LIBRARIES=\$home/libphoenix.dylib" --args "\$@"
 [ -n "\$gate_only" ] && set -- --env SUNBIRD_GATE_ONLY=1 "\$@"
 exec /usr/bin/open -a "\$copy" "\$@"
@@ -261,6 +300,7 @@ JS
 }
 if make_icon "$home/Sunbird.icns"; then
    cp "$home/Sunbird.icns" "$app/Contents/Resources/Sunbird.icns"
+   cp "$home/Sunbird.icns" "$gate_app/Contents/Resources/Sunbird.icns"
 else
    echo "Couldn't draw Sunbird's icon; it keeps a plain one." >&2
 fi
@@ -281,8 +321,33 @@ cat >"$app/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+# For when the plugin runtime crashes on a Discord build it doesn't know yet.
+cat >"$gate_app/Contents/MacOS/sunbird-gate-only" <<EOF
+#!/bin/sh
+exec $(q "$app/Contents/MacOS/sunbird") --no-runtime "\$@"
+EOF
+chmod +x "$gate_app/Contents/MacOS/sunbird-gate-only"
+cat >"$gate_app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+   <key>CFBundleExecutable</key><string>sunbird-gate-only</string>
+   <key>CFBundleIdentifier</key><string>tools.sunbird.launcher.gate-only</string>
+   <key>CFBundleName</key><string>Sunbird (access gate only)</string>
+   <key>CFBundleDisplayName</key><string>Sunbird (access gate only)</string>
+   <key>CFBundleIconFile</key><string>Sunbird</string>
+   <key>CFBundlePackageType</key><string>APPL</string>
+   <key>CFBundleShortVersionString</key><string>1.0</string>
+   <key>LSMinimumSystemVersion</key><string>13.0</string>
+   <key>LSUIElement</key><true/>
+</dict>
+</plist>
+EOF
 /usr/bin/codesign --force --sign - "$app" >/dev/null 2>&1 || true
+/usr/bin/codesign --force --sign - "$gate_app" >/dev/null 2>&1 || true
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" 2>/dev/null || true
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$gate_app" 2>/dev/null || true
 
 # First download now, so a missing network shows up here rather than as a
 # Discord without Sunbird.
