@@ -52,7 +52,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `crates/runtime-mobile/src/host.rs` | Phoenix's host call, event and field numbers, read at startup from the name table in the installed APK's dex, or the host's Swift name table on iOS. `host::send` and `host::ask` call host modules. |
 | `crates/runtime-mobile/src/picker.rs` | File picker, toasts, clipboard and links through Phoenix's host modules. |
 | `crates/runtime-mobile/src/install.rs`, `loader.rs` | The APK self-update, and Android's installer opened on it through Discord's `FileProvider`. |
-| `crates/runtime-desktop` | phoenix on Desktop Phoenix (`Discord.exe`, Linux `discord-phoenix`, macOS `Discord`): the access gate, the HTTP transport hooks, the Sunbird pages in User Settings, message accessories and the tray. `os.rs` holds what differs per OS. On macOS, which is arm64, everything runs from arm64 locators except the menu separator (see Host facts). |
+| `crates/runtime-desktop` | phoenix on Desktop Phoenix (`Discord.exe`, Linux `discord-phoenix`, macOS `Discord`): the access gate, the HTTP transport hooks, the Sunbird pages in User Settings, message accessories and the tray. `os.rs` holds what differs per OS. On macOS, which is arm64, everything runs from arm64 locators (see Host facts). |
 | `crates/ui-mobile` | Typed codec for mobile (Android/iOS) Phoenix UI-op batches. `src/props.in` is Phoenix's prop table, `templates.json` holds captured layouts, `motion.rs` drives native springs, `mirror.rs` keeps a live copy of the view tree that host tests can drive. |
 | `crates/ui-desktop` | Desktop UI host primitives (clipboard, URLs, notifications, the tray, GPUI surface hooks), one file per OS. |
 | `crates/wire` | Tagged values and bridge frames (`HostCall`, `DispatchEvent`). |
@@ -377,9 +377,12 @@ byte pattern says nothing about arm32.
   message: a message is always newer than its channel. The detour is a native `extern "C"` function (a
   24-byte return goes through `x8`), and the constructors are called through `sret_caller`.
   `SharedString` keeps x86's tags (0x18 static). Discord's Rust heap may be its own malloc zone, so
-  our `Rc` handlers are pinned (`gpui::pinned_rc_u64`) and never freed by Discord. The separator
-  tag isn't verified (this builder pushes none, and a payload variant would crash), so arm64 items
-  follow Discord's without one. `with_color` is the setter between `with_icon` and `push` that is
+  our `Rc` handlers are pinned (`gpui::pinned_rc_u64`) and never freed by Discord. The message
+  menu pushes no separator; `separator_tag` comes from another menu's push of an item that is only
+  a tag (`mov w8, #4; str x8, [sp, #s]; add x1, sp, #s; bl push`), 4 as on x86. Verified on screen.
+  Menu icons are Mana icon ids: the sorted names of the `icons/<Name>.svg` table
+  (`desktop::icon_names`, `.secondary.svg` layers skipped), so `ic_mana_angle_brackets` is
+  `AngleBrackets`; an action without one gets `PuzzlePiecePlus`, as on mobile. `with_color` is the setter between `with_icon` and `push` that is
   always called with `w1 = 2` (Discord's danger items, through a `mov w1, #2; b` stub).
 - Test a second instance with `open -n -a <copy> --env DYLD_INSERT_LIBRARIES=... --env
   LIBDISCORD_DATA_DIR=...`. Exec'd from a shell it re-execs, and the loader in the last image
@@ -399,9 +402,13 @@ byte pattern says nothing about arm32.
   `"id"`/`"channel_id"` offsets off its `serialize_field` calls (`w2` key length, `x3` field), and
   the menu detour takes the word in its input (or that word + 16, an `Rc`) whose message has both
   ids, read with `read_memory`, before serializing.
-- Optimistic delete: `macos::optimistic_delete` is the x86 rule with stubs resolved (the one other
-  parent of `MESSAGE_DELETE`'s callees sharing at least 4 and taking a lock, LSE `cas` or
-  `ldaxr`); callers through stubs come from the stubs whose tail `b` hits a callee. Host allocator: `__rust_alloc(size, align)` is
+- Optimistic delete: arm64 has two single-message store deletes, and the x86 rule picked one the
+  client never calls. `macos::optimistic_delete` returns every function that calls one of the
+  `MESSAGE_DELETE` handler's rare callees (2-8 callers, the map removals), takes the store lock
+  first with its third argument (`mov x1, x2; bl lock`), and dereferences a pointer pair from its
+  second (`ldp xC, xM, [args]`); both are hooked. Found with a temporary caller tracer on the
+  removals, since lldb on a live copy made it exit when the session ended. Verified with
+  message-logger: other users' deletes stay; your own were still to be checked. Host allocator: `__rust_alloc(size, align)` is
   `alloc_or_oom`'s first real call, and `__rust_dealloc(ptr, size, align)` the next function,
   which subtracts the size from Discord's live-byte counter (`neg`, `ldadd`).
 - Startup. `prepare` runs in the loader's constructor, so Discord's window waits for every

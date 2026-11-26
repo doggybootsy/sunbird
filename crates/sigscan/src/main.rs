@@ -470,7 +470,19 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                   let id = registry.id("MESSAGE_DELETE").ok_or("no MESSAGE_DELETE")?;
                   phoenix_sigs::macos::optimistic_delete(image, registry.entry(id).handler)
                })
-               .map(at),
+               .map(|funcs| funcs.into_iter().map(at).collect::<Vec<_>>().join(", ")),
+         );
+         report(
+            "icon names",
+            phoenix_sigs::desktop::icon_names(image).map(|names| {
+               let id = |name: &str| names.iter().position(|probe| probe == name);
+               format!(
+                  "{} names, Copy {:x?}, Trash {:x?}",
+                  names.len(),
+                  id("Copy"),
+                  id("Trash")
+               )
+            }),
          );
          report(
             "access gate",

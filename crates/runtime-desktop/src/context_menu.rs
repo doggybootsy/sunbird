@@ -84,6 +84,8 @@ struct MenuSymbols {
    /// default color.
    with_color:        Option<WithColorFn>,
    vec_push:          VecPushFn,
+   /// `MenuItem::Separator`'s tag; `None` when arm64's push doesn't decode.
+   separator_tag:     Option<u64>,
    layout:            MenuLayout,
 }
 
@@ -214,8 +216,58 @@ unsafe extern "C" fn menu_action_callback(
 
 /// Maps well-known mobile/plugin icon names to Desktop Phoenix's verified
 /// Mana icon enum values (observed in `MessageContextMenu`).
+/// Mana's icon names in id order, from [`desktop::icon_names`].
+static ICON_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// A plugin's icon as a Mana icon id: `res://ic_mana_angle_brackets` is
+/// `AngleBrackets`. Without an icon, the puzzle piece mobile shows too.
 fn map_icon(icon: Option<&str>) -> Option<u16> {
-   let icon = icon?;
+   let Some(names) = ICON_NAMES.get() else {
+      return legacy_icon(icon?);
+   };
+   let id = |name: &str| {
+      names
+         .binary_search_by(|probe| probe.as_str().cmp(name))
+         .ok()
+         .and_then(|at| u16::try_from(at).ok())
+   };
+   let Some(icon) = icon else {
+      return id("PuzzlePiecePlus");
+   };
+   let snake = icon.rsplit('/').next().unwrap_or(icon);
+   let snake = snake.strip_prefix("ic_mana_").unwrap_or(snake);
+   let camel: String = snake
+      .split('_')
+      .map(|word| {
+         let mut chars = word.chars();
+         chars.next().map_or_else(String::new, |first| {
+            first.to_ascii_uppercase().to_string() + chars.as_str()
+         })
+      })
+      .collect();
+   id(&camel)
+      .or_else(|| id(alias(snake)?))
+      .or_else(|| id("PuzzlePiecePlus"))
+}
+
+/// The icon Mana names differently from mobile's drawable.
+fn alias(icon: &str) -> Option<&'static str> {
+   if icon.contains("delete") || icon.contains("trash") {
+      Some("Trash")
+   } else if icon.contains("copy_id") {
+      Some("Id")
+   } else if icon.contains("link") {
+      Some("Link")
+   } else if icon.contains("copy") || icon.contains("code") {
+      Some("Copy")
+   } else {
+      None
+   }
+}
+
+/// Mana icon ids seen on 2026-11 Windows builds, for a build whose icon table
+/// isn't found.
+fn legacy_icon(icon: &str) -> Option<u16> {
    if icon.contains("delete") || icon.contains("trash") {
       Some(0x280)
    } else if icon.contains("copy_id") || icon.contains("id") {
@@ -231,6 +283,12 @@ fn map_icon(icon: Option<&str>) -> Option<u16> {
 
 /// Locates and hooks `MessageContextMenu` from `DllMain`.
 pub fn install(image: &Image<'static>) {
+   match desktop::icon_names(image) {
+      Ok(names) => {
+         let _ = ICON_NAMES.set(names);
+      },
+      Err(err) => log::warn!("desktop context menu: {err}, menu icons from the built-in list"),
+   }
    if !crate::X86_CODE {
       #[cfg(target_os = "macos")]
       arm64::install(image);
@@ -274,6 +332,7 @@ pub fn install(image: &Image<'static>) {
          with_icon:         std::mem::transmute::<usize, WithIconFn>(menu.with_icon),
          with_color:        Some(std::mem::transmute::<usize, WithColorFn>(menu.with_color)),
          vec_push:          std::mem::transmute::<usize, VecPushFn>(menu.vec_push),
+         separator_tag:     Some(layout::MENU_ITEM_SEPARATOR_TAG),
          layout:            menu.layout,
       }
    };
@@ -416,12 +475,10 @@ fn append_plugin_actions(
 
    // Push a native separator first if the menu already has Discord's own items.
    // SAFETY: `vec` is the live `Vec<MenuItem>` just returned by `orig_build`.
-   // arm64's separator tag isn't verified, so its items follow Discord's
-   // without one.
    let has_existing = unsafe { (*vec).len > 0 };
-   if has_existing && crate::X86_CODE {
+   if has_existing && let Some(tag) = syms.separator_tag {
       let mut sep = RawMenuItem::zeroed();
-      sep.put(0, layout::MENU_ITEM_SEPARATOR_TAG);
+      sep.put(0, tag);
       // SAFETY: `vec_push` copies one `MenuItem`, which fits `sep`.
       unsafe { (syms.vec_push)(vec, &raw mut sep) };
    }
@@ -589,6 +646,7 @@ mod arm64 {
                .and_then(sret_caller)
                .map(|thunk| std::mem::transmute::<usize, super::WithColorFn>(thunk)),
             vec_push:          std::mem::transmute::<usize, super::VecPushFn>(menu.vec_push),
+            separator_tag:     menu.separator_tag,
             layout:            menu.layout,
          });
       }

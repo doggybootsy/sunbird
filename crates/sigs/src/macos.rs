@@ -679,6 +679,8 @@ pub struct MessageMenu {
    pub with_color:        Option<usize>,
    /// `Vec<MenuItem>::push(x0 vec, x1 item)`.
    pub vec_push:          usize,
+   /// `MenuItem::Separator`'s tag, from a push of an item that is only a tag.
+   pub separator_tag:     Option<u64>,
    pub layout:            crate::desktop::MenuLayout,
 }
 
@@ -1035,8 +1037,64 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
       with_icon,
       with_color,
       vec_push,
+      separator_tag: separator_tag(image, vec_push, layout.action_tag),
       layout,
    })
+}
+
+/// The tag of the payload-less `MenuItem` other menus push: just before the
+/// call, `mov wT, #tag; str xT, [sp, #slot]; ...; add x1, sp, #slot` with
+/// nothing else stored in the slot. Every such push must agree.
+fn separator_tag(image: &Image<'_>, vec_push: usize, action_tag: u64) -> Option<u64> {
+   let mut tags = Vec::new();
+   for (site, _) in arm64::code_refs(image, vec_push..vec_push + 1) {
+      let Some(code) = image.read(site.checked_sub(8 * 4)?, 8 * 4) else {
+         continue;
+      };
+      let insns: Vec<Insn> = arm64::decode_all(code, site - 8 * 4)
+         .map(|(_, insn)| insn)
+         .collect();
+      let Some(slot) = insns.iter().rev().find_map(|insn| {
+         match *insn {
+            Insn::AddImm { rd: 1, rn: 31, imm } => Some(imm),
+            _ => None,
+         }
+      }) else {
+         continue;
+      };
+      let stores: Vec<(u8, usize)> = insns
+         .iter()
+         .filter_map(|insn| {
+            match *insn {
+               Insn::Store {
+                  rt, rn: 31, offset, ..
+               } if offset >= slot && offset < slot + 0x200 => Some((rt, offset)),
+               _ => None,
+            }
+         })
+         .collect();
+      let [(rt, offset)] = stores.as_slice() else {
+         continue;
+      };
+      if *offset != slot {
+         continue;
+      }
+      let tag = insns.iter().rev().find_map(|insn| {
+         match *insn {
+            Insn::MovZ { rd, imm, .. } if rd == *rt => Some(imm),
+            _ => None,
+         }
+      });
+      if let Some(tag) = tag.filter(|&tag| tag < 0x10 && tag != action_tag) {
+         tags.push(tag);
+      }
+   }
+   tags.sort_unstable();
+   tags.dedup();
+   match tags.as_slice() {
+      &[tag] => Some(tag),
+      _ => None,
+   }
 }
 
 /// An address loaded by an `adrp`/`add` pair, at each instruction that
@@ -2103,94 +2161,92 @@ fn real_callees(image: &Image<'_>, func: usize) -> std::collections::HashSet<usi
       .collect()
 }
 
-/// Whether `code` takes a lock: an exclusive or compare-and-swap load.
-fn takes_lock(code: &[u8]) -> bool {
-   code.as_chunks::<4>().0.iter().any(|word| {
-      let word = u32::from_le_bytes(*word);
-      // `ldaxr`/`ldxr`, and `cas`/`casa`/`casal`/`casl` (32 and 64 bits).
-      word & 0xBFFF_7C00 == 0x885F_7C00 || word & 0xBFA0_7C00 == 0x88A0_7C00
-   })
-}
-
-/// [`crate::desktop::optimistic_delete`] for arm64.
+/// [`crate::desktop::optimistic_delete`] for arm64: every store function that
+/// deletes one message the client asked to, `fn(store, &[&channel_id,
+/// &message_id], meta) -> bool`.
 ///
-/// `Store::delete_message`, the client's own delete, shares the map and index
-/// deletes with the `MESSAGE_DELETE` handler and takes the store's lock.
-/// Calls are compared after resolving outlined stubs.
-pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usize> {
-   use std::collections::{
-      HashMap,
-      HashSet,
-   };
+/// Each takes the store's write lock first (`mov x1, x2; bl lock`, the lock
+/// given the third argument), loads the id pair from its second argument and
+/// dereferences both (`ldp xC, xM, [args]; ldr [xC]; ldr [xM]`), and calls the
+/// same message removal as the `MESSAGE_DELETE` handler. Discord has more
+/// than one (its own delete and another path), so all are returned.
+pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<Vec<usize>> {
    let (handler, _) = image
       .function_bounds(message_delete)
       .ok_or("MESSAGE_DELETE handler has no bounds")?;
-   let shared_with = real_callees(image, handler);
-   // Each of the handler's callees' callers: direct ones, then those that
-   // reach it through a stub ending in `b callee`.
-   let callees: Vec<usize> = shared_with.iter().copied().collect();
-   let direct = arm64::code_refs_to(image, &callees);
-   let mut stubs: HashMap<usize, usize> = HashMap::new();
-   for &(site, target) in &direct {
-      let Some(word) = image.read_u32(site) else {
-         continue;
-      };
-      if !matches!(arm64::decode(word, site), Insn::B { .. }) {
-         continue;
-      }
-      if let Some(start) = image.function_containing(site)
-         && site - start < 6 * 4
-         && stub(image, start).and_then(|(_, tail)| tail) == Some(target)
-      {
-         stubs.insert(start, target);
-      }
-   }
-   let stub_starts: Vec<usize> = stubs.keys().copied().collect();
-   let through_stubs = arm64::code_refs_to(image, &stub_starts)
-      .into_iter()
-      .filter_map(|(site, stub)| Some((site, *stubs.get(&stub)?)));
-   let mut parents: HashMap<usize, HashSet<usize>> = HashMap::new();
-   for (site, real) in direct.iter().copied().chain(through_stubs) {
-      let Some(word) = image.read_u32(site) else {
-         continue;
-      };
-      if !matches!(arm64::decode(word, site), Insn::Bl { .. } | Insn::B { .. }) {
-         continue;
-      }
-      if let Some((parent, _)) = image.function_bounds(site)
-         && parent != real
-         && !stubs.contains_key(&parent)
-      {
-         parents.entry(real).or_default().insert(parent);
-      }
-   }
-   let mut candidates: Vec<usize> = parents
-      .values()
-      .filter(|parents| parents.len() == 2 && parents.contains(&handler))
-      .filter_map(|parents| parents.iter().copied().find(|&parent| parent != handler))
-      .collect();
-   candidates.sort_unstable();
-   candidates.dedup();
-   let found: Vec<usize> = candidates
+   let callees: Vec<usize> = real_callees(image, handler).into_iter().collect();
+   let refs = arm64::code_refs_to(image, &callees);
+   // The removals themselves are called from few places; shared helpers like
+   // the lock or a hash, from hundreds.
+   let rare: std::collections::HashSet<usize> = callees
       .iter()
       .copied()
-      .filter(|&other| {
-         let callees = real_callees(image, other);
-         let shared = callees.intersection(&shared_with).count();
-         let head = |at: usize| image.read(at, 0x80).is_some_and(takes_lock);
-         let locks = head(other) || first_call(image, other).is_some_and(head);
-         shared >= 4 && locks
+      .filter(|&callee| {
+         let uses = refs.iter().filter(|&&(_, target)| target == callee).count();
+         (2..=8).contains(&uses)
       })
       .collect();
-   match found.as_slice() {
-      &[only] => Ok(only),
-      _ => {
-         Err(format!(
-            "optimistic delete matched {found:x?} among {candidates:x?} ({} callees)",
-            shared_with.len()
-         ))
-      },
+   let mut parents: Vec<usize> = refs
+      .iter()
+      .filter(|(_, target)| rare.contains(target))
+      .filter_map(|&(site, _)| image.function_containing(site))
+      .filter(|&parent| parent != handler)
+      .collect();
+   parents.sort_unstable();
+   parents.dedup();
+   let mut found: Vec<usize> = parents
+      .into_iter()
+      .filter(|&func| deletes_one_message(image, func))
+      .collect();
+   found.sort_unstable();
+   if found.is_empty() || found.len() > 4 {
+      return Err(format!("optimistic delete matched {found:x?}"));
    }
+   Ok(found)
+}
+
+/// [`optimistic_delete`]'s shape: the lock with the third argument first,
+/// then the dereferenced id pair from the second.
+fn deletes_one_message(image: &Image<'_>, func: usize) -> bool {
+   let code = flattened(image, func);
+   let head = &code[..code.len().min(40)];
+   let Some(args) = head.iter().find_map(|insn| {
+      match *insn {
+         Insn::MovReg {
+            rd,
+            rm: 1,
+            wide: true,
+         } if rd >= 19 => Some(rd),
+         _ => None,
+      }
+   }) else {
+      return false;
+   };
+   let Some(lock) = head.iter().position(|insn| matches!(insn, Insn::Bl { .. })) else {
+      return false;
+   };
+   if !head[..lock].iter().any(|insn| {
+      matches!(insn, Insn::MovReg {
+         rd:   1,
+         rm:   2,
+         wide: true,
+      })
+   }) {
+      return false;
+   }
+   code[lock..code.len().min(lock + 12)]
+      .windows(3)
+      .any(|window| {
+         let Some((true, first, second, rn, 0)) = pair(window[0]) else {
+            return false;
+         };
+         let loads = |reg: u8| {
+            window[1..]
+               .iter()
+               .any(|insn| matches!(*insn, Insn::Load { rn, offset: 0, size: 8, .. } if rn == reg))
+         };
+         rn == args && loads(first) && loads(second)
+      })
 }
 
 /// `build_message_body`, which `MessageRow::render` calls once per row, and

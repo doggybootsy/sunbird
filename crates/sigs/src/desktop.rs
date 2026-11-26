@@ -3259,3 +3259,57 @@ fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + 
       ))
    })
 }
+
+/// Mana's icon names in id order: a `MenuItem`'s icon is the index of its
+/// name in this list.
+///
+/// The icon table pairs each name with `icons/<Name>.svg`; the paths are read
+/// in a run from `icons/A.svg`, and the ids are their names sorted, which
+/// Discord's own menu icons (`Copy` 0x99, `Id` 0x15b, `Link` 0x177, `Trash`
+/// 0x280 on 2026-11 builds) confirm.
+pub fn icon_names(image: &Image<'_>) -> Found<Vec<String>> {
+   /// How far apart two paths in the table may sit, a name between them.
+   const GAP: usize = 128;
+   let start = image
+      .find_bytes_iter(b"icons/A.svg")
+      .next()
+      .ok_or("icon table not found")?;
+   let mut names = Vec::new();
+   let mut at = start;
+   while let Some(window) = image.read(at, GAP) {
+      let Some(path) = window.windows(6).position(|w| w == b"icons/") else {
+         break;
+      };
+      let Some(rest) = image.read(at + path + 6, GAP) else {
+         break;
+      };
+      let Some(end) = rest.windows(4).position(|w| w == b".svg") else {
+         break;
+      };
+      let Ok(name) = std::str::from_utf8(&rest[..end]) else {
+         break;
+      };
+      at += path + 6 + end + 4;
+      // `Name.secondary.svg` is a second layer of `Name`, with no id.
+      if name.contains('.') {
+         continue;
+      }
+      if !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+         || (name == "A" && !names.is_empty())
+      {
+         break;
+      }
+      names.push(name.to_owned());
+   }
+   names.sort_unstable();
+   names.dedup();
+   let has = |name: &str| {
+      names
+         .binary_search_by(|probe| probe.as_str().cmp(name))
+         .is_ok()
+   };
+   if names.len() < 100 || !["Copy", "Id", "Link", "Trash"].into_iter().all(has) {
+      return Err(format!("icon table holds {} names", names.len()));
+   }
+   Ok(names)
+}
