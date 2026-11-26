@@ -230,7 +230,9 @@ byte pattern says nothing about arm32.
   Discord's restricted entitlements. The launcher, `/Applications/Sunbird.app` (or
   `~/Applications` without admin rights), starts it with
   `open -a <copy> --env DYLD_INSERT_LIBRARIES=<dylib>`, and rebuilds the copy when Discord's
-  executable changes. A second Discord hands off to a running one, so the launcher first quits
+  executable changes. Discord relaunches itself through Launch Services (Command-R) with its
+  own environment, which the loader has already left, so the copy's `LSEnvironment` also carries
+  `DYLD_INSERT_LIBRARIES`. Verified: Command-R comes back with Sunbird. A second Discord hands off to a running one, so the launcher first quits
   any Discord Phoenix or copy process without `libphoenix` mapped (`lsof -p`). `SIGTERM` exits it
   within about a second.
 - Patching Discord Phoenix in place (Vencord-style: `DYLD_INSERT_LIBRARIES` in Info.plist's
@@ -357,7 +359,9 @@ byte pattern says nothing about arm32.
   (`ui-desktop/src/macos/panel.rs`), routed from `modal::open_page`/`open_choice`/`close_page`: a
   vertical `NSStackView` of headings, button rows, wrapping labels and `scrollableTextView`s. One
   target object answers every button by tag and is each window's delegate, so closing a dialog
-  answers -1. Verified: both render and size correctly.
+  answers -1. Verified: both render and size correctly. Edit Code, Install from URL and a setting's
+  Edit open there too, with an editable code view or a one-line field, a status line, and
+  `panel_text` reading the fields back from a button's thread.
 - Message actions. `macos::message_context_menu` finds the builder by its `MessageContextMenu`
   string and flattens its stubs (a `bl` to a stub ending `b T` becomes `bl T`). Items are built
   `i18n -> MenuItem::new::<F> -> with_id -> [with_icon] -> push`; every `MenuItem::new::<F>` ends

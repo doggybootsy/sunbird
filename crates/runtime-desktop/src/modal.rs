@@ -723,20 +723,29 @@ unsafe extern "C" fn modal_button_callback(
 /// arm64 locators.
 #[cfg(target_os = "macos")]
 mod panel {
-   use std::sync::Arc;
+   use std::sync::{
+      Arc,
+      OnceLock,
+   };
 
    use phoenix_ui_desktop::{
       PanelButton,
       PanelSection,
       close_panel,
+      panel_text,
+      set_panel_status,
       show_panel,
    };
 
    use super::{
       Choice,
       ChoiceOption,
+      FieldKind,
       ModalSection,
       PageModalSpec,
+      SettingField,
+      force_redraw,
+      setting_value,
    };
 
    fn section(section: ModalSection) -> PanelSection {
@@ -767,9 +776,169 @@ mod panel {
                title,
                text,
                monospace,
+               editable: false,
             }
          },
       }
+   }
+
+   /// The editor's buttons, which act on the panel `id` holds once it opens.
+   fn button(
+      label: &str,
+      danger: bool,
+      id: &Arc<OnceLock<u64>>,
+      press: impl Fn(u64) + Send + Sync + 'static,
+   ) -> PanelButton {
+      let id = Arc::clone(id);
+      PanelButton {
+         label: label.to_owned(),
+         danger,
+         on_press: Arc::new(move || {
+            if let Some(&id) = id.get() {
+               press(id);
+            }
+         }),
+      }
+   }
+
+   /// The first editable section's text, or why it can't be read.
+   fn first_text(id: u64) -> Option<String> {
+      let text = panel_text(id).and_then(|texts| texts.into_iter().next());
+      if text.is_none() {
+         set_panel_status(id, "Couldn't read the text".to_owned(), true);
+      }
+      text
+   }
+
+   pub fn open_code_editor(plugin: String, source: String) {
+      let id = Arc::new(OnceLock::new());
+      let title = format!("Edit {plugin}");
+      let saving = plugin;
+      let buttons = vec![
+         button("Save & Reload", false, &id, move |id| {
+            let Some(code) = first_text(id) else {
+               return;
+            };
+            match phoenix_runtime::save_source(&saving, code) {
+               Ok(()) => {
+                  close_panel(id);
+                  phoenix_ui_desktop::toast(&format!("Saved & reloaded {saving}"));
+               },
+               Err(err) => set_panel_status(id, format!("Save failed: {err}"), true),
+            }
+         }),
+         button("Copy", false, &id, |id| {
+            let Some(code) = first_text(id) else {
+               return;
+            };
+            match phoenix_ui_desktop::copy(&code) {
+               Ok(()) => set_panel_status(id, "Copied the source".to_owned(), false),
+               Err(err) => set_panel_status(id, format!("Copy failed: {err}"), true),
+            }
+         }),
+         button("Cancel", false, &id, close_panel),
+      ];
+      let _ = id.set(show_panel(
+         title,
+         vec![
+            PanelSection::Code {
+               title:     None,
+               text:      source,
+               monospace: true,
+               editable:  true,
+            },
+            PanelSection::Status,
+            PanelSection::Buttons {
+               title: None,
+               buttons,
+            },
+         ],
+         None,
+      ));
+   }
+
+   pub fn open_install_url() {
+      let id = Arc::new(OnceLock::new());
+      let buttons = vec![
+         button("Install", false, &id, |id| {
+            let Some(raw) = first_text(id) else {
+               return;
+            };
+            let url = raw.trim().to_owned();
+            if url.is_empty() {
+               set_panel_status(id, "Enter an https:// URL ending in .js".to_owned(), true);
+               return;
+            }
+            set_panel_status(id, "Downloading and installing...".to_owned(), false);
+            match phoenix_runtime::install(&url) {
+               Ok(name) => {
+                  close_panel(id);
+                  phoenix_ui_desktop::toast(&format!("Installed {name}"));
+               },
+               Err(err) => set_panel_status(id, err.to_string(), true),
+            }
+         }),
+         button("Cancel", false, &id, close_panel),
+      ];
+      let _ = id.set(show_panel(
+         "Install a plugin".to_owned(),
+         vec![
+            PanelSection::Field {
+               title:       Some("Plugin URL".to_owned()),
+               text:        String::new(),
+               placeholder: Some("https://example.com/plugin.js".to_owned()),
+               secure:      false,
+            },
+            PanelSection::Status,
+            PanelSection::Buttons {
+               title: None,
+               buttons,
+            },
+         ],
+         None,
+      ));
+   }
+
+   pub fn open_setting_editor(field: SettingField) {
+      let id = Arc::new(OnceLock::new());
+      let (title, initial, secure) = (
+         field.title.clone(),
+         field.initial.clone(),
+         field.kind == FieldKind::Secret,
+      );
+      let buttons = vec![
+         button("Save", false, &id, move |id| {
+            let Some(text) = first_text(id) else {
+               return;
+            };
+            match setting_value(&field, &text) {
+               Ok(value) => {
+                  phoenix_runtime::set_setting(&field.plugin, &field.key, value);
+                  close_panel(id);
+                  force_redraw();
+               },
+               Err(why) => set_panel_status(id, why.to_owned(), true),
+            }
+         }),
+         button("Cancel", false, &id, close_panel),
+      ];
+      let _ = id.set(show_panel(
+         title,
+         vec![
+            PanelSection::Field {
+               title: None,
+               text: initial,
+               placeholder: None,
+               secure,
+            },
+            PanelSection::Status,
+            PanelSection::Buttons {
+               title: None,
+               buttons,
+            },
+         ],
+         None,
+      ));
    }
 
    pub fn open(spec: PageModalSpec, on_close: Option<phoenix_ui_desktop::PanelAction>) -> u64 {
@@ -965,6 +1134,11 @@ pub fn close_page(id: u64) {
 
 /// Opens a native GPUI multiline code editor modal for `plugin`.
 pub fn open_code_editor(plugin: String, initial_source: String) {
+   #[cfg(target_os = "macos")]
+   if cfg!(target_os = "macos") {
+      panel::open_code_editor(plugin, initial_source);
+      return;
+   }
    resolve_pending_choice();
    set_active(Some(ActiveModal::CodeEditor(CodeEditorModal {
       plugin,
@@ -975,6 +1149,11 @@ pub fn open_code_editor(plugin: String, initial_source: String) {
 
 /// Opens a native GPUI single-line URL installer modal.
 pub fn open_install_url() {
+   #[cfg(target_os = "macos")]
+   if cfg!(target_os = "macos") {
+      panel::open_install_url();
+      return;
+   }
    resolve_pending_choice();
    set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
       setting:      None,
@@ -986,6 +1165,11 @@ pub fn open_install_url() {
 
 /// Opens the one-line field on a plugin's text, number or secret setting.
 pub fn open_setting_editor(field: SettingField) {
+   #[cfg(target_os = "macos")]
+   if cfg!(target_os = "macos") {
+      panel::open_setting_editor(field);
+      return;
+   }
    resolve_pending_choice();
    set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
       pending_init: Some(field.initial.clone()),
@@ -1002,20 +1186,28 @@ fn save_setting(app: *mut c_void, field: &SettingField) {
       set_install_status("Could not read the text field", true, false);
       return;
    };
-   let text = raw.trim();
-   let value = if field.kind == FieldKind::Number {
-      match text.parse::<f64>() {
-         Ok(number) if number.is_finite() => phoenix_runtime::Chosen::Number(number),
-         _ => {
-            set_install_status("Enter a number", true, false);
-            return;
-         },
-      }
-   } else {
-      phoenix_runtime::Chosen::Text(text.to_owned())
-   };
-   phoenix_runtime::set_setting(&field.plugin, &field.key, value);
-   close_active();
+   match setting_value(field, &raw) {
+      Ok(value) => {
+         phoenix_runtime::set_setting(&field.plugin, &field.key, value);
+         close_active();
+      },
+      Err(why) => set_install_status(why, true, false),
+   }
+}
+
+/// What `text` stores as `field`'s value, or why it can't.
+fn setting_value(
+   field: &SettingField,
+   text: &str,
+) -> Result<phoenix_runtime::Chosen, &'static str> {
+   let text = text.trim();
+   if field.kind != FieldKind::Number {
+      return Ok(phoenix_runtime::Chosen::Text(text.to_owned()));
+   }
+   match text.parse::<f64>() {
+      Ok(number) if number.is_finite() => Ok(phoenix_runtime::Chosen::Number(number)),
+      _ => Err("Enter a number"),
+   }
 }
 
 fn close_active() {

@@ -31,7 +31,9 @@ pub use macos::{
    PanelButton,
    PanelSection,
    close_panel,
+   panel_text,
    redraw_windows,
+   set_panel_status,
    show_panel,
 };
 #[cfg(windows)] use windows::Host as Os;

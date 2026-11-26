@@ -3,13 +3,18 @@
 //! native window needs none.
 //!
 //! Each window is a vertical `NSStackView` of section titles, button rows,
-//! wrapping labels and scrollable read-only text views. One shared target
+//! wrapping labels, scrollable text views, one-line fields and a status line.
+//! [`panel_text`] reads back what the editable ones hold. One shared target
 //! object answers the buttons, by tag, and is every window's delegate, so a
 //! closed window reports itself.
 
 use std::{
    collections::HashMap,
-   ffi::c_void,
+   ffi::{
+      CStr,
+      c_char,
+      c_void,
+   },
    ptr,
    sync::{
       Arc,
@@ -21,8 +26,10 @@ use std::{
          AtomicU64,
          Ordering,
       },
+      mpsc,
    },
    thread,
+   time::Duration,
 };
 
 use super::{
@@ -67,7 +74,17 @@ pub enum PanelSection {
       title:     Option<String>,
       text:      String,
       monospace: bool,
+      editable:  bool,
    },
+   /// A one-line text field; `secure` hides what is typed.
+   Field {
+      title:       Option<String>,
+      text:        String,
+      placeholder: Option<String>,
+      secure:      bool,
+   },
+   /// A line [`set_panel_status`] changes, empty until then.
+   Status,
 }
 
 /// An open window: the `NSWindow`, its buttons' tags and what runs when it
@@ -76,6 +93,11 @@ struct Open {
    window:   usize,
    tags:     Vec<isize>,
    on_close: Option<Action>,
+   /// The editable views in section order, each with whether it is an
+   /// `NSTextView` (read by `string`) rather than an `NSTextField`
+   /// (`stringValue`).
+   editable: Vec<(usize, bool)>,
+   status:   usize,
 }
 
 static NEXT_PANEL: AtomicU64 = AtomicU64::new(1);
@@ -110,6 +132,7 @@ msg_send!(send_priority(priority: f32, orientation: isize) -> ());
 msg_send!(send_size(width: f64, height: f64) -> ());
 msg_send!(send_anchor(anchor: Id, constant: f64) -> Id);
 msg_send!(send_fitting() -> Size);
+msg_send!(send_utf8() -> *const c_char);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -146,6 +169,72 @@ pub fn close_panel(id: u64) {
    });
 }
 
+/// The text of window `id`'s editable sections, in order, or `None` once it
+/// is closed. Waits on the main thread, so never call it from there.
+#[must_use]
+pub fn panel_text(id: u64) -> Option<Vec<String>> {
+   let (sender, receiver) = mpsc::channel();
+   on_main_with(move || {
+      let views = OPEN
+         .lock()
+         .unwrap_or_else(PoisonError::into_inner)
+         .get(&id)
+         .map(|open| open.editable.clone());
+      let texts = views.map(|views| {
+         views
+            .into_iter()
+            .map(|(view, text_view)| {
+               let getter = if text_view {
+                  sel(c"string")
+               } else {
+                  sel(c"stringValue")
+               };
+               // SAFETY: on the main thread; a view the open window holds,
+               // and `UTF8String` stays valid inside this block's pool.
+               unsafe {
+                  let utf8 = send_utf8(send(view as Id, getter), sel(c"UTF8String"));
+                  if utf8.is_null() {
+                     String::new()
+                  } else {
+                     CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                  }
+               }
+            })
+            .collect()
+      });
+      let _ = sender.send(texts);
+   });
+   receiver.recv_timeout(Duration::from_secs(5)).ok().flatten()
+}
+
+/// Shows `text` in window `id`'s status line, red when `error`.
+pub fn set_panel_status(id: u64, text: String, error: bool) {
+   on_main_with(move || {
+      let status = OPEN
+         .lock()
+         .unwrap_or_else(PoisonError::into_inner)
+         .get(&id)
+         .map_or(0, |open| open.status);
+      if status == 0 {
+         return;
+      }
+      let color = if error {
+         c"systemRedColor"
+      } else {
+         c"secondaryLabelColor"
+      };
+      // SAFETY: on the main thread; a label the open window holds.
+      unsafe {
+         send_id(status as Id, sel(c"setStringValue:"), ns_string(&text));
+         send_id(
+            status as Id,
+            sel(c"setTextColor:"),
+            send(class(c"NSColor"), sel(color)),
+         );
+      }
+   });
+}
+
 /// # Safety
 ///
 /// On the main thread, inside an autorelease pool.
@@ -178,6 +267,8 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
       return;
    }
    let mut tags = Vec::new();
+   let mut editable = Vec::new();
+   let mut status = 0;
    // SAFETY: on the main thread; every object made here is checked for nil
    // before it is used, and the window holds the views it is given.
    unsafe {
@@ -297,6 +388,7 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
                title,
                text,
                monospace,
+               editable: is_editable,
             } => {
                if let Some(title) = title {
                   add(heading(&title));
@@ -308,9 +400,23 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
                fixed_height = false;
                send_isize(scroll, sel(c"setBorderType:"), BEZEL);
                let view = send(scroll, sel(c"documentView"));
-               send_bool(view, sel(c"setEditable:"), false);
+               send_bool(view, sel(c"setEditable:"), is_editable);
                send_bool(view, sel(c"setSelectable:"), true);
                send_bool(view, sel(c"setRichText:"), false);
+               if is_editable {
+                  // Code, not prose: no smart quotes, dashes or corrections.
+                  for setter in [
+                     c"setAutomaticQuoteSubstitutionEnabled:",
+                     c"setAutomaticDashSubstitutionEnabled:",
+                     c"setAutomaticTextReplacementEnabled:",
+                     c"setAutomaticSpellingCorrectionEnabled:",
+                     c"setContinuousSpellCheckingEnabled:",
+                  ] {
+                     send_bool(view, sel(setter), false);
+                  }
+                  send_bool(view, sel(c"setAllowsUndo:"), true);
+                  editable.push((view as usize, true));
+               }
                send_id(view, sel(c"setString:"), ns_string(&text));
                let font = if monospace {
                   send_font(
@@ -337,6 +443,43 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
                send_bool(tall, sel(c"setActive:"), true);
                add(scroll);
             },
+            PanelSection::Field {
+               title,
+               text,
+               placeholder,
+               secure,
+            } => {
+               if let Some(title) = title {
+                  add(heading(&title));
+               }
+               let kind = if secure {
+                  class(c"NSSecureTextField")
+               } else {
+                  class(c"NSTextField")
+               };
+               let field = send_id(kind, sel(c"textFieldWithString:"), ns_string(&text));
+               if field.is_null() {
+                  continue;
+               }
+               if let Some(placeholder) = placeholder {
+                  send_id(
+                     field,
+                     sel(c"setPlaceholderString:"),
+                     ns_string(&placeholder),
+                  );
+               }
+               editable.push((field as usize, false));
+               add(field);
+            },
+            PanelSection::Status => {
+               let label = send_id(
+                  class(c"NSTextField"),
+                  sel(c"wrappingLabelWithString:"),
+                  ns_string(""),
+               );
+               status = label as usize;
+               add(label);
+            },
          }
       }
 
@@ -359,6 +502,8 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
             window: window as usize,
             tags,
             on_close,
+            editable,
+            status,
          });
       send(window, sel(c"center"));
       send_id(window, sel(c"makeKeyAndOrderFront:"), ptr::null_mut());

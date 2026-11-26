@@ -220,6 +220,8 @@ pub use panel::{
    PanelButton,
    PanelSection,
    close_panel,
+   panel_text,
+   set_panel_status,
    show_panel,
 };
 

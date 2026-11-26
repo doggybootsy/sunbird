@@ -129,8 +129,8 @@ site=$(q "$site")
 discord=$(q "$discord")
 copy="\$home/Sunbird.app"
 gate_only=$no_runtime
-# Bumped when the copy's branding changes, so existing copies are rebuilt.
-brand=1
+# Bumped when the copy's Info.plist changes, so existing copies are rebuilt.
+brand=2
 fetch() { /usr/bin/curl -fsSL --proto $proto --proto-redir =https "\$@" 2>/dev/null; }
 fail() {
    /usr/bin/osascript -e 'on run argv' -e 'display alert "Sunbird" message (item 1 of argv)' \\
@@ -180,6 +180,11 @@ if [ "\$stamp" != "\$(cat "\$home/stamp" 2>/dev/null)" ] ||
       /usr/bin/plutil -remove CFBundleIconName "\$plist" 2>/dev/null || true
       /usr/bin/plutil -replace CFBundleIconFile -string Sunbird "\$plist"
    fi
+   # Discord relaunches itself through Launch Services (Command-R, updates)
+   # with its own environment, which the loader has taken itself out of. The
+   # copy's LSEnvironment puts it back for every start, the Dock's included.
+   /usr/bin/plutil -replace LSEnvironment.DYLD_INSERT_LIBRARIES \\
+      -string "\$home/libphoenix.dylib" "\$plist"
    # Ad hoc, without the hardened runtime or Discord's entitlements; the
    # helpers and frameworks inside keep Discord's own signatures.
    if ! /usr/bin/codesign --force --sign - "\$new" >/dev/null 2>&1; then
