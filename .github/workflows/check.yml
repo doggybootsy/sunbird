@@ -25,6 +25,7 @@ jobs:
       - name: sigscan check
         env:
           DESKTOP: ${{ vars.DISCORD_EXE_URL }}
+          MACOS: ${{ vars.DISCORD_MACOS_URL }}
         run: |
           missed=0
           check() {
@@ -44,4 +45,21 @@ jobs:
           else
             echo "::notice::DISCORD_EXE_URL is unset, desktop skipped"
           fi
+          if [ -n "$MACOS" ]; then
+            curl -fsSL "$MACOS" -o macos-phoenix
+            if unzip -p macos-phoenix "Discord Phoenix.app/Contents/MacOS/Discord" > Discord-macos 2>/dev/null; then
+              check macos Discord-macos
+            else
+              check macos macos-phoenix
+            fi
+          else
+            echo "::notice::DISCORD_MACOS_URL is unset, macos skipped"
+          fi
           exit $missed
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: cargo test --locked -p phoenix-hook -p phoenix-sigs -p phoenix-ui-desktop -p phoenix-loader
+      - run: cargo clippy --locked --no-deps -p phoenix-hook -p phoenix-sigs -p sigscan -p phoenix-ui-desktop -p stand-in --all-targets -- -D warnings

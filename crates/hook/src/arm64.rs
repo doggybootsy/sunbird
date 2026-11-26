@@ -284,6 +284,97 @@ pub fn decode_all(code: &[u8], pc: usize) -> impl Iterator<Item = (usize, Insn)>
       })
 }
 
+/// Decodes up to `count` arm64 instructions starting at `pc` into `(addr, text)`.
+#[must_use]
+pub fn disasm(code: &[u8], pc: usize, count: usize) -> Vec<(usize, String)> {
+   code
+      .as_chunks::<4>()
+      .0
+      .iter()
+      .take(count)
+      .enumerate()
+      .map(|(i, &bytes)| {
+         let addr = pc + i * 4;
+         let word = u32::from_le_bytes(bytes);
+         (addr, format_insn(word, addr))
+      })
+      .collect()
+}
+
+fn format_insn(word: u32, pc: usize) -> String {
+   let x = |r: Reg, wide: bool| match (r, wide) {
+      (31, true) => "xzr".to_owned(),
+      (31, false) => "wzr".to_owned(),
+      (_, true) => format!("x{r}"),
+      (_, false) => format!("w{r}"),
+   };
+   let sp = |r: Reg| if r == 31 { "sp".to_owned() } else { format!("x{r}") };
+   let cond_name = |c: u8| match c {
+      0 => "eq",
+      1 => "ne",
+      2 => "hs",
+      3 => "lo",
+      4 => "mi",
+      5 => "pl",
+      6 => "vs",
+      7 => "vc",
+      8 => "hi",
+      9 => "ls",
+      10 => "ge",
+      11 => "lt",
+      12 => "gt",
+      13 => "le",
+      14 => "al",
+      _ => "nv",
+   };
+   match decode(word, pc) {
+      Insn::Adrp { rd, page } => format!("adrp {}, {page:#x}", x(rd, true)),
+      Insn::AddImm { rd, rn, imm } => format!("add {}, {}, #{imm:#x}", sp(rd), sp(rn)),
+      Insn::CmpImm { rn, imm, wide } => format!("cmp {}, #{imm:#x}", x(rn, wide)),
+      Insn::Load { rt, rn, offset, size } => {
+         let (op, wide) = match size {
+            1 => ("ldrb", false),
+            2 => ("ldrh", false),
+            4 => ("ldr", false),
+            _ => ("ldr", true),
+         };
+         format!("{op} {}, [{}, #{offset:#x}]", x(rt, wide), sp(rn))
+      },
+      Insn::Store { rt, rn, offset, size } => {
+         let (op, wide) = match size {
+            1 => ("strb", false),
+            2 => ("strh", false),
+            4 => ("str", false),
+            _ => ("str", true),
+         };
+         format!("{op} {}, [{}, #{offset:#x}]", x(rt, wide), sp(rn))
+      },
+      Insn::MovZ { rd, imm, wide } => format!("mov {}, #{imm:#x}", x(rd, wide)),
+      Insn::MovN { rd, imm, wide } => format!("movn {}, #{imm:#x}", x(rd, wide)),
+      Insn::MovReg { rd, rm, wide } => format!("mov {}, {}", x(rd, wide), x(rm, wide)),
+      Insn::Cset { rd, cond } => format!("cset {}, {}", x(rd, false), cond_name(cond)),
+      Insn::Bl { target } => format!("bl {target:#x}"),
+      Insn::B { target } => format!("b {target:#x}"),
+      Insn::BCond { cond, target } => format!("b.{} {target:#x}", cond_name(cond)),
+      Insn::Cbz { rt, nonzero, target } => {
+         let op = if nonzero { "cbnz" } else { "cbz" };
+         format!("{op} x{rt}, {target:#x}")
+      },
+      Insn::Tbz { rt, bit, nonzero, target } => {
+         let op = if nonzero { "tbnz" } else { "tbz" };
+         format!("{op} x{rt}, #{bit}, {target:#x}")
+      },
+      Insn::Writeback { rt, rn, imm, load } => {
+         let op = if load { "ldr" } else { "str" };
+         format!("{op} x{rt}, [{}, #{imm:#x}]!", sp(rn))
+      },
+      Insn::Ret => "ret".to_owned(),
+      Insn::Br { rn } => format!("br {}", x(rn, true)),
+      Insn::Blr { rn } => format!("blr {}", x(rn, true)),
+      Insn::Other(w) => format!(".word {w:#010x}"),
+   }
+}
+
 /// The decoded body of the function holding `addr`, from its start.
 #[must_use]
 pub fn function(image: &Image<'_>, addr: usize) -> Option<(usize, Vec<(usize, Insn)>)> {

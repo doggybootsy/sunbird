@@ -563,7 +563,12 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
       println!("   {:<40} {:#010x}{note}", entry.name, entry.handler);
    }
-   if let Ok(http) = DesktopHttpTransport::locate(image) {
+   let http = if image.function_starts.is_some() {
+      phoenix_sigs::macos::http_transport(image)
+   } else {
+      DesktopHttpTransport::locate(image)
+   };
+   if let Ok(http) = http {
       let fmt_opt = |addr: Option<usize>| {
          addr.map_or_else(|| "none".to_owned(), |addr| format!("{addr:#010x}"))
       };
@@ -747,6 +752,16 @@ impl Tools<'_> {
          },
          None => usize::MAX,
       };
+      if self.arm64 {
+         for (line_addr, text) in phoenix_hook::arm64::disasm(code, addr, count) {
+            if line_addr >= end {
+               println!("   -- end of function --");
+               break;
+            }
+            println!("   {}  {text}", self.at(line_addr));
+         }
+         return;
+      }
       for line in x86::disasm(code, addr, count) {
          if line.addr >= end {
             println!("   -- end of function --");

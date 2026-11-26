@@ -258,7 +258,10 @@ byte pattern says nothing about arm32.
   shadows it). The debug shell is on and needs `debug-shell-token` from Sunbird's home.
 - `__TEXT` never takes `PROT_WRITE`. `Image::write_code` copies the page with
   `vm_protect(VM_PROT_COPY)`, which drops its execute bit until it is restored, so the patcher must
-  not share the page. Verified with SIP off only.
+  not share the page. Verified live with SIP enabled on macOS arm64 build 2233.
+- Dev loop: `./scripts/dev-macos.sh` builds `dev-fast` (or `--release`), ad-hoc signs and copies
+  `libphoenix.dylib`, and relaunches `Sunbird.app`. Also supports `--test`, `--clippy`, `--sigscan`,
+  `--logs`, `--eval`, and `--no-runtime`.
 - arm64 locators live in `crates/sigs/src/macos.rs`, on the decoder in `crates/hook/src/arm64.rs`.
   `sigscan strings`/`refs` resolve `adrp` pairs on Mach-O, and function bounds come from
   `LC_FUNCTION_STARTS`. The code is heavily outlined (`bl` to tiny shared stubs), so static
