@@ -143,6 +143,8 @@ struct CodeEditorModal {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
    Text,
+   /// Text over several lines, in a `TextArea`.
+   Lines,
    Number,
    /// Starts empty rather than showing the stored value.
    Secret,
@@ -962,7 +964,7 @@ fn open_panel(spec: PageModalSpec) -> u64 {
 }
 
 #[cfg(not(target_os = "macos"))]
-const fn open_panel(_spec: PageModalSpec) -> u64 {
+fn open_panel(_spec: PageModalSpec) -> u64 {
    0
 }
 
@@ -1139,7 +1141,12 @@ pub fn open_setting_editor(field: SettingField) {
 /// Stores the field's text as `field`'s value and closes the modal, or says
 /// why it can't.
 fn save_setting(app: *mut c_void, field: &SettingField) {
-   let Some(raw) = read_url_field(app) else {
+   let raw = if field.kind == FieldKind::Lines {
+      read_code_field(app)
+   } else {
+      read_url_field(app)
+   };
+   let Some(raw) = raw else {
       set_install_status("Could not read the text field", true, false);
       return;
    };
@@ -1638,6 +1645,8 @@ const ALIGN_CENTER: u8 = 4;
 
 /// Lines the plugin code editor shows; it scrolls past them.
 const EDITOR_ROWS: u8 = 30;
+/// Rows of a multiline setting's field.
+const SETTING_ROWS: u8 = 8;
 
 fn set_mono_font(s: &Style, font_px: f32, line_px: f32) {
    s.length(s.at.font_size, gpui_px(font_px));
@@ -2044,6 +2053,10 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          )
       },
       Snapshot::InstallUrl(inst) => {
+         let lines = inst
+            .setting
+            .as_ref()
+            .is_some_and(|field| field.kind == FieldKind::Lines);
          let mut body = gpui::v_stack(10.0);
          if let Some(ref mut b) = body {
             gpui::style_div(b, |s| s.length(s.at.size[0], W_FULL));
@@ -2052,7 +2065,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                   ensure_field_entity(
                      app,
                      window,
-                     false,
+                     lines,
                      match &inst.setting {
                         None => "https://example.com/plugin.js",
                         Some(field) if field.kind == FieldKind::Secret => "Leave empty to clear",
@@ -2064,14 +2077,24 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                if let Some(init) = &inst.pending_init {
                   unsafe { set_field_text(app, &ent, init) };
                }
-               // SAFETY: constructs hosted `TextInput` from
-               // `&Entity<FieldState>` in a buffer that fits it and converts to
-               // `AnyElement`.
+               // SAFETY: constructs hosted `TextInput`, or `TextArea` for a
+               // multiline setting, from `&Entity<FieldState>` in a buffer that
+               // fits it and converts to `AnyElement`.
                let mut ti_any = unsafe {
-                  let mut ti = RawTextInput::zeroed();
-                  (tf.text_input_new)(&raw mut ti, &raw const ent);
                   let mut any = MaybeUninit::<RawAnyElement>::uninit();
-                  (tf.text_input_into_any)(any.as_mut_ptr(), &raw mut ti);
+                  if lines {
+                     let mut ta = RawTextArea::zeroed();
+                     (tf.text_area_new)(&raw mut ta, &raw const ent);
+                     if let Some(rows) = tf.layout.text_area_rows {
+                        ta.put(rows, [1u8, SETTING_ROWS]);
+                        ta.put(rows + 2, [1u8, SETTING_ROWS]);
+                     }
+                     (tf.text_area_into_any)(any.as_mut_ptr(), &raw mut ta);
+                  } else {
+                     let mut ti = RawTextInput::zeroed();
+                     (tf.text_input_new)(&raw mut ti, &raw const ent);
+                     (tf.text_input_into_any)(any.as_mut_ptr(), &raw mut ti);
+                  }
                   any.assume_init()
                };
                if let Some(mut wrap) = gpui::v_stack(4.0) {

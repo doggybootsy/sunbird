@@ -1,5 +1,6 @@
 //! phoenix on Desktop Phoenix: the access gate, the HTTP transport hooks, the
-//! Sunbird pages in User Settings, message accessories and the tray.
+//! Sunbird pages in User Settings, message accessories, member list
+//! decorations and the tray.
 
 #![cfg(any(
    windows,
@@ -14,7 +15,11 @@ mod discord;
 mod emoji;
 mod fetch;
 mod gpui;
+#[cfg(not(target_os = "macos"))]
+mod headers;
+mod icons;
 mod js;
+mod members;
 mod message;
 mod modal;
 mod os;
@@ -90,14 +95,23 @@ pub fn prepare() -> Result<(), Error> {
    open_access_gate(&image);
    settings::install(&image);
    staff::prepare(&image);
-   if X86_CODE {
+   #[cfg(not(target_os = "macos"))]
+   {
       modal::install(&image);
+      // Before accessories hooks `MessageRow::render`, whose prologue the header
+      // locators check.
+      let header = headers::locate(&image);
       accessories::install(&image);
+      members::install(&image);
+      headers::install(&image, header);
+      icons::install(&image);
       context_menu::install(&image);
       message::install(&image);
       badges::install(&image);
       emoji::install(&image);
-   } else {
+   }
+   #[cfg(target_os = "macos")]
+   {
       context_menu::install(&image);
       accessories::install(&image);
       emoji::install(&image);

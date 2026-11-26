@@ -52,7 +52,9 @@ use crate::{
       ActionMeta,
    },
    emoji,
+   icons,
    js::Desktop,
+   members::Place,
    modal::{
       self,
       ModalButton,
@@ -63,6 +65,16 @@ use crate::{
 
 #[derive(Clone)]
 pub struct DesktopAccessory<'js> {
+   pub id:       u64,
+   pub plugin:   String,
+   pub priority: i32,
+   pub render:   Function<'js>,
+}
+
+/// A `phoenix.ui.addMemberDecoration` or `addMessageHeaderDecoration`
+/// callback.
+#[derive(Clone)]
+pub struct DesktopMember<'js> {
    pub id:       u64,
    pub plugin:   String,
    pub priority: i32,
@@ -115,6 +127,7 @@ fn parse_rendered(value: &Value<'_>, priority: i32) -> Option<RenderedAccessory>
          text,
          color: None,
          tint: None,
+         icons: Vec::new(),
       });
    }
    if let Some(obj) = value.as_object() {
@@ -133,7 +146,8 @@ fn parse_rendered(value: &Value<'_>, priority: i32) -> Option<RenderedAccessory>
          .ok()
          .flatten()
          .map(to_argb);
-      if text.is_empty() && tint.is_none() {
+      let icons = parse_icons(obj);
+      if text.is_empty() && tint.is_none() && icons.is_empty() {
          return None;
       }
       return Some(RenderedAccessory {
@@ -141,9 +155,32 @@ fn parse_rendered(value: &Value<'_>, priority: i32) -> Option<RenderedAccessory>
          text,
          color,
          tint,
+         icons,
       });
    }
    None
+}
+
+/// `icons: [{ svg, color }]`, registered for drawing. Empty where icons cannot
+/// be drawn, which leaves the text.
+fn parse_icons(obj: &Object<'_>) -> Vec<(&'static str, Option<u32>)> {
+   let Ok(Some(list)) = obj.get::<_, Option<Array<'_>>>("icons") else {
+      return Vec::new();
+   };
+   list
+      .iter::<Object<'_>>()
+      .filter_map(Result::ok)
+      .take(8)
+      .filter_map(|icon| {
+         let svg = icon.get::<_, String>("svg").ok()?;
+         let color = icon
+            .get::<_, Option<f64>>("color")
+            .ok()
+            .flatten()
+            .map(to_argb);
+         Some((icons::register(&svg)?, color))
+      })
+      .collect()
 }
 
 fn evaluate_accessories_in_ctx<'js>(ctx: &Ctx<'js>, message_id: u64) -> Vec<RenderedAccessory> {
@@ -242,6 +279,104 @@ pub fn render_accessories(engine: &Engine, message_id: u64) -> Vec<RenderedAcces
    engine.with(|ctx| evaluate_accessories_in_ctx(&ctx, message_id))
 }
 
+/// The plugin API name registering `place`'s decorations.
+const fn api_name(place: Place) -> &'static str {
+   match place {
+      Place::Members => "addMemberDecoration",
+      Place::Headers => "addMessageHeaderDecoration",
+   }
+}
+
+/// Calls every decoration registered for `place` with `user_id`.
+fn evaluate_decorations_in_ctx<'js>(
+   ctx: &Ctx<'js>,
+   place: Place,
+   user_id: u64,
+) -> Vec<RenderedAccessory> {
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return Vec::new();
+   };
+   let snapshot: Vec<DesktopMember<'js>> = registry.decorations(place).borrow().clone();
+   drop(registry);
+   let Ok(arg) = Object::new(ctx.clone()) else {
+      return Vec::new();
+   };
+   let _ = arg.set("userId", user_id.to_string());
+
+   let mut out = Vec::new();
+   for decoration in &snapshot {
+      match decoration
+         .render
+         .call::<_, Value<'_>>((arg.clone(),))
+         .catch(ctx)
+      {
+         Ok(val) => out.extend(parse_rendered(&val, decoration.priority)),
+         Err(err) => log::error!("[{}] {} render: {err}", decoration.plugin, api_name(place)),
+      }
+   }
+   out
+}
+
+/// Evaluates every decoration registered for `place` with `user_id`.
+pub fn render_decorations(engine: &Engine, place: Place, user_id: u64) -> Vec<RenderedAccessory> {
+   engine.with(|ctx| evaluate_decorations_in_ctx(&ctx, place, user_id))
+}
+
+/// `addMemberDecoration` and `addMessageHeaderDecoration`, which differ only
+/// in where they draw.
+fn add_decoration<'js>(
+   ctx: &Ctx<'js>,
+   place: Place,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+   let render = options.get::<_, Function<'js>>("render")?;
+   let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
+   let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+   let decorations = place.decorations();
+   let count = {
+      let registry = ctx
+         .userdata::<Desktop<'js>>()
+         .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+      let mut list = registry.decorations(place).borrow_mut();
+      list.push(DesktopMember {
+         id,
+         plugin: plugin.to_owned(),
+         priority,
+         render,
+      });
+      list.len()
+   };
+   decorations.set_active_count(count);
+   decorations.clear_cache();
+   accessories::invalidate_discord_windows();
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut list = registry.decorations(place).borrow_mut();
+         list.retain(|entry| entry.id != id);
+         decorations.set_active_count(list.len());
+         decorations.clear_cache();
+         accessories::invalidate_discord_windows();
+      }
+   })?;
+   remove.set(
+      "update",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, user_id: Opt<String>| {
+         if let Some(uid) = user_id.0.and_then(|s| s.parse::<u64>().ok()) {
+            let items = evaluate_decorations_in_ctx(&ctx, place, uid);
+            decorations.set_rendered(uid, items);
+         } else {
+            decorations.clear_cache();
+            accessories::invalidate_discord_windows();
+         }
+      })?,
+   )?;
+   Ok(remove)
+}
+
 #[expect(
    clippy::cast_possible_truncation,
    clippy::cast_sign_loss,
@@ -300,6 +435,13 @@ fn add_message_accessory<'js>(
       })?,
    )?;
    Ok(remove)
+}
+
+/// The author of `message_id` in Phoenix's message store.
+pub fn cached_author(message_id: u64) -> Option<u64> {
+   let json = cached_message_and_me(0, message_id).0?;
+   let message = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+   message.get("author")?.get("id")?.as_str()?.parse().ok()
 }
 
 fn cached_message_and_me(channel_id: u64, message_id: u64) -> (Option<String>, Option<String>) {
@@ -658,6 +800,16 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          add_message_accessory(&ctx, &owner, &options)
       })?,
    )?;
+
+   for place in [Place::Members, Place::Headers] {
+      let owner = plugin.to_owned();
+      ui.set(
+         api_name(place),
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+            add_decoration(&ctx, place, &owner, &options)
+         })?,
+      )?;
+   }
 
    let action_owner = plugin.to_owned();
    ui.set(

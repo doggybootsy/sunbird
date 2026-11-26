@@ -23,9 +23,11 @@ use std::{
 };
 
 use phoenix_hook::image::Image;
+#[cfg(target_os = "macos")]
+use phoenix_runtime::discord::InFlight;
 use phoenix_runtime::{
    discord::{
-      Authorization, DiscordError, InFlight, RequestAction, api_path, observe_request,
+      Authorization, DiscordError, RequestAction, api_path, observe_request,
       run_response_hooks, session_request, take_response, track_response, watch_response,
    },
    fetch::{self, Request, Response},

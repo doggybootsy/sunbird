@@ -67,3 +67,6 @@
 !web/plugins/
 !web/plugins/frida-*.js
 !web/plugins/frida-gadget-*.so.gz
+!web/plugins/platform-indicators/
+!web/plugins/platform-indicators/*.svg
+!web/plugins/platform-indicators/*.png

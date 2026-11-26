@@ -229,6 +229,7 @@ impl Engine {
                         title:       definition.title.clone(),
                         description: definition.description.clone(),
                         control:     definition.kind.current(picked),
+                        multiline:   definition.multiline,
                      }
                   })
                   .collect();

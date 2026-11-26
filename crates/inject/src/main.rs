@@ -560,17 +560,25 @@ mod windows {
       } else {
          "=http"
       };
-      let out = Command::new(system32("curl.exe"))
-         .args(["-fsSL", "--proto", proto, "--proto-redir", "=https"])
-         .args([
-            "--ssl-revoke-best-effort",
-            "--max-time",
-            &max_secs.to_string(),
-         ])
-         .args(args)
-         .creation_flags(NO_WINDOW)
-         .output()
-         .context("running curl.exe")?;
+      let max_secs = max_secs.to_string();
+      let run = |revoke: &[&str]| {
+         Command::new(system32("curl.exe"))
+            .args(["-fsSL", "--proto", proto, "--proto-redir", "=https"])
+            .args(revoke)
+            .args(["--max-time", &max_secs])
+            .args(args)
+            .creation_flags(NO_WINDOW)
+            .output()
+            .context("running curl.exe")
+      };
+      let mut out = run(&["--ssl-revoke-best-effort"])?;
+      // Windows 10 1809's curl.exe (7.55, as in LTSC 2019) predates the flag,
+      // so it runs again without, checking revocation strictly instead.
+      if !out.status.success()
+         && String::from_utf8_lossy(&out.stderr).contains("--ssl-revoke-best-effort")
+      {
+         out = run(&[])?;
+      }
       if !out.status.success() {
          misstep::bail!("curl: {}", String::from_utf8_lossy(&out.stderr).trim());
       }

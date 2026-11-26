@@ -6,7 +6,7 @@ name: check
 # the DISCORD_EXE_URL repository variable points at a copy of its Discord.exe.
 on:
   push:
-    paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'Cargo.*', 'flake.*', '.github/workflows/check.yml']
+    paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'crates/loader/**', 'Cargo.*', 'flake.*', '.github/workflows/check.yml']
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
@@ -56,6 +56,7 @@ jobs:
             echo "::notice::DISCORD_MACOS_URL is unset, macos skipped"
           fi
           exit $missed
+
   macos:
     runs-on: macos-15
     steps:
@@ -63,3 +64,4 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component clippy
       - run: cargo test --locked -p phoenix-hook -p phoenix-sigs -p phoenix-ui-desktop -p phoenix-loader
       - run: cargo clippy --locked --no-deps -p phoenix-hook -p phoenix-sigs -p sigscan -p phoenix-ui-desktop -p stand-in --all-targets -- -D warnings
+      - run: cargo build --locked --release -p phoenix-loader

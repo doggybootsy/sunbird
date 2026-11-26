@@ -400,7 +400,8 @@ let catalogTimer = null;
 const DESKTOP_FULL = new Set([
   'silent-typing', 'message-latency', 'message-logger', 'no-profile-themes',
   'no-reply-mention', 'spoiler-mode', 'text-replace', 'view-raw',
-  'global-badges', 'dearrow', 'translate', 'clear-urls', 'fix-embeds'
+  'global-badges', 'dearrow', 'translate', 'clear-urls', 'fix-embeds',
+  'platform-indicators'
 ]);
 const DESKTOP_PARTIAL = new Set(['fakenitro']);
 const MOBILE_ONLY = new Set(['hide-composer-buttons', 'reviewdb', 'taptap', 'example']);
@@ -636,8 +637,9 @@ async function loadPlugins() {
               if (!ok) e.target.checked = !e.target.checked;
             };
           } else if (s.type === 'text' || s.type === 'secret') {
-            const inp = document.createElement('input');
-            inp.type = s.type === 'secret' ? 'password' : 'text';
+            const inp = document.createElement(s.multiline ? 'textarea' : 'input');
+            if (s.multiline) inp.rows = Math.min(Math.max((s.value || '').split('\n').length + 1, 3), 12);
+            else inp.type = s.type === 'secret' ? 'password' : 'text';
             inp.value = s.type === 'secret' ? '' : (s.value || '');
             inp.placeholder = s.type === 'secret' ? (s.has_value ? '•••••••• (set)' : 'Enter secret') : '';
             const btn = document.createElement('button');

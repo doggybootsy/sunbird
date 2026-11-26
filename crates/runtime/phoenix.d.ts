@@ -933,7 +933,13 @@ declare namespace Phoenix {
 
   type SettingSpec =
     | (SpecBase & { type: "switch"; default?: boolean; onChange?(value: boolean): void })
-    | (SpecBase & { type: "text"; default?: string; onChange?(value: string): void })
+    | (SpecBase & {
+        type: "text";
+        default?: string;
+        /// Edited over several lines, for lists like one rule per line. Desktop only for now.
+        multiline?: boolean;
+        onChange?(value: string): void;
+      })
     /// Text shown masked, and replaced with `[redacted]` in the plugin's log lines.
     | (SpecBase & { type: "secret"; default?: string; onChange?(value: string): void })
     /// One of a fixed list, shown as rows with a checkmark. Defaults to the first option.
@@ -1202,21 +1208,32 @@ declare namespace Phoenix {
     userId?: string;
   }
 
+  /// An SVG icon: its shape is filled with `color` (32-bit ARGB), whatever fills the source has.
+  /// Android and iOS draw no SVG and show the image at `uri` (PNG, WebP or a `data:` URI) as it is,
+  /// so it carries its own color there.
+  interface RenderedIcon {
+    svg: string;
+    color?: number;
+    uri?: string;
+  }
+
   /// Text a `render` returns: plain, colored (32-bit ARGB), or nothing. Under a message's content,
   /// `tint` also colors the message's author and text (32-bit ARGB); `text` may then be empty.
+  /// `icons` are drawn in place of `text` where the client can draw them (member and header
+  /// decorations), and `text` shows everywhere else.
   type Rendered =
     | string
-    | { text?: string; color?: number; tint?: number }
+    | { text?: string; color?: number; tint?: number; icons?: RenderedIcon[] }
     | null
     | undefined
     | false;
 
   /// Undoes a registration. `update` draws it again, asking the plugin anew; for a message
-  /// accessory, `update(messageId)` redraws only that message, and for a profile tab,
-  /// `update(userId)` only that profile's page.
+  /// accessory, `update(messageId)` redraws only that message, and for a profile tab or a member
+  /// decoration, `update(userId)` only that user's.
   interface Remover {
     (): void;
-    update?(messageId?: string): void;
+    update?(id?: string): void;
   }
 
   /// A pressable piece of text, or plain text without `onPress`. `color` (32-bit ARGB) wins over
@@ -1330,6 +1347,20 @@ declare namespace Phoenix {
       placement?: "content" | "header";
       priority?: number;
       render(ctx: MessageContext): Rendered | Promise<Rendered>;
+    }): Remover;
+    /// Text or icons after a user's name in the member list and on their DM in the DM list.
+    /// Absent on runtimes from before it. It runs once per user, and the result is kept until
+    /// `update(userId)`.
+    addMemberDecoration?(options: {
+      priority?: number;
+      render(ctx: { userId: string }): Rendered;
+    }): Remover;
+    /// Icons right after the author's name in message headers. Absent on runtimes from before it.
+    /// Only `icons` are drawn. Like `addMemberDecoration`, it runs once per author and the result
+    /// is kept until `update(userId)`.
+    addMessageHeaderDecoration?(options: {
+      priority?: number;
+      render(ctx: { userId: string }): Rendered;
     }): Remover;
     /// A row in the message long-press menu, above Delete. The menu closes on press.
     addMessageAction(options: {
