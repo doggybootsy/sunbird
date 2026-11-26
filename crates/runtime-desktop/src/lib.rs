@@ -23,60 +23,33 @@ mod staff;
 
 use std::{
    ffi::c_void,
-   path::{
-      Path,
-      PathBuf,
-   },
-   sync::{
-      Arc,
-      Mutex,
-      PoisonError,
-   },
+   path::{Path, PathBuf},
+   sync::{Arc, Mutex, PoisonError},
    time::Duration,
 };
 
 use phoenix_hook::image::Image;
 use phoenix_runtime::{
-   Error,
-   Notice,
-   Platform,
-   Plugin,
-   Started,
-   discord::{
-      Authorization,
-      DiscordError,
-   },
-   fetch::{
-      FetchError,
-      Request,
-      Response,
-   },
-   remote::{
-      self,
-      Done,
-   },
-   store::{
-      Rows,
-      StoreError,
-   },
+   Error, Notice, Platform, Plugin, Started,
+   discord::{Authorization, DiscordError},
+   fetch::{FetchError, Request, Response},
+   remote::{self, Done},
+   store::{Rows, StoreError},
 };
 use phoenix_sigs::registry::GatewayRegistry;
-use rquickjs::{
-   Ctx,
-   Object,
-};
+use rquickjs::{Ctx, Object};
 
 struct Desktop;
 
 /// A `POST /ui/choose` or `POST /ui/sheet` body.
 #[derive(serde::Deserialize)]
 struct DialogRequest {
-   title:     Option<String>,
-   message:   Option<String>,
-   text:      Option<String>,
+   title: Option<String>,
+   message: Option<String>,
+   text: Option<String>,
    monospace: Option<bool>,
    highlight: Option<bool>,
-   options:   Option<Vec<DialogItem>>,
+   options: Option<Vec<DialogItem>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -84,7 +57,7 @@ struct DialogRequest {
 enum DialogItem {
    Label(String),
    Item {
-      label:  String,
+      label: String,
       #[serde(default)]
       danger: bool,
    },
@@ -124,7 +97,6 @@ pub fn prepare() -> Result<(), Error> {
       message::install(&image);
       badges::install(&image);
       emoji::install(&image);
-      <os::Os as os::DesktopOs>::install(&image);
    } else {
       context_menu::install(&image);
       accessories::install(&image);
@@ -133,6 +105,7 @@ pub fn prepare() -> Result<(), Error> {
       message::install(&image);
       log::info!("arm64 Desktop: plugin pages and dialogs are AppKit windows");
    }
+   <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
       discord::install(&image);
@@ -283,19 +256,16 @@ impl Platform for Desktop {
       remote::require_token(&state.plugins_dir().with_file_name("debug-shell-token"));
       remote::ensure_started();
       phoenix_ui_desktop::start_tray(phoenix_ui_desktop::TrayConfig {
-         dashboard_url:    remote::dashboard_url(),
-         plugins_dir:      state.plugins_dir(),
-         on_reload_all:    Some(Arc::new(phoenix_runtime::reload_all)),
+         dashboard_url: remote::dashboard_url(),
+         plugins_dir: state.plugins_dir(),
+         on_reload_all: Some(Arc::new(phoenix_runtime::reload_all)),
          on_check_updates: Some(Arc::new(phoenix_runtime::update::check_now)),
       });
-      phoenix_ui_desktop::notify(
-         "Sunbird ready",
-         Some(if X86_CODE {
-            "Open User Settings -> Sunbird, or press Ctrl+Shift+I for DevTools"
-         } else {
-            "Sunbird's settings are in its menu bar item"
-         }),
+      let ready_body = format!(
+         "Open User Settings -> Sunbird, or press {} for DevTools",
+         phoenix_ui_desktop::DEVTOOLS_SHORTCUT
       );
+      phoenix_ui_desktop::notify("Sunbird ready", Some(&ready_body));
       phoenix_runtime::update::check();
    }
 
@@ -368,26 +338,20 @@ fn dialog(body: &[u8], sheet: bool) -> remote::Reply {
       .options
       .unwrap_or_default()
       .into_iter()
-      .map(|item| {
-         match item {
-            DialogItem::Label(label) => {
-               modal::ChoiceOption {
-                  label,
-                  danger: false,
-               }
-            },
-            DialogItem::Item { label, danger } => modal::ChoiceOption { label, danger },
-         }
+      .map(|item| match item {
+         DialogItem::Label(label) => modal::ChoiceOption {
+            label,
+            danger: false,
+         },
+         DialogItem::Item { label, danger } => modal::ChoiceOption { label, danger },
       })
       .collect::<Vec<_>>();
    let content = if sheet {
-      request.text.map(|text| {
-         modal::ModalSection::Code {
-            title: None,
-            text,
-            monospace: request.monospace.unwrap_or_default(),
-            highlight: request.highlight.unwrap_or_default(),
-         }
+      request.text.map(|text| modal::ModalSection::Code {
+         title: None,
+         text,
+         monospace: request.monospace.unwrap_or_default(),
+         highlight: request.highlight.unwrap_or_default(),
       })
    } else {
       request

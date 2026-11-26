@@ -291,7 +291,7 @@
       </label>
     </div>
     <button class="btn" id="popout-btn" title="Open in standalone window">Pop out</button>
-    <div class="nav-shortcut">Settings: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd> · DevTools: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd></div>
+    <div class="nav-shortcut" id="nav-shortcut">Settings: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd> · DevTools: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd></div>
   </div>
 </nav>
 <main>
@@ -334,7 +334,7 @@
 
   <section id="tab-console" class="hidden">
     <h1>Runtime Console</h1>
-    <p class="sub">Evaluate JavaScript in the QuickJS plugin runtime (<kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run).</p>
+    <p class="sub" id="eval-hint">Evaluate JavaScript in the QuickJS plugin runtime (<kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run).</p>
     <div class="card">
       <textarea id="eval-input" rows="3" placeholder="Object.keys(phoenix.gateway).length"></textarea>
       <div class="toolbar" style="margin:10px 0 0">
@@ -922,6 +922,12 @@ function openTabFromHash() {
     return;
   }
   loadPlugins();
+}
+if (/Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent)) {
+  const nav = $('#nav-shortcut');
+  if (nav) nav.innerHTML = 'Settings: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd> · DevTools: <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd>';
+  const hint = $('#eval-hint');
+  if (hint) hint.innerHTML = 'Evaluate JavaScript in the QuickJS plugin runtime (<kbd>Cmd</kbd>+<kbd>Enter</kbd> to run).';
 }
 window.addEventListener('hashchange', openTabFromHash);
 openTabFromHash();

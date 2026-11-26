@@ -8,40 +8,20 @@
 //! `MenuItem::Action` with a native `Rc<dyn Fn>` click callback.
 
 use std::{
-   collections::{
-      HashMap,
-      VecDeque,
-   },
+   collections::{HashMap, VecDeque},
    ffi::c_void,
    ptr,
    sync::{
-      LazyLock,
-      Mutex,
-      OnceLock,
-      PoisonError,
-      RwLock,
-      atomic::{
-         AtomicU64,
-         AtomicUsize,
-         Ordering,
-      },
+      LazyLock, Mutex, OnceLock, PoisonError, RwLock,
+      atomic::{AtomicU64, AtomicUsize, Ordering},
       mpsc,
    },
 };
 
 use phoenix_hook::image::Image;
-use phoenix_sigs::desktop::{
-   self,
-   MenuLayout,
-   layout,
-};
+use phoenix_sigs::desktop::{self, MenuLayout, layout};
 
-use crate::gpui::{
-   self,
-   RcFnVtbl,
-   Scratch,
-   SharedString,
-};
+use crate::gpui::{self, RcFnVtbl, Scratch, SharedString};
 
 /// `Vec<MenuItem>` in Discord's Rust ABI (`[cap, ptr, len]`).
 #[repr(C)]
@@ -73,20 +53,20 @@ type VecPushFn = unsafe extern "C" fn(*mut RawMenuVec, *mut RawMenuItem);
 
 struct MenuSymbols {
    /// x86's [`BuildMenuFn`]; arm64 keeps its own in `arm64::ORIG`.
-   orig_build:        Option<BuildMenuFn>,
-   msg_ptr_offset:    usize,
-   msg_id_offset:     usize,
+   orig_build: Option<BuildMenuFn>,
+   msg_ptr_offset: usize,
+   msg_id_offset: usize,
    channel_id_offset: usize,
-   props_new:         PropsNewFn,
-   with_id:           WithIdFn,
-   with_icon:         WithIconFn,
+   props_new: PropsNewFn,
+   with_id: WithIdFn,
+   with_icon: WithIconFn,
    /// `None` when arm64's ranking isn't clear; danger items then keep the
    /// default color.
-   with_color:        Option<WithColorFn>,
-   vec_push:          VecPushFn,
+   with_color: Option<WithColorFn>,
+   vec_push: VecPushFn,
    /// `MenuItem::Separator`'s tag; `None` when arm64's push doesn't decode.
-   separator_tag:     Option<u64>,
-   layout:            MenuLayout,
+   separator_tag: Option<u64>,
+   layout: MenuLayout,
 }
 
 // SAFETY: function pointers and plain struct offsets into `Discord.exe`.
@@ -99,11 +79,11 @@ static MENU_SYMS: OnceLock<MenuSymbols> = OnceLock::new();
 /// GPUI thread when a message context menu opens.
 #[derive(Clone, Debug)]
 pub struct ActionMeta {
-   pub id:          u64,
-   pub label:       String,
-   pub icon:        Option<String>,
-   pub danger:      bool,
-   pub priority:    i32,
+   pub id: u64,
+   pub label: String,
+   pub icon: Option<String>,
+   pub danger: bool,
+   pub priority: i32,
    pub has_visible: bool,
 }
 
@@ -114,7 +94,7 @@ static ACTIONS: LazyLock<RwLock<Vec<ActionMeta>>> = LazyLock::new(|| RwLock::new
 /// `(action_id, message_id, channel_id)` to invoke when the user clicks it.
 #[derive(Clone, Copy)]
 struct PendingClick {
-   action:  u64,
+   action: u64,
    message: u64,
    channel: u64,
 }
@@ -123,26 +103,26 @@ const MAX_PENDING_CLICKS: usize = 512;
 
 struct ClickTable {
    order: VecDeque<u64>,
-   map:   HashMap<u64, PendingClick>,
+   map: HashMap<u64, PendingClick>,
 }
 
 static NEXT_CLICK_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CLICKS: LazyLock<Mutex<ClickTable>> = LazyLock::new(|| {
    Mutex::new(ClickTable {
       order: VecDeque::new(),
-      map:   HashMap::new(),
+      map: HashMap::new(),
    })
 });
 static WORKER_TX: OnceLock<mpsc::Sender<PendingClick>> = OnceLock::new();
 
 static MENU_ACTION_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
-   size:          size_of::<u64>(),
-   align:         align_of::<u64>(),
-   call_once:     menu_action_callback as *const c_void,
-   call_mut:      menu_action_callback as *const c_void,
-   call:          menu_action_callback as *const c_void,
-   extra:         ptr::null(),
+   size: size_of::<u64>(),
+   align: align_of::<u64>(),
+   call_once: menu_action_callback as *const c_void,
+   call_mut: menu_action_callback as *const c_void,
+   call: menu_action_callback as *const c_void,
+   extra: ptr::null(),
 };
 
 /// Updates the menu-thread snapshot of registered `addMessageAction` entries.
@@ -323,17 +303,17 @@ pub fn install(image: &Image<'static>) {
    // SAFETY: every address was validated by `desktop::message_context_menu`.
    let syms = unsafe {
       MenuSymbols {
-         orig_build:        Some(std::mem::transmute::<usize, BuildMenuFn>(trampoline)),
-         msg_ptr_offset:    menu.msg_ptr_offset,
-         msg_id_offset:     menu.msg_id_offset,
+         orig_build: Some(std::mem::transmute::<usize, BuildMenuFn>(trampoline)),
+         msg_ptr_offset: menu.msg_ptr_offset,
+         msg_id_offset: menu.msg_id_offset,
          channel_id_offset: menu.channel_id_offset,
-         props_new:         std::mem::transmute::<usize, PropsNewFn>(menu.props_new),
-         with_id:           std::mem::transmute::<usize, WithIdFn>(menu.with_id),
-         with_icon:         std::mem::transmute::<usize, WithIconFn>(menu.with_icon),
-         with_color:        Some(std::mem::transmute::<usize, WithColorFn>(menu.with_color)),
-         vec_push:          std::mem::transmute::<usize, VecPushFn>(menu.vec_push),
-         separator_tag:     Some(layout::MENU_ITEM_SEPARATOR_TAG),
-         layout:            menu.layout,
+         props_new: std::mem::transmute::<usize, PropsNewFn>(menu.props_new),
+         with_id: std::mem::transmute::<usize, WithIdFn>(menu.with_id),
+         with_icon: std::mem::transmute::<usize, WithIconFn>(menu.with_icon),
+         with_color: Some(std::mem::transmute::<usize, WithColorFn>(menu.with_color)),
+         vec_push: std::mem::transmute::<usize, VecPushFn>(menu.vec_push),
+         separator_tag: Some(layout::MENU_ITEM_SEPARATOR_TAG),
+         layout: menu.layout,
       }
    };
    let _ = MENU_SYMS.set(syms);
@@ -486,17 +466,14 @@ fn append_plugin_actions(
 
    for action in visible {
       let token = register_click(PendingClick {
-         action:  action.id,
+         action: action.id,
          message: message_id,
          channel: channel_id,
       });
-      let rc_ptr = if crate::X86_CODE {
-         let Some(rc_ptr) = gpui::alloc_rc_u64(token) else {
-            continue;
-         };
-         rc_ptr
-      } else {
-         gpui::pinned_rc_u64(token)
+      let Some(rc_ptr) = gpui::alloc_rc_u64(token)
+         .or_else(|| (!crate::X86_CODE).then(|| gpui::pinned_rc_u64(token)))
+      else {
+         continue;
       };
       let label_ss = SharedString::from_str(&action.label);
       let id_str = gpui::intern_str(&format!("sunbird-msg-action-{}", action.id));
@@ -551,24 +528,12 @@ fn append_plugin_actions(
 mod arm64 {
    use std::{
       ffi::c_void,
-      sync::{
-         OnceLock,
-         atomic::Ordering,
-      },
+      sync::{OnceLock, atomic::Ordering},
    };
 
-   use phoenix_hook::image::{
-      Image,
-      sret_caller,
-   };
+   use phoenix_hook::image::{Image, sret_caller};
 
-   use super::{
-      ACTIVE_COUNT,
-      MENU_SYMS,
-      MenuSymbols,
-      RawMenuVec,
-      append_plugin_actions,
-   };
+   use super::{ACTIVE_COUNT, MENU_SYMS, MenuSymbols, RawMenuVec, append_plugin_actions};
 
    type BuildFn = unsafe extern "C" fn(
       input: *const c_void,
@@ -634,20 +599,20 @@ mod arm64 {
       unsafe {
          let _ = ORIG.set(std::mem::transmute::<usize, BuildFn>(trampoline));
          let _ = MENU_SYMS.set(MenuSymbols {
-            orig_build:        None,
-            msg_ptr_offset:    0,
-            msg_id_offset:     menu.message_id_offset,
+            orig_build: None,
+            msg_ptr_offset: 0,
+            msg_id_offset: menu.message_id_offset,
             channel_id_offset: menu.channel_id_offset,
-            props_new:         std::mem::transmute::<usize, super::PropsNewFn>(props_new),
-            with_id:           std::mem::transmute::<usize, super::WithIdFn>(with_id),
-            with_icon:         std::mem::transmute::<usize, super::WithIconFn>(with_icon),
-            with_color:        menu
+            props_new: std::mem::transmute::<usize, super::PropsNewFn>(props_new),
+            with_id: std::mem::transmute::<usize, super::WithIdFn>(with_id),
+            with_icon: std::mem::transmute::<usize, super::WithIconFn>(with_icon),
+            with_color: menu
                .with_color
                .and_then(sret_caller)
                .map(|thunk| std::mem::transmute::<usize, super::WithColorFn>(thunk)),
-            vec_push:          std::mem::transmute::<usize, super::VecPushFn>(menu.vec_push),
-            separator_tag:     menu.separator_tag,
-            layout:            menu.layout,
+            vec_push: std::mem::transmute::<usize, super::VecPushFn>(menu.vec_push),
+            separator_tag: menu.separator_tag,
+            layout: menu.layout,
          });
       }
       let _ = IDS.set((menu.message_id_offset, menu.channel_id_offset));

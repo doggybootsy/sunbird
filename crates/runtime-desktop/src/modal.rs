@@ -10,60 +10,24 @@
 use std::{
    ffi::c_void,
    mem::MaybeUninit,
-   ptr,
-   slice,
-   str,
+   ptr, slice, str,
    sync::{
-      Arc,
-      Condvar,
-      LazyLock,
-      Mutex,
-      OnceLock,
-      PoisonError,
-      atomic::{
-         AtomicBool,
-         AtomicU64,
-         AtomicUsize,
-         Ordering,
-      },
+      Arc, Condvar, LazyLock, Mutex, OnceLock, PoisonError,
+      atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
    },
    time::Duration,
 };
 
 use phoenix_hook::image::Image;
-use phoenix_runtime::highlight::{
-   self,
-   JsonKind,
-   Kind,
-};
-use phoenix_sigs::desktop::{
-   self,
-   FieldLayout,
-   ModalLayout,
-   layout,
-};
+use phoenix_runtime::highlight::{self, JsonKind, Kind};
+use phoenix_sigs::desktop::{self, FieldLayout, ModalLayout, layout};
 
 use crate::{
    gpui::{
-      self,
-      BtnSize,
-      BtnVariant,
-      RawAnyElement,
-      RawButton,
-      RawDiv,
-      RcFnVtbl,
-      Scratch,
-      SharedString,
-      Style,
-      W_FULL,
-      argb_to_hsla,
-      gpui_px,
-      intern_str,
+      self, BtnSize, BtnVariant, RawAnyElement, RawButton, RawDiv, RcFnVtbl, Scratch, SharedString,
+      Style, W_FULL, argb_to_hsla, gpui_px, intern_str,
    },
-   os::{
-      DesktopOs,
-      Os,
-   },
+   os::{DesktopOs, Os},
 };
 
 const MAX_HIGHLIGHT_LINES: usize = 600;
@@ -91,8 +55,8 @@ const COL_OK: u32 = 0xFF7E_E787;
 /// (`phoenix.ui.openPage`).
 #[derive(Clone)]
 pub struct ModalButton {
-   pub label:    String,
-   pub danger:   bool,
+   pub label: String,
+   pub danger: bool,
    pub on_press: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -100,16 +64,16 @@ pub struct ModalButton {
 #[derive(Clone)]
 pub enum ModalSection {
    Buttons {
-      title:   Option<String>,
+      title: Option<String>,
       buttons: Vec<ModalButton>,
    },
    Text {
       title: Option<String>,
-      text:  String,
+      text: String,
    },
    Code {
-      title:     Option<String>,
-      text:      String,
+      title: Option<String>,
+      text: String,
       monospace: bool,
       highlight: bool,
    },
@@ -118,7 +82,7 @@ pub enum ModalSection {
 /// Specification for a native GPUI plugin page (`phoenix.ui.openPage`).
 #[derive(Clone)]
 pub struct PageModalSpec {
-   pub title:    String,
+   pub title: String,
    pub sections: Vec<ModalSection>,
 }
 
@@ -126,14 +90,18 @@ pub struct PageModalSpec {
 /// worker thread reads.
 pub struct Choice {
    picked: Mutex<Option<i32>>,
-   done:   Condvar,
+   done: Condvar,
+   #[cfg(target_os = "macos")]
+   panel_id: OnceLock<u64>,
 }
 
 impl Choice {
    const fn new() -> Self {
       Self {
          picked: Mutex::new(None),
-         done:   Condvar::new(),
+         done: Condvar::new(),
+         #[cfg(target_os = "macos")]
+         panel_id: OnceLock::new(),
       }
    }
 
@@ -160,15 +128,15 @@ impl Choice {
 
 /// One button of a native choose dialog.
 pub struct ChoiceOption {
-   pub label:  String,
+   pub label: String,
    pub danger: bool,
 }
 
 #[derive(Clone)]
 struct CodeEditorModal {
-   plugin:       String,
+   plugin: String,
    pending_init: Option<String>,
-   status:       Option<(String, bool)>,
+   status: Option<(String, bool)>,
 }
 
 /// What a plugin's text, number or secret setting holds.
@@ -183,30 +151,30 @@ pub enum FieldKind {
 /// A plugin setting edited in the one-line field.
 #[derive(Clone)]
 pub struct SettingField {
-   pub plugin:  String,
-   pub key:     String,
-   pub title:   String,
+   pub plugin: String,
+   pub key: String,
+   pub title: String,
    pub initial: String,
-   pub kind:    FieldKind,
+   pub kind: FieldKind,
 }
 
 /// The one-line field modal: a plugin URL to install, or a setting.
 #[derive(Clone)]
 struct InstallUrlModal {
-   setting:      Option<SettingField>,
+   setting: Option<SettingField>,
    pending_init: Option<String>,
-   status:       Option<(String, bool)>,
-   busy:         bool,
+   status: Option<(String, bool)>,
+   busy: bool,
 }
 
 #[derive(Clone)]
 enum ActiveModal {
    Page {
-      id:   u64,
+      id: u64,
       spec: PageModalSpec,
    },
    Choice {
-      spec:   PageModalSpec,
+      spec: PageModalSpec,
       choice: Arc<Choice>,
    },
    CodeEditor(CodeEditorModal),
@@ -234,13 +202,13 @@ type RawTextArea = Scratch<{ layout::SCRATCH_CAP }>;
 struct RawEntity {
    id_lo: u32,
    id_hi: u32,
-   rest:  [u64; 3],
+   rest: [u64; 3],
 }
 const _: () = assert!(size_of::<RawEntity>() == layout::ENTITY);
 
 #[repr(C, align(8))]
 struct RawContext {
-   app:  *mut c_void,
+   app: *mut c_void,
    weak: RawEntity,
 }
 
@@ -297,40 +265,40 @@ type ListenerPushFn = unsafe extern "C" fn(*mut c_void, *mut u8, *const RcFnVtbl
 type IsHoveredFn = unsafe extern "C" fn(*const c_void, *const c_void) -> bool;
 
 struct ModalSymbols {
-   vec_push_any:        VecPushAnyFn,
-   modal_new:           ModalNewFn,
-   modal_into_any:      ModalIntoAnyFn,
-   modal_child_div:     ModalChildDivFn,
+   vec_push_any: VecPushAnyFn,
+   modal_new: ModalNewFn,
+   modal_into_any: ModalIntoAnyFn,
+   modal_child_div: ModalChildDivFn,
    modal_footer_button: ModalFooterBtnFn,
-   div_id:              DivIdFn,
-   layout:              ModalLayout,
+   div_id: DivIdFn,
+   layout: ModalLayout,
 }
 
 /// Click-outside-to-close, wired the way Discord's own overlay `backdrop` is.
 struct DismissSymbols {
-   push:                 ListenerPushFn,
-   is_hovered:           IsHoveredFn,
+   push: ListenerPushFn,
+   is_hovered: IsHoveredFn,
    /// `Div` offset of its `Box<Interactivity>`.
-   interactivity:        usize,
+   interactivity: usize,
    mouse_down_listeners: usize,
-   propagate_event:      usize,
+   propagate_event: usize,
 }
 
 struct TextFieldSymbols {
-   cx_new_single:       CxNewFieldFn,
-   cx_new_multiline:    CxNewFieldFn,
-   entity_map_get:      EntityMapGetFn,
-   entity_downgrade:    EntityDowngradeFn,
-   weak_drop:           WeakDropFn,
-   text_get:            TextGetFn,
-   set_value:           SetValueFn,
-   update_entity_dyn:   UpdateEntityDynFn,
-   arc_drop_slow:       ArcDropSlowFn,
-   text_input_new:      TextInputNewFn,
+   cx_new_single: CxNewFieldFn,
+   cx_new_multiline: CxNewFieldFn,
+   entity_map_get: EntityMapGetFn,
+   entity_downgrade: EntityDowngradeFn,
+   weak_drop: WeakDropFn,
+   text_get: TextGetFn,
+   set_value: SetValueFn,
+   update_entity_dyn: UpdateEntityDynFn,
+   arc_drop_slow: ArcDropSlowFn,
+   text_input_new: TextInputNewFn,
    text_input_into_any: TextInputIntoAnyFn,
-   text_area_new:       TextAreaNewFn,
-   text_area_into_any:  TextAreaIntoAnyFn,
-   layout:              FieldLayout,
+   text_area_new: TextAreaNewFn,
+   text_area_into_any: TextAreaIntoAnyFn,
+   layout: FieldLayout,
 }
 
 // SAFETY: resolved static function pointers in `Discord.exe`.
@@ -389,13 +357,13 @@ static ACTIVE_MODAL: LazyLock<Mutex<Option<ActiveModal>>> = LazyLock::new(|| Mut
 /// Main-thread-owned GPUI `Entity<FieldState>` handles, lazily created on first
 /// render when `window` and `app` are live.
 struct FieldEntities {
-   url:  Option<RawEntity>,
+   url: Option<RawEntity>,
    code: Option<RawEntity>,
 }
 
 static FIELD_ENTITIES: LazyLock<Mutex<FieldEntities>> = LazyLock::new(|| {
    Mutex::new(FieldEntities {
-      url:  None,
+      url: None,
       code: None,
    })
 });
@@ -431,44 +399,44 @@ fn lookup_modal_action(id: u64) -> Option<ModalAction> {
 
 static MODAL_CLOSE_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
-   size:          size_of::<u64>(),
-   align:         align_of::<u64>(),
-   call_once:     modal_close_callback as *const c_void,
-   call_mut:      modal_close_callback as *const c_void,
-   call:          modal_close_callback as *const c_void,
-   extra:         ptr::null(),
+   size: size_of::<u64>(),
+   align: align_of::<u64>(),
+   call_once: modal_close_callback as *const c_void,
+   call_mut: modal_close_callback as *const c_void,
+   call: modal_close_callback as *const c_void,
+   extra: ptr::null(),
 };
 
 static MODAL_BTN_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
-   size:          size_of::<u64>(),
-   align:         align_of::<u64>(),
-   call_once:     modal_button_callback as *const c_void,
-   call_mut:      modal_button_callback as *const c_void,
-   call:          modal_button_callback as *const c_void,
-   extra:         ptr::null(),
+   size: size_of::<u64>(),
+   align: align_of::<u64>(),
+   call_once: modal_button_callback as *const c_void,
+   call_mut: modal_button_callback as *const c_void,
+   call: modal_button_callback as *const c_void,
+   extra: ptr::null(),
 };
 
 // `Box<dyn Fn(&MouseDownEvent, DispatchPhase, &Hitbox, &mut Window, &mut App)>`
 // vtables for zero-sized listeners, so the box holds no allocation.
 static SCRIM_PRESS_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: noop_drop as *const c_void,
-   size:          0,
-   align:         1,
-   call_once:     scrim_press as *const c_void,
-   call_mut:      scrim_press as *const c_void,
-   call:          scrim_press as *const c_void,
-   extra:         ptr::null(),
+   size: 0,
+   align: 1,
+   call_once: scrim_press as *const c_void,
+   call_mut: scrim_press as *const c_void,
+   call: scrim_press as *const c_void,
+   extra: ptr::null(),
 };
 
 static CARD_PRESS_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: noop_drop as *const c_void,
-   size:          0,
-   align:         1,
-   call_once:     card_press as *const c_void,
-   call_mut:      card_press as *const c_void,
-   call:          card_press as *const c_void,
-   extra:         ptr::null(),
+   size: 0,
+   align: 1,
+   call_once: card_press as *const c_void,
+   call_mut: card_press as *const c_void,
+   call: card_press as *const c_void,
+   extra: ptr::null(),
 };
 
 const PHASE_BUBBLE: u8 = 0;
@@ -560,20 +528,20 @@ fn on_mouse_down(div: &mut RawDiv, vtbl: &'static RcFnVtbl) -> bool {
 
 #[repr(C)]
 struct SetValueEnv {
-   entity:   *const RawEntity,
+   entity: *const RawEntity,
    text_ptr: *const u8,
    text_len: usize,
-   tf:       *const TextFieldSymbols,
+   tf: *const TextFieldSymbols,
 }
 
 static SET_VALUE_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
-   size:          size_of::<SetValueEnv>(),
-   align:         align_of::<SetValueEnv>(),
-   call_once:     set_value_trampoline as *const c_void,
-   call_mut:      set_value_trampoline as *const c_void,
-   call:          set_value_trampoline as *const c_void,
-   extra:         ptr::null(),
+   size: size_of::<SetValueEnv>(),
+   align: align_of::<SetValueEnv>(),
+   call_once: set_value_trampoline as *const c_void,
+   call_mut: set_value_trampoline as *const c_void,
+   call: set_value_trampoline as *const c_void,
+   extra: ptr::null(),
 };
 
 unsafe extern "C" fn set_value_trampoline(
@@ -698,16 +666,14 @@ unsafe extern "C" fn modal_button_callback(
                return;
             }
             set_install_status("Downloading and installing plugin...", false, true);
-            std::thread::spawn(move || {
-               match phoenix_runtime::install(&url) {
-                  Ok(name) => {
-                     close_active();
-                     phoenix_ui_desktop::toast(&format!("Installed {name}"));
-                  },
-                  Err(err) => {
-                     set_install_status(&format!("{err}"), true, false);
-                  },
-               }
+            std::thread::spawn(move || match phoenix_runtime::install(&url) {
+               Ok(name) => {
+                  close_active();
+                  phoenix_ui_desktop::toast(&format!("Installed {name}"));
+               },
+               Err(err) => {
+                  set_install_status(&format!("{err}"), true, false);
+               },
             });
          },
       }
@@ -723,47 +689,29 @@ unsafe extern "C" fn modal_button_callback(
 /// arm64 locators.
 #[cfg(target_os = "macos")]
 mod panel {
-   use std::sync::{
-      Arc,
-      OnceLock,
-   };
+   use std::sync::{Arc, OnceLock};
 
    use phoenix_ui_desktop::{
-      PanelButton,
-      PanelSection,
-      close_panel,
-      panel_text,
-      set_panel_status,
-      show_panel,
+      PanelButton, PanelSection, close_panel, panel_text, set_panel_status, show_panel,
    };
 
    use super::{
-      Choice,
-      ChoiceOption,
-      FieldKind,
-      ModalSection,
-      PageModalSpec,
-      SettingField,
-      force_redraw,
+      Choice, ChoiceOption, FieldKind, ModalSection, PageModalSpec, SettingField, force_redraw,
       setting_value,
    };
 
    fn section(section: ModalSection) -> PanelSection {
       match section {
-         ModalSection::Buttons { title, buttons } => {
-            PanelSection::Buttons {
-               title,
-               buttons: buttons
-                  .into_iter()
-                  .map(|button| {
-                     PanelButton {
-                        label:    button.label,
-                        danger:   button.danger,
-                        on_press: button.on_press,
-                     }
-                  })
-                  .collect(),
-            }
+         ModalSection::Buttons { title, buttons } => PanelSection::Buttons {
+            title,
+            buttons: buttons
+               .into_iter()
+               .map(|button| PanelButton {
+                  label: button.label,
+                  danger: button.danger,
+                  on_press: button.on_press,
+               })
+               .collect(),
          },
          ModalSection::Text { title, text } => PanelSection::Text { title, text },
          ModalSection::Code {
@@ -771,13 +719,11 @@ mod panel {
             text,
             monospace,
             ..
-         } => {
-            PanelSection::Code {
-               title,
-               text,
-               monospace,
-               editable: false,
-            }
+         } => PanelSection::Code {
+            title,
+            text,
+            monospace,
+            editable: false,
          },
       }
    }
@@ -842,10 +788,10 @@ mod panel {
          title,
          vec![
             PanelSection::Code {
-               title:     None,
-               text:      source,
+               title: None,
+               text: source,
                monospace: true,
-               editable:  true,
+               editable: true,
             },
             PanelSection::Status,
             PanelSection::Buttons {
@@ -859,14 +805,20 @@ mod panel {
 
    pub fn open_install_url() {
       let id = Arc::new(OnceLock::new());
+      let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
       let buttons = vec![
-         button("Install", false, &id, |id| {
+         button("Install", false, &id, move |id| {
+            if busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+               return;
+            }
             let Some(raw) = first_text(id) else {
+               busy.store(false, std::sync::atomic::Ordering::Release);
                return;
             };
             let url = raw.trim().to_owned();
             if url.is_empty() {
                set_panel_status(id, "Enter an https:// URL ending in .js".to_owned(), true);
+               busy.store(false, std::sync::atomic::Ordering::Release);
                return;
             }
             set_panel_status(id, "Downloading and installing...".to_owned(), false);
@@ -875,7 +827,10 @@ mod panel {
                   close_panel(id);
                   phoenix_ui_desktop::toast(&format!("Installed {name}"));
                },
-               Err(err) => set_panel_status(id, err.to_string(), true),
+               Err(err) => {
+                  set_panel_status(id, err.to_string(), true);
+                  busy.store(false, std::sync::atomic::Ordering::Release);
+               },
             }
          }),
          button("Cancel", false, &id, close_panel),
@@ -884,10 +839,10 @@ mod panel {
          "Install a plugin".to_owned(),
          vec![
             PanelSection::Field {
-               title:       Some("Plugin URL".to_owned()),
-               text:        String::new(),
+               title: Some("Plugin URL".to_owned()),
+               text: String::new(),
                placeholder: Some("https://example.com/plugin.js".to_owned()),
-               secure:      false,
+               secure: false,
             },
             PanelSection::Status,
             PanelSection::Buttons {
@@ -966,8 +921,8 @@ mod panel {
             .map(|(index, option)| {
                let (choice, id) = (Arc::clone(choice), Arc::clone(&id));
                PanelButton {
-                  label:    option.label,
-                  danger:   option.danger,
+                  label: option.label,
+                  danger: option.danger,
                   on_press: Arc::new(move || {
                      choice.pick(i32::try_from(index).unwrap_or(-1));
                      if let Some(&id) = id.get() {
@@ -983,11 +938,9 @@ mod panel {
          });
       }
       let dismissed = Arc::clone(choice);
-      let _ = id.set(show_panel(
-         title,
-         sections,
-         Some(Arc::new(move || dismissed.pick(-1))),
-      ));
+      let panel_id = show_panel(title, sections, Some(Arc::new(move || dismissed.pick(-1))));
+      let _ = id.set(panel_id);
+      let _ = choice.panel_id.set(panel_id);
    }
 }
 
@@ -1055,8 +1008,8 @@ pub fn open_choice(
          .map(|(index, option)| {
             let picked = Arc::clone(&choice);
             ModalButton {
-               label:    option.label,
-               danger:   option.danger,
+               label: option.label,
+               danger: option.danger,
                on_press: Arc::new(move || {
                   finish_choice(&picked, i32::try_from(index).unwrap_or(-1));
                }),
@@ -1069,7 +1022,7 @@ pub fn open_choice(
       });
    }
    set_active(Some(ActiveModal::Choice {
-      spec:   PageModalSpec { title, sections },
+      spec: PageModalSpec { title, sections },
       choice: Arc::clone(&choice),
    }));
    choice
@@ -1092,6 +1045,10 @@ pub fn ask(
 
 /// Closes `choice`'s dialog if it is still the one on screen.
 pub fn dismiss_choice(choice: &Arc<Choice>) {
+   #[cfg(target_os = "macos")]
+   if let Some(&id) = choice.panel_id.get() {
+      phoenix_ui_desktop::close_panel(id);
+   }
    finish_choice(choice, -1);
 }
 
@@ -1156,10 +1113,10 @@ pub fn open_install_url() {
    }
    resolve_pending_choice();
    set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
-      setting:      None,
+      setting: None,
       pending_init: Some(String::new()),
-      status:       None,
-      busy:         false,
+      status: None,
+      busy: false,
    })));
 }
 
@@ -1173,9 +1130,9 @@ pub fn open_setting_editor(field: SettingField) {
    resolve_pending_choice();
    set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
       pending_init: Some(field.initial.clone()),
-      setting:      Some(field),
-      status:       None,
-      busy:         false,
+      setting: Some(field),
+      status: None,
+      busy: false,
    })));
 }
 
@@ -1267,30 +1224,26 @@ pub fn install(image: &Image<'static>) {
    // SAFETY: resolved and shape-checked against `Discord.exe` by `sigs`.
    let _ = DISMISS_SYM.set(unsafe {
       DismissSymbols {
-         push:                 std::mem::transmute::<usize, ListenerPushFn>(
-            found.dismiss.listener_push,
-         ),
-         is_hovered:           std::mem::transmute::<usize, IsHoveredFn>(
-            found.dismiss.hitbox_is_hovered,
-         ),
-         interactivity:        gpui_layout.div.interactivity,
+         push: std::mem::transmute::<usize, ListenerPushFn>(found.dismiss.listener_push),
+         is_hovered: std::mem::transmute::<usize, IsHoveredFn>(found.dismiss.hitbox_is_hovered),
+         interactivity: gpui_layout.div.interactivity,
          mouse_down_listeners: found.dismiss.mouse_down_listeners,
-         propagate_event:      found.dismiss.propagate_event,
+         propagate_event: found.dismiss.propagate_event,
       }
    });
 
    // SAFETY: resolved and layout-verified against `Discord.exe`.
    let modal_sym = unsafe {
       ModalSymbols {
-         vec_push_any:        std::mem::transmute::<usize, VecPushAnyFn>(found.vec_push_any),
-         modal_new:           std::mem::transmute::<usize, ModalNewFn>(found.modal_new),
-         modal_into_any:      std::mem::transmute::<usize, ModalIntoAnyFn>(found.modal_into_any),
-         modal_child_div:     std::mem::transmute::<usize, ModalChildDivFn>(found.modal_child_div),
+         vec_push_any: std::mem::transmute::<usize, VecPushAnyFn>(found.vec_push_any),
+         modal_new: std::mem::transmute::<usize, ModalNewFn>(found.modal_new),
+         modal_into_any: std::mem::transmute::<usize, ModalIntoAnyFn>(found.modal_into_any),
+         modal_child_div: std::mem::transmute::<usize, ModalChildDivFn>(found.modal_child_div),
          modal_footer_button: std::mem::transmute::<usize, ModalFooterBtnFn>(
             found.modal_footer_button,
          ),
-         div_id:              std::mem::transmute::<usize, DivIdFn>(found.div_id),
-         layout:              found.layout,
+         div_id: std::mem::transmute::<usize, DivIdFn>(found.div_id),
+         layout: found.layout,
       }
    };
    let _ = MODAL_SYM.set(modal_sym);
@@ -1300,28 +1253,28 @@ pub fn install(image: &Image<'static>) {
          // SAFETY: resolved and cross-checked against `Discord.exe`.
          let sym = unsafe {
             TextFieldSymbols {
-               cx_new_single:       std::mem::transmute::<usize, CxNewFieldFn>(tf.cx_new_single),
-               cx_new_multiline:    std::mem::transmute::<usize, CxNewFieldFn>(tf.cx_new_multiline),
-               entity_map_get:      std::mem::transmute::<usize, EntityMapGetFn>(tf.entity_map_get),
-               entity_downgrade:    std::mem::transmute::<usize, EntityDowngradeFn>(
+               cx_new_single: std::mem::transmute::<usize, CxNewFieldFn>(tf.cx_new_single),
+               cx_new_multiline: std::mem::transmute::<usize, CxNewFieldFn>(tf.cx_new_multiline),
+               entity_map_get: std::mem::transmute::<usize, EntityMapGetFn>(tf.entity_map_get),
+               entity_downgrade: std::mem::transmute::<usize, EntityDowngradeFn>(
                   tf.entity_downgrade,
                ),
-               weak_drop:           std::mem::transmute::<usize, WeakDropFn>(tf.weak_drop),
-               text_get:            std::mem::transmute::<usize, TextGetFn>(tf.text_get),
-               set_value:           std::mem::transmute::<usize, SetValueFn>(tf.set_value),
-               update_entity_dyn:   std::mem::transmute::<usize, UpdateEntityDynFn>(
+               weak_drop: std::mem::transmute::<usize, WeakDropFn>(tf.weak_drop),
+               text_get: std::mem::transmute::<usize, TextGetFn>(tf.text_get),
+               set_value: std::mem::transmute::<usize, SetValueFn>(tf.set_value),
+               update_entity_dyn: std::mem::transmute::<usize, UpdateEntityDynFn>(
                   tf.update_entity_dyn,
                ),
-               arc_drop_slow:       std::mem::transmute::<usize, ArcDropSlowFn>(tf.arc_drop_slow),
-               text_input_new:      std::mem::transmute::<usize, TextInputNewFn>(tf.text_input_new),
+               arc_drop_slow: std::mem::transmute::<usize, ArcDropSlowFn>(tf.arc_drop_slow),
+               text_input_new: std::mem::transmute::<usize, TextInputNewFn>(tf.text_input_new),
                text_input_into_any: std::mem::transmute::<usize, TextInputIntoAnyFn>(
                   tf.text_input_into_any,
                ),
-               text_area_new:       std::mem::transmute::<usize, TextAreaNewFn>(tf.text_area_new),
-               text_area_into_any:  std::mem::transmute::<usize, TextAreaIntoAnyFn>(
+               text_area_new: std::mem::transmute::<usize, TextAreaNewFn>(tf.text_area_new),
+               text_area_into_any: std::mem::transmute::<usize, TextAreaIntoAnyFn>(
                   tf.text_area_into_any,
                ),
-               layout:              tf.layout,
+               layout: tf.layout,
             }
          };
          let _ = FIELD_SYM.set(sym);
@@ -1465,10 +1418,10 @@ unsafe fn set_field_text(app: *mut c_void, entity: &RawEntity, text: &str) {
       return;
    }
    let mut env = SetValueEnv {
-      entity:   ptr::from_ref(entity),
+      entity: ptr::from_ref(entity),
       text_ptr: text.as_ptr(),
       text_len: text.len(),
-      tf:       ptr::from_ref(tf),
+      tf: ptr::from_ref(tf),
    };
    // SAFETY: `update_entity_dyn` leases `FieldState`, calls
    // `set_value_trampoline` synchronously on this stack frame, ends the lease,
@@ -1962,21 +1915,17 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          ActiveModal::Page { spec, .. } | ActiveModal::Choice { spec, .. } => {
             Snapshot::Page(spec.clone())
          },
-         ActiveModal::CodeEditor(ed) => {
-            Snapshot::CodeEditor(CodeEditorModal {
-               plugin:       ed.plugin.clone(),
-               pending_init: ed.pending_init.take(),
-               status:       ed.status.clone(),
-            })
-         },
-         ActiveModal::InstallUrl(inst) => {
-            Snapshot::InstallUrl(InstallUrlModal {
-               setting:      inst.setting.clone(),
-               pending_init: inst.pending_init.take(),
-               status:       inst.status.clone(),
-               busy:         inst.busy,
-            })
-         },
+         ActiveModal::CodeEditor(ed) => Snapshot::CodeEditor(CodeEditorModal {
+            plugin: ed.plugin.clone(),
+            pending_init: ed.pending_init.take(),
+            status: ed.status.clone(),
+         }),
+         ActiveModal::InstallUrl(inst) => Snapshot::InstallUrl(InstallUrlModal {
+            setting: inst.setting.clone(),
+            pending_init: inst.pending_init.take(),
+            status: inst.status.clone(),
+            busy: inst.busy,
+         }),
       };
       drop(guard);
       snapshot
@@ -2100,11 +2049,16 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
             gpui::style_div(b, |s| s.length(s.at.size[0], W_FULL));
             if let Some(tf) = FIELD_SYM.get()
                && let Some(ent) = unsafe {
-                  ensure_field_entity(app, window, false, match &inst.setting {
-                     None => "https://example.com/plugin.js",
-                     Some(field) if field.kind == FieldKind::Secret => "Leave empty to clear",
-                     Some(_) => "",
-                  })
+                  ensure_field_entity(
+                     app,
+                     window,
+                     false,
+                     match &inst.setting {
+                        None => "https://example.com/plugin.js",
+                        Some(field) if field.kind == FieldKind::Secret => "Leave empty to clear",
+                        Some(_) => "",
+                     },
+                  )
                }
             {
                if let Some(init) = &inst.pending_init {
@@ -2166,12 +2120,10 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          }
          let (title, subtitle) = match &inst.setting {
             Some(field) => (field.title.clone(), Some(field.plugin.clone())),
-            None => {
-               (
-                  "Install Plugin from URL".to_owned(),
-                  Some("Paste an https:// URL pointing to a Sunbird .js plugin bundle.".to_owned()),
-               )
-            },
+            None => (
+               "Install Plugin from URL".to_owned(),
+               Some("Paste an https:// URL pointing to a Sunbird .js plugin bundle.".to_owned()),
+            ),
          };
          (title, subtitle, 2, body, footer)
       },
@@ -2248,11 +2200,14 @@ mod tests {
          (4, "2"),
          (3, ","),
       ];
-      assert_eq!(super::coalesce(tokens.into_iter()), vec![
-         (2, "  \"k\"".to_owned()),
-         (3, ": ".to_owned()),
-         (4, "12".to_owned()),
-         (3, ",".to_owned()),
-      ]);
+      assert_eq!(
+         super::coalesce(tokens.into_iter()),
+         vec![
+            (2, "  \"k\"".to_owned()),
+            (3, ": ".to_owned()),
+            (4, "12".to_owned()),
+            (3, ",".to_owned()),
+         ]
+      );
    }
 }

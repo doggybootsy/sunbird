@@ -4,30 +4,16 @@
 //! thread, so the crate links nothing beyond libSystem.
 
 use std::{
-   ffi::{
-      CStr,
-      CString,
-      c_char,
-      c_void,
-   },
+   ffi::{CStr, CString, c_char, c_void},
    io::Write as _,
    path::PathBuf,
-   process::{
-      Command,
-      Stdio,
-   },
+   process::{Command, Stdio},
    ptr,
    sync::Once,
    thread,
 };
 
-use crate::{
-   DesktopHost,
-   Error,
-   TrayAction,
-   config,
-   spawn_reaped,
-};
+use crate::{DesktopHost, Error, TrayAction, config, spawn_reaped};
 
 /// Chromium-family browsers that take `--app=<url>`, by bundle and binary.
 const APP_BROWSERS: [(&str, &str); 4] = [
@@ -125,8 +111,9 @@ impl DesktopHost for Host {
    }
 }
 
-/// Marks every window's content view dirty, from any thread. GPUI's view is
-/// layer-backed and renders a frame when its layer is asked to display.
+/// Marks every window's content view and GPUI subview layers dirty, from any
+/// thread. `GPUIView` uses `RedrawDuringViewResize`, so only invalidating its
+/// `CALayer` triggers `displayLayer:`.
 pub fn redraw_windows() {
    on_main(|| {
       // SAFETY: on the main thread, where AppKit may be used; every object is
@@ -141,8 +128,25 @@ pub fn redraw_windows() {
          for at in 0..count {
             let window = send_index(windows, sel(c"objectAtIndex:"), at);
             let view = send(window, sel(c"contentView"));
-            if !view.is_null() {
-               send_bool(view, sel(c"setNeedsDisplay:"), true);
+            if view.is_null() {
+               continue;
+            }
+            send_bool(view, sel(c"setNeedsDisplay:"), true);
+            let layer = send(view, sel(c"layer"));
+            if !layer.is_null() {
+               send_void(layer, sel(c"setNeedsDisplay"));
+            }
+            let subviews = send(view, sel(c"subviews"));
+            if subviews.is_null() {
+               continue;
+            }
+            let sub_count = send_usize(subviews, sel(c"count"));
+            for sub_at in 0..sub_count {
+               let sub = send_index(subviews, sel(c"objectAtIndex:"), sub_at);
+               let sub_layer = send(sub, sel(c"layer"));
+               if !sub_layer.is_null() {
+                  send_void(sub_layer, sel(c"setNeedsDisplay"));
+               }
             }
          }
       }
@@ -200,6 +204,7 @@ macro_rules! msg_send {
 }
 
 msg_send!(send() -> Id);
+msg_send!(send_void() -> ());
 msg_send!(send_id(arg: Id) -> Id);
 msg_send!(send_bool(arg: bool) -> ());
 msg_send!(send_usize() -> usize);
@@ -207,7 +212,7 @@ msg_send!(send_index(at: usize) -> Id);
 msg_send!(send_isize(arg: isize) -> ());
 msg_send!(send_f64(arg: f64) -> Id);
 msg_send!(send_str(arg: *const c_char) -> Id);
-msg_send!(send_key_code() -> u16);
+msg_send!(send_cstr() -> *const c_char);
 msg_send!(send_monitor(mask: u64, handler: *const Block) -> Id);
 msg_send!(send_symbol(name: Id, description: Id) -> Id);
 msg_send!(send_item(title: Id, action: Sel, key: Id) -> Id);
@@ -216,12 +221,7 @@ msg_send!(send_tag() -> isize);
 mod panel;
 
 pub use panel::{
-   Action as PanelAction,
-   PanelButton,
-   PanelSection,
-   close_panel,
-   panel_text,
-   set_panel_status,
+   Action as PanelAction, PanelButton, PanelSection, close_panel, panel_text, set_panel_status,
    show_panel,
 };
 
@@ -392,32 +392,30 @@ fn start_status_item() {
 /// Sunbird's shortcuts while Discord is focused: Control-Shift-U opens
 /// Sunbird's settings, since Command-Shift-U is Discord's own Upload File, and
 /// Command-Shift-I its `DevTools`, which Discord leaves free.
-const SHORTCUTS: [(usize, u16, fn()); 2] = [
-   // `kVK_ANSI_U`, `kVK_ANSI_I`.
-   (CONTROL_SHIFT, 0x20, crate::open_settings),
-   (COMMAND_SHIFT, 0x22, crate::open_devtools),
+const SHORTCUTS: [(usize, &str, fn()); 2] = [
+   (CONTROL_SHIFT, "u", crate::open_settings),
+   (COMMAND_SHIFT, "i", crate::open_devtools),
 ];
 
-/// `NSEventModifierFlagShift` with `Control` or `Command`, and the mask of
-/// every device-independent modifier, so variants with another modifier miss.
+// shift, control, option, command (ignore caps lock, numpad, fn)
 const CONTROL_SHIFT: usize = (1 << 17) | (1 << 18);
 const COMMAND_SHIFT: usize = (1 << 17) | (1 << 20);
-const MODIFIERS: usize = 0xFFFF_0000;
+const MODIFIERS: usize = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
 
 /// An Objective-C block, laid out as the runtime reads one.
 #[repr(C)]
 struct Block {
-   isa:        *const c_void,
-   flags:      i32,
-   reserved:   i32,
-   invoke:     extern "C" fn(*const Self, Id) -> Id,
+   isa: *const c_void,
+   flags: i32,
+   reserved: i32,
+   invoke: extern "C" fn(*const Self, Id) -> Id,
    descriptor: *const BlockDescriptor,
 }
 
 #[repr(C)]
 struct BlockDescriptor {
    reserved: usize,
-   size:     usize,
+   size: usize,
 }
 
 unsafe extern "C" {
@@ -428,20 +426,31 @@ unsafe extern "C" {
 /// every other key on.
 extern "C" fn key_down(_block: *const Block, event: Id) -> Id {
    // SAFETY: AppKit passes the `NSEvent` being dispatched.
-   let (code, flags) = unsafe {
+   let (chars, flags) = unsafe {
       (
-         send_key_code(event, sel(c"keyCode")),
+         send(event, sel(c"charactersIgnoringModifiers")),
          send_usize(event, sel(c"modifierFlags")),
       )
    };
    let pressed = flags & MODIFIERS;
-   let Some(&(_, _, run)) = SHORTCUTS
+   if chars.is_null() {
+      return event;
+   }
+   // SAFETY: `chars` is a non-nil `NSString` whose `UTF8String` lives for this autorelease pool.
+   let key = unsafe {
+      let ptr = send_cstr(chars, sel(c"UTF8String"));
+      if ptr.is_null() {
+         return event;
+      }
+      CStr::from_ptr(ptr).to_str().unwrap_or("")
+   };
+   let Some(&(_, matched, run)) = SHORTCUTS
       .iter()
-      .find(|&&(modifiers, key, _)| modifiers == pressed && key == code)
+      .find(|&&(modifiers, wanted, _)| modifiers == pressed && key.eq_ignore_ascii_case(wanted))
    else {
       return event;
    };
-   log::info!("shortcuts: key {code:#x}");
+   log::info!("shortcuts: key {matched}");
    // Opening spawns a browser, which must not block the main thread.
    let _ = thread::Builder::new()
       .name("sunbird-shortcut".to_owned())
@@ -456,15 +465,15 @@ fn start_shortcuts() {
    const IS_GLOBAL: i32 = 1 << 28;
    static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
       reserved: 0,
-      size:     size_of::<Block>(),
+      size: size_of::<Block>(),
    };
 
    // Leaked, since the monitor keeps it for the life of the process.
    let block = Box::leak(Box::new(Block {
-      isa:        &raw const _NSConcreteGlobalBlock,
-      flags:      IS_GLOBAL,
-      reserved:   0,
-      invoke:     key_down,
+      isa: &raw const _NSConcreteGlobalBlock,
+      flags: IS_GLOBAL,
+      reserved: 0,
+      invoke: key_down,
       descriptor: &raw const DESCRIPTOR,
    }));
    // SAFETY: on the main thread; the block has the handler's signature and
