@@ -148,7 +148,10 @@ version=\$(fetch --max-time 5 "\$site/version.json" |
    sed -n 's/.*"loader": *"\([^"]*\)".*/\1/p')
 if [ -n "\$version" ] && [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)" ]; then
    tmp=\$(mktemp "\$home/libphoenix.dylib.XXXXXX")
-   if fetch --max-time 60 -o "\$tmp" "\$site/plugins/libphoenix-macos-arm64.dylib"; then
+   if fetch --max-time 60 -o "\$tmp" "\$site/plugins/libphoenix-macos-arm64.dylib" &&
+      /usr/bin/file -b "\$tmp" 2>/dev/null | grep -q 'Mach-O 64-bit dynamically linked shared library arm64' &&
+      LC_ALL=C /usr/bin/grep -q 'phoenix-version:' "\$tmp" &&
+      (/usr/bin/codesign -v "\$tmp" >/dev/null 2>&1 || /usr/bin/codesign --force --sign - "\$tmp" >/dev/null 2>&1); then
       mv "\$tmp" "\$home/libphoenix.dylib"
       echo "\$version" >"\$home/version"
    else
@@ -162,11 +165,61 @@ while [ "\${1:-}" = --no-runtime ] || [ "\${1:-}" = --gate-only ]; do
 done
 [ -d "\$discord" ] || fail "Discord Phoenix is gone from \$discord. Run the Sunbird installer again."
 
-# Rebuilt when Discord's executable changed, or when the copy lost its ad hoc
-# signature, which Discord's updater would put back.
 stamp="\$(/usr/bin/stat -f '%m %z' "\$discord/Contents/MacOS/Discord") brand \$brand"
+needs_rebuild=
 if [ "\$stamp" != "\$(cat "\$home/stamp" 2>/dev/null)" ] ||
    ! /usr/bin/codesign -dv "\$copy" 2>&1 | grep -q 'Signature=adhoc'; then
+   needs_rebuild=1
+fi
+
+ask() {
+   /usr/bin/osascript -e 'on run argv' \\
+      -e 'display dialog (item 1 of argv) with title "Sunbird" buttons {"Cancel", "Restart"} default button "Restart"' \\
+      -e 'end run' -- "\$1" >/dev/null 2>&1
+}
+
+# check running instances before rebuilding so we don't swap the bundle under a live process
+pids= sunbird= running_gate=
+for pid in \$(/bin/ps -axo pid=,comm= | /usr/bin/awk \\
+   -v phoenix="\$discord/Contents/MacOS/Discord" -v copy="\$copy/Contents/MacOS/Discord" \\
+   '{ pid = \$1; sub(/^ *[0-9]+ /, ""); if (\$0 == phoenix || \$0 == copy) print pid }'); do
+   pids="\$pids \$pid"
+   /usr/sbin/lsof -p "\$pid" 2>/dev/null | grep -q libphoenix && sunbird=1
+   /bin/ps eww -p "\$pid" 2>/dev/null | grep -q 'SUNBIRD_GATE_ONLY=1' && running_gate=1
+done
+
+if [ -n "\$pids" ]; then
+   prompt=
+   if [ -z "\$sunbird" ]; then
+      if [ -n "\$gate_only" ]; then
+         prompt="Discord is already running without Sunbird. Restart it with the access gate only? A call you are in will end."
+      else
+         prompt="Discord is already running without Sunbird. Restart it with Sunbird? A call you are in will end."
+      fi
+   elif [ -n "\$gate_only" ] && [ -z "\$running_gate" ]; then
+      prompt="Discord is already running with plugins. Restart it without the Sunbird plugin runtime? A call you are in will end."
+   elif [ -z "\$gate_only" ] && [ -n "\$running_gate" ]; then
+      prompt="Discord is running in access gate only mode. Restart it with the full Sunbird runtime? A call you are in will end."
+   elif [ -n "\$needs_rebuild" ]; then
+      prompt="Discord Phoenix was updated. Restart Sunbird to apply the update? A call you are in will end."
+   fi
+   if [ -n "\$prompt" ]; then
+      ask "\$prompt" || exit 0
+      kill \$pids 2>/dev/null
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+         alive=
+         for pid in \$pids; do kill -0 "\$pid" 2>/dev/null && alive=1; done
+         [ -z "\$alive" ] && break
+         sleep 0.5
+      done
+   else
+      exec /usr/bin/open -a "\$copy" --args "\$@"
+   fi
+fi
+
+# Rebuilt when Discord's executable changed, or when the copy lost its ad hoc
+# signature, which Discord's updater would put back.
+if [ -n "\$needs_rebuild" ]; then
    tmp=\$(mktemp -d "\$home/Sunbird.XXXXXX")
    new="\$tmp/Sunbird.app"
    # A clone on APFS, so the copy takes no space until Discord updates.
@@ -207,25 +260,6 @@ fi
 [ -f "\$home/libphoenix.dylib" ] ||
    fail "Sunbird hasn't been downloaded yet. Check your connection and open Sunbird again."
 
-# A second Discord hands off to the running one and exits, so one running
-# without Sunbird, Discord Phoenix itself or the copy, is quit first. One that
-# has Sunbird is brought forward by open.
-pids= sunbird=
-for pid in \$(/bin/ps -axo pid=,comm= | /usr/bin/awk \
-   -v phoenix="\$discord/Contents/MacOS/Discord" -v copy="\$copy/Contents/MacOS/Discord" \
-   '{ pid = \$1; sub(/^ *[0-9]+ /, ""); if (\$0 == phoenix || \$0 == copy) print pid }'); do
-   pids="\$pids \$pid"
-   /usr/sbin/lsof -p "\$pid" 2>/dev/null | grep -q libphoenix && sunbird=1
-done
-if [ -n "\$pids" ] && [ -z "\$sunbird" ]; then
-   kill \$pids 2>/dev/null
-   for _ in 1 2 3 4 5 6 7 8 9 10; do
-      alive=
-      for pid in \$pids; do kill -0 "\$pid" 2>/dev/null && alive=1; done
-      [ -z "\$alive" ] && break
-      sleep 0.5
-   done
-fi
 set -- --env "DYLD_INSERT_LIBRARIES=\$home/libphoenix.dylib" --args "\$@"
 [ -n "\$gate_only" ] && set -- --env SUNBIRD_GATE_ONLY=1 "\$@"
 exec /usr/bin/open -a "\$copy" "\$@"
