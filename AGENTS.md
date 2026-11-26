@@ -324,7 +324,7 @@ byte pattern says nothing about arm32.
   2; other values, like `u64::MAX`, are valid, so it is no sanity check. Verified: the Staff Only
   section (Experiments, Build Overrides, Developer Options) shows.
 - Shortcuts. `ui-desktop/src/macos.rs` installs an `NSEvent` local key monitor (a hand-built global
-  block): Control-Shift-U opens settings, Control-Shift-I DevTools. Command-Shift-U is Discord's
+  block): Control-Shift-U opens settings, Command-Shift-I DevTools. Command-Shift-U is Discord's
   Upload File, and Discord's own DevTools stay on Command-Option-I. The monitor only sees keys while
   Discord is focused. When testing with System Events, confirm focus first; a window opened by the
   previous shortcut takes it.

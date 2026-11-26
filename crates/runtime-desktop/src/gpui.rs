@@ -1338,9 +1338,10 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
 
    // 1. Header + Category Tab Bar
    let summary = format!(
-      "v{} · {enabled_count}/{} plugins active · Ctrl+Shift+I for DevTools",
+      "v{} · {enabled_count}/{} plugins active · {} for DevTools",
       update::VERSION,
-      plugins.len()
+      plugins.len(),
+      phoenix_ui_desktop::DEVTOOLS_SHORTCUT,
    );
    root = b.push_div(root, b.text_block("Sunbird", &summary));
 
@@ -1978,7 +1979,10 @@ fn render_general_tab(b: &Builder, mut root: RawDiv) -> RawDiv {
       b.action_row(
          "sunbird-open-devtools",
          "Runtime Console & DevTools",
-         "Evaluate JavaScript in QuickJS and view live runtime logs (Ctrl+Shift+I).",
+         &format!(
+            "Evaluate JavaScript in QuickJS and view live runtime logs ({}).",
+            phoenix_ui_desktop::DEVTOOLS_SHORTCUT
+         ),
          "Open DevTools",
          BtnVariant::Secondary,
          BtnSize::Medium,

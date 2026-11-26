@@ -370,7 +370,13 @@ fn start_status_item() {
                   sel(c"initWithTitle:action:keyEquivalent:"),
                   ns_string(action.label()),
                   sel(c"sunbirdTray:"),
-                  ns_string(""),
+                  // An uppercase key adds Shift to the default Command, so
+                  // the menu shows the monitor's Shift-Command-I.
+                  ns_string(if matches!(action, TrayAction::OpenDevtools) {
+                     "I"
+                  } else {
+                     ""
+                  }),
                );
                send_id(menu_item, sel(c"setTarget:"), target);
                send_isize(menu_item, sel(c"setTag:"), at.cast_signed());
@@ -383,19 +389,19 @@ fn start_status_item() {
    }
 }
 
-/// Sunbird's shortcuts while Discord is focused, the same as on Windows:
-/// Control-Shift-U opens Sunbird's settings and Control-Shift-I its
-/// `DevTools`. Command-Shift-U is Discord's own Upload File, so these use the
-/// literal Control key.
-const SHORTCUTS: [(u16, fn()); 2] = [
+/// Sunbird's shortcuts while Discord is focused: Control-Shift-U opens
+/// Sunbird's settings, since Command-Shift-U is Discord's own Upload File, and
+/// Command-Shift-I its `DevTools`, which Discord leaves free.
+const SHORTCUTS: [(usize, u16, fn()); 2] = [
    // `kVK_ANSI_U`, `kVK_ANSI_I`.
-   (0x20, crate::open_settings),
-   (0x22, crate::open_devtools),
+   (CONTROL_SHIFT, 0x20, crate::open_settings),
+   (COMMAND_SHIFT, 0x22, crate::open_devtools),
 ];
 
-/// `NSEventModifierFlagShift | NSEventModifierFlagControl`, and the mask of
-/// every device-independent modifier, so Command or Option variants miss.
+/// `NSEventModifierFlagShift` with `Control` or `Command`, and the mask of
+/// every device-independent modifier, so variants with another modifier miss.
 const CONTROL_SHIFT: usize = (1 << 17) | (1 << 18);
+const COMMAND_SHIFT: usize = (1 << 17) | (1 << 20);
 const MODIFIERS: usize = 0xFFFF_0000;
 
 /// An Objective-C block, laid out as the runtime reads one.
@@ -428,10 +434,11 @@ extern "C" fn key_down(_block: *const Block, event: Id) -> Id {
          send_usize(event, sel(c"modifierFlags")),
       )
    };
-   if flags & MODIFIERS != CONTROL_SHIFT {
-      return event;
-   }
-   let Some(&(_, run)) = SHORTCUTS.iter().find(|&&(key, _)| key == code) else {
+   let pressed = flags & MODIFIERS;
+   let Some(&(_, _, run)) = SHORTCUTS
+      .iter()
+      .find(|&&(modifiers, key, _)| modifiers == pressed && key == code)
+   else {
       return event;
    };
    log::info!("shortcuts: key {code:#x}");
@@ -473,6 +480,6 @@ fn start_shortcuts() {
    if monitor.is_null() {
       log::info!("shortcuts: AppKit refused the key monitor");
    } else {
-      log::info!("shortcuts: Control-Shift-U opens settings, Control-Shift-I DevTools");
+      log::info!("shortcuts: Control-Shift-U opens settings, Command-Shift-I DevTools");
    }
 }

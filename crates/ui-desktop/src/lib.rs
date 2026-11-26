@@ -203,8 +203,16 @@ pub fn open_settings() {
    }
 }
 
+/// The `DevTools` shortcut as Sunbird's pages name it: Command on macOS, where
+/// Control-Shift-I would be out of place, Control elsewhere.
+pub const DEVTOOLS_SHORTCUT: &str = if cfg!(target_os = "macos") {
+   "Cmd+Shift+I"
+} else {
+   "Ctrl+Shift+I"
+};
+
 /// Opens the Sunbird `DevTools` / Runtime Console directly in a standalone
-/// window (`Ctrl+Shift+I` while Discord Phoenix is focused).
+/// window ([`DEVTOOLS_SHORTCUT`] while Discord Phoenix is focused).
 pub fn open_devtools() {
    if let Some(config) = config() {
       open_app_window(&format!("{}#console", config.dashboard_url), 960, 680);
