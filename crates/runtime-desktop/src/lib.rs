@@ -302,6 +302,16 @@ impl Platform for Desktop {
       }
    }
 
+   #[cfg(target_os = "macos")]
+   fn updates_loader(&self) -> bool {
+      macos_loader_path().is_some()
+   }
+
+   #[cfg(target_os = "macos")]
+   fn update_loader(&self, version: &str, update: &phoenix_runtime::update::Update) {
+      update_macos_loader(version, update);
+   }
+
    fn route(&self, request: &remote::Request) -> Option<remote::Reply> {
       let html = || {
          (
@@ -371,4 +381,95 @@ fn dialog(body: &[u8], sheet: bool) -> remote::Reply {
    let title = request.title.unwrap_or_else(|| "Sunbird".to_owned());
    let index = modal::ask(title, content, options, Duration::from_secs(120));
    remote::ok_json(&DialogAnswer { index })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_loader_path() -> Option<std::path::PathBuf> {
+   let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+   // SAFETY: queries the Mach-O image that holds this function.
+   let ok = unsafe { libc::dladdr(macos_loader_path as *const c_void, info.as_mut_ptr()) };
+   if ok == 0 {
+      return None;
+   }
+   // SAFETY: `dladdr` returned non-zero, so `info` is initialized.
+   let info = unsafe { info.assume_init() };
+   if info.dli_fname.is_null() {
+      return None;
+   }
+   // SAFETY: `dli_fname` is a NUL-terminated path from dyld.
+   let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }
+      .to_str()
+      .ok()?;
+   let path = std::path::PathBuf::from(path);
+   path.is_file().then_some(path)
+}
+
+#[cfg(target_os = "macos")]
+fn update_macos_loader(version: &str, update: &phoenix_runtime::update::Update) {
+   use phoenix_runtime::update;
+
+   let finish_err = |msg: String| {
+      log::error!("loader update: {msg}");
+      update::finish(Some(format!("Loader update failed: {msg}")));
+      phoenix_ui_desktop::toast(&format!("Loader update failed: {msg}"));
+   };
+
+   let Some(dest) = macos_loader_path() else {
+      finish_err("could not locate loaded libphoenix.dylib".to_owned());
+      return;
+   };
+   let Some(dir) = dest.parent() else {
+      finish_err("loaded dylib has no parent directory".to_owned());
+      return;
+   };
+
+   update::set_status(Some(format!("Downloading Sunbird {version}...")));
+   let url = format!("{}plugins/libphoenix-macos-arm64.dylib", update::ASSETS);
+   let bytes = match phoenix_runtime::fetch::get(&url) {
+      Ok(bytes) => bytes,
+      Err(err) => {
+         finish_err(err.to_string());
+         return;
+      },
+   };
+   // arm64 Mach-O 64-bit magic + loader version marker
+   if !bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE])
+      || !bytes.windows(16).any(|w| w == b"phoenix-version:")
+   {
+      finish_err("downloaded dylib failed validation".to_owned());
+      return;
+   }
+
+   let tmp = dir.join(format!("libphoenix.dylib.next.{}", std::process::id()));
+   if let Err(err) = std::fs::write(&tmp, &bytes) {
+      finish_err(format!("write temp dylib: {err}"));
+      return;
+   }
+   let signed = std::process::Command::new("/usr/bin/codesign")
+      .args(["--force", "--sign", "-"])
+      .arg(&tmp)
+      .status()
+      .is_ok_and(|s| s.success());
+   if !signed {
+      let _ = std::fs::remove_file(&tmp);
+      finish_err("codesign failed".to_owned());
+      return;
+   }
+   if let Err(err) = std::fs::rename(&tmp, &dest) {
+      let _ = std::fs::remove_file(&tmp);
+      finish_err(format!("swap dylib: {err}"));
+      return;
+   }
+   let _ = std::fs::write(dir.join("version"), format!("{version}\n"));
+
+   for name in &update.plugins {
+      let crc = update.plugin_crcs.get(name).copied();
+      if let Ok(source) = update::download_plugin(name, crc) {
+         let _ = phoenix_runtime::save_source(name, source);
+      }
+   }
+
+   let msg = format!("Updated to Sunbird {version} — press Cmd+R to restart.");
+   update::finish(Some(msg.clone()));
+   phoenix_ui_desktop::toast(&msg);
 }
